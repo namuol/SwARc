@@ -95,7 +95,7 @@ gfx::Device* Gfx() {
     s.vsync = vs && *vs && *vs != '0';
     SDL_Window* w = SdlWindowFor(s.hwnd);
     if (!w) FatalF("ddraw: no SDL window for hwnd %08X", s.hwnd);
-    GdiYieldWindow(w);
+    hle::GdiYieldWindow(w);
     s.gfx = gfx::CreateChosenDevice(w);
     s.gfx->ResetSwapChain(PrimaryWidth(), PrimaryHeight(), s.vsync);
   }
