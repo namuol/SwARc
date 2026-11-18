@@ -23,6 +23,7 @@
 #include <mutex>
 #include <set>
 #include <thread>
+#include <string>
 #include <vector>
 
 #include "runtime/display.h"
@@ -45,6 +46,9 @@ constexpr SDL_MouseID kWarp = 0xD51D52;
 // TEST_INPUT relative moves ("move", "goto", a resolved "warp"): they carry
 // no host position, so they always move the cursor by their motion.
 constexpr SDL_MouseID kTestRelative = 0xD51D53;
+// TEST_INPUT "shot NAME": an SDL user event whose code indexes g_shot_names.
+constexpr Uint32 kShotEvent = SDL_EVENT_USER + 0x51;
+std::vector<std::string> g_shot_names;
 
 namespace {
 
@@ -1037,6 +1041,9 @@ void InjectTestFocus() {
 //   <t> click [left|right]
 //   <t> key <SDL scancode name> [seconds]   e.g. Escape, Return, Space, A;
 //                         held for that long (default 0.08)
+//   <t> warp <x> <y>      to client (x, y) in one relative move
+//   <t> shot <name>       save the next frame as $<ID>_SHOT_DIR/<name>.bmp
+//                         (tools/smoke.py compares it with a reference)
 // '#' starts a comment.
 struct TestEvent {
   double t;
@@ -1108,6 +1115,12 @@ void InjectTestInput() {
         e.motion.x = std::atof(a);
         e.motion.y = std::atof(b);
         q.push_back({t, e});
+      } else if (c == "shot" && n >= 3) {
+        SDL_Event e{};
+        e.type = kShotEvent;
+        e.user.code = int32_t(g_shot_names.size());
+        g_shot_names.push_back(a);
+        q.push_back({t, e});
       } else if (c == "click") {
         bool right = n >= 3 && std::string(a) == "right";
         SDL_Event e{};
@@ -1156,6 +1169,11 @@ void InjectTestInput() {
   bool moved = false;
   while (next < q.size() && q[next].t <= t) {
     SDL_Event e = q[next].e;
+    if (e.type == kShotEvent) {
+      gfx::RequestShot(g_shot_names[size_t(e.user.code)].c_str());
+      next++;
+      continue;
+    }
     if (e.type == SDL_EVENT_MOUSE_MOTION) {
       if (moved) break;
       moved = true;

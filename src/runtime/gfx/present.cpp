@@ -7,6 +7,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <mutex>
+#include <string>
 #include <vector>
 
 #include "runtime/env.h"
@@ -21,6 +23,20 @@ namespace {
 
 int frame = 0;  // frames presented (back or front buffer)
 
+std::mutex g_shot_mu;
+std::string g_shot_name;  // RequestShot: saved with the next frame
+
+void SaveBmp(int w, int h, const std::vector<uint8_t>& px, const char* name) {
+  SDL_Surface* surf =
+      SDL_CreateSurfaceFrom(w, h, SDL_PIXELFORMAT_XRGB8888, const_cast<uint8_t*>(px.data()), w * 4);
+  const char* dir = Env("SHOT_DIR");
+  std::string path = std::string(dir ? dir : ".") + "/" + name + ".bmp";
+  if (surf) {
+    SDL_SaveBMP(surf, path.c_str());
+    SDL_DestroySurface(surf);
+  }
+}
+
 // <ID>_SHOT_EVERY / _SHOT_FROM / _SHOT_DIR: counts presented frames (back
 // or front buffer) and saves the due ones, read by `read`.
 void MaybeShoot(int w, int h, const std::function<void(uint8_t*, uint32_t)>& read) {
@@ -33,6 +49,16 @@ void MaybeShoot(int w, int h, const std::function<void(uint8_t*, uint32_t)>& rea
     return e ? std::atoi(e) : 0;
   }();
   frame++;
+  std::string named;
+  {
+    std::lock_guard<std::mutex> l(g_shot_mu);
+    named.swap(g_shot_name);
+  }
+  if (!named.empty()) {
+    std::vector<uint8_t> px(size_t(w) * h * 4);
+    read(px.data(), uint32_t(w * 4));
+    SaveBmp(w, h, px, named.c_str());
+  }
   if (every > 0 && frame >= from && frame % every == 0) {
     std::vector<uint8_t> px(size_t(w) * h * 4);
     read(px.data(), uint32_t(w * 4));
@@ -49,6 +75,16 @@ void MaybeShoot(int w, int h, const std::function<void(uint8_t*, uint32_t)>& rea
 }
 
 }  // namespace
+
+void RequestShot(const char* name) {
+  std::lock_guard<std::mutex> l(g_shot_mu);
+  g_shot_name = name;
+}
+
+bool ShotPending() {
+  std::lock_guard<std::mutex> l(g_shot_mu);
+  return !g_shot_name.empty();
+}
 
 // Games that draw on the front buffer (DirectDraw without a back buffer):
 // the same screenshots, of the front buffer.

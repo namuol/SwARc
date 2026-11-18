@@ -19,6 +19,12 @@ void PresentWithDevAids(Device& dev, int w, int h);
 // The same for a frame drawn on the front buffer (Device::PresentFront).
 void PresentFrontWithDevAids(Device& dev, int w, int h);
 
+// Test aid (<ID>_TEST_INPUT "shot NAME"): the next presented frame is saved
+// as $<ID>_SHOT_DIR/NAME.bmp. Front ends that present only when something
+// changes (a still menu on the front buffer) present when ShotPending().
+void RequestShot(const char* name);
+bool ShotPending();
+
 // The backend every graphics front end uses: <ID>_GFX=d3d9 or gpu; by
 // default SDL_GPU.
 Backend ChosenBackend();

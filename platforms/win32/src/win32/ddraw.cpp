@@ -597,6 +597,8 @@ void PushFront(Surface& s, const gfx::Rect& r) {
       // The game is pumping messages: alive, even if a still menu draws
       // nothing for a while.
       WatchdogFrame();
+      // A test screenshot is due (TEST_INPUT "shot"): present now.
+      if (gfx::ShotPending()) g_front_pending = true;
       // With the cursor mark on, a moved cursor is worth a present even
       // when the game draws nothing (menus showing the system cursor).
       if (CursorMarkOn()) {
