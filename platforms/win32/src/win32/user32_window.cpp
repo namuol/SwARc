@@ -12,6 +12,7 @@
 #include <bit>
 #include <cmath>
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -455,6 +456,19 @@ struct ClientMap {
   int cw = 0, ch = 0;
   bool fitted = false;
 };
+// SetPointerRemap: by hwnd, {shown l, t, w, h, asked l, t, w, h}.
+std::map<uint32_t, std::array<int, 8>> g_pointer_remap;
+
+// A client point through hwnd's pointer remap, if it has one.
+void RemapPointer(uint32_t hwnd, int* x, int* y) {
+  std::lock_guard<std::recursive_mutex> l(g_mu);
+  auto it = g_pointer_remap.find(hwnd);
+  if (it == g_pointer_remap.end()) return;
+  const auto& r = it->second;
+  *x = r[4] + int(std::floor(double(*x - r[0]) * r[6] / r[2]));
+  *y = r[5] + int(std::floor(double(*y - r[1]) * r[7] / r[3]));
+}
+
 ClientMap MapToClient(uint32_t hwnd) {
   ClientMap m;
   SDL_Window* sdl;
@@ -653,7 +667,8 @@ void HandleSdlEvent(const SDL_Event& e) {
           x = int(e.motion.x);
           y = int(e.motion.y);
         }
-        if (cm.fitted) {
+        RemapPointer(h, &x, &y);
+        if (cm.fitted || x < 0 || y < 0 || x >= cm.cw || y >= cm.ch) {
           // Over the black bars: the pointer is at the screen's edge.
           x = std::clamp(x, 0, std::max(cm.cw - 1, 0));
           y = std::clamp(y, 0, std::max(cm.ch - 1, 0));
@@ -3735,6 +3750,15 @@ void ScreenPointToClient(uint32_t hwnd, int* x, int* y) {
   WindowOrigin(hwnd, &ox, &oy);
   *x -= ox;
   *y -= oy;
+}
+
+void SetPointerRemap(uint32_t hwnd, int shown_l, int shown_t, int shown_w, int shown_h, int asked_l,
+                     int asked_t, int asked_w, int asked_h) {
+  std::lock_guard<std::recursive_mutex> l(g_mu);
+  if (shown_w <= 0 || shown_h <= 0)
+    g_pointer_remap.erase(hwnd);
+  else
+    g_pointer_remap[hwnd] = {shown_l, shown_t, shown_w, shown_h, asked_l, asked_t, asked_w, asked_h};
 }
 
 void CursorInClient(uint32_t hwnd, int* x, int* y) {

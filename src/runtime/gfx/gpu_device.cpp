@@ -2918,10 +2918,36 @@ void r_color0(inout vec4 c) {
       } else if (f == Format::X8R8G8B8) {
         const auto* p = reinterpret_cast<const uint32_t*>(s);
         for (int x = 0; x < w; x++) d[x] = p[x] | 0xFF000000u;
+      } else if (const uint32_t* lut = Lut16(f)) {
+        // 16-bit formats: a table of DecodePixel's results, so the same
+        // values at a fraction of the cost (full-screen 2D blits).
+        const auto* p = reinterpret_cast<const uint16_t*>(s);
+        for (int x = 0; x < w; x++) d[x] = lut[p[x]];
       } else {
         for (int x = 0; x < w; x++) d[x] = DecodePixel(s + size_t(x) * bpp, f);
       }
     }
+  }
+
+  // DecodePixel of every value of a 16-bit format, built on first use;
+  // null for other formats.
+  static const uint32_t* Lut16(Format f) {
+    static const Format kFormats[] = {Format::R5G6B5, Format::X1R5G5B5, Format::A1R5G5B5,
+                                      Format::A4R4G4B4, Format::X4R4G4B4};
+    static std::once_flag once[std::size(kFormats)];
+    static std::vector<uint32_t> tables[std::size(kFormats)];
+    for (size_t i = 0; i < std::size(kFormats); i++) {
+      if (kFormats[i] != f) continue;
+      std::call_once(once[i], [&] {
+        tables[i].resize(65536);
+        for (uint32_t v = 0; v < 65536; v++) {
+          uint16_t raw = uint16_t(v);
+          tables[i][v] = DecodePixel(reinterpret_cast<const uint8_t*>(&raw), f);
+        }
+      });
+      return tables[i].data();
+    }
+    return nullptr;
   }
 
   // ---- DirectDraw blits: a textured screen quad with private state

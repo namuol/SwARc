@@ -62,6 +62,14 @@ void ShowWindowNoActivate(uint32_t hwnd);
 // frame into it (gfx::FitRect) and the pointer is mapped back.
 void ClientAreaSize(uint32_t hwnd, int* w, int* h);
 
+// A presenter that shows the game's picture in a smaller rectangle than the
+// one the game drew it to (GDI integer scaling): pointer positions in
+// `shown` (client pixels) are reported to the game as the matching points
+// of `asked`, so clicks land where the game drew what the player sees.
+// shown_w = 0 removes it.
+void SetPointerRemap(uint32_t hwnd, int shown_l, int shown_t, int shown_w, int shown_h, int asked_l,
+                     int asked_t, int asked_w, int asked_h);
+
 // The cursor as GetCursorPos reports it, in hwnd's client coordinates.
 void CursorInClient(uint32_t hwnd, int* x, int* y);
 // PostMessage from host code (any thread): queues msg for hwnd's thread.

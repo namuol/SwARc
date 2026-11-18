@@ -53,6 +53,25 @@ struct GameConfig : recomp::GameConfig {
   };
   Fullscreen fullscreen = Fullscreen::Desktop;
 
+  // Whether presenting a GDI-drawn window waits for the display's refresh.
+  // For games that pace their frames by time and present as soon as a frame
+  // is ready (with a minimum frame time patched out): vsync then sets the
+  // frame rate to the display's. <ID>_VSYNC=0|1 overrides it.
+  bool vsync = false;
+
+  // How GDI blits that enlarge onto a window are scaled (the GPU does it;
+  // <ID>_GDI_SCALE=nearest|integer|sharp overrides it):
+  // - Nearest: nearest-neighbour onto the rectangle the game asked for
+  //   (pixels unevenly sized when the scale isn't a whole number).
+  // - Integer: square pixels at the largest whole-number scale that fits
+  //   that rectangle, centred in it, the rest black; the pointer is mapped
+  //   back to the game's rectangle (SetPointerRemap).
+  // - SharpBilinear: nearest-neighbour up to that whole-number scale, then
+  //   bilinear filtering for the rest of the way: fills the rectangle with
+  //   even, crisp pixels, only their edges blended.
+  enum class GdiScale { Nearest, Integer, SharpBilinear };
+  GdiScale gdi_scale = GdiScale::Nearest;
+
   // Video memory DirectDraw reports, in MB. Games pick detail settings
   // from it; a game's best profile may need more than the default.
   uint32_t video_memory_mb = 64;

@@ -1,3 +1,4 @@
+#include <cctype>
 #include "program.h"
 
 #include <filesystem>
@@ -176,6 +177,26 @@ bool Program::LoadManifest(const std::string& path, std::string* err) {
       replaced.insert(va);
       natives[va] = name;
       names[va] = name;
+    } else if (kind == "patch") {
+      // patch <va> <hex bytes>: the code is lifted as if these bytes were
+      // there (a game project's fix to an instruction inside a function,
+      // e.g. a constant). Only what is lifted changes: the image's bytes in
+      // guest memory stay the original ones.
+      std::string hex;
+      for (char ch : name)
+        if (!std::isspace(static_cast<unsigned char>(ch))) hex += ch;
+      if (hex.empty() || hex.size() % 2) {
+        *err = path + ":" + std::to_string(no) + ": patch needs whole hex bytes";
+        return false;
+      }
+      for (size_t i = 0; i < hex.size(); i += 2) {
+        uint64_t at = va + i / 2;
+        if (at < mod.text_lo || at >= mod.text_hi) {
+          *err = path + ":" + std::to_string(no) + ": patch outside .text";
+          return false;
+        }
+        *mem.ptr<uint8_t>(at) = uint8_t(std::stoul(hex.substr(i, 2), nullptr, 16));
+      }
     } else if (kind == "host") {
       if (name.empty()) {
         *err = path + ":" + std::to_string(no) + ": host needs a symbol";

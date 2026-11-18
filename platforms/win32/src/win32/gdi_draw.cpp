@@ -11,8 +11,9 @@
 // - Memory DCs (CreateCompatibleDC) select a bitmap, a palette, a brush.
 // - Window DCs (user32 GetDC: DcForWindow) draw into a render target of the
 //   window's client size on its gfx device: a blit onto a window uploads the
-//   source rectangle at its own size and the GPU scales it (linear
-//   filtering, as HALFTONE stretching looks), fills are GPU fills. A blit
+//   source rectangle at its own size and the GPU scales it
+//   (GameConfig::gdi_scale: nearest-neighbour, whole-number or sharp
+//   bilinear, whatever the stretch mode), fills are GPU fills. A blit
 //   onto a window presents the target (present.h: screenshots and frame
 //   reports apply); fills alone don't present, they only change what the
 //   next present shows. Windows are not read back: a window as a blit
@@ -23,6 +24,7 @@
 //   SetStretchBltMode asked for.
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <map>
@@ -30,12 +32,14 @@
 #include <mutex>
 #include <vector>
 
+#include "runtime/env.h"
 #include "runtime/gfx/present.h"
 #include "runtime/log.h"
 #include "win32/font_raster.h"
 #include "win32/gdi_state.h"
 #include "win32/hle.h"
 #include "win32/kernel32_state.h"
+#include "win32/process.h"
 #include "win32/user32_window.h"
 #include "x86/present.h"
 
@@ -153,8 +157,37 @@ struct WinSurface {
   std::unique_ptr<gfx::Device> dev;
   gfx::TextureId target = 0;
   int w = 0, h = 0;
+  // Blit sources are uploaded here, then scaled onto the target.
+  gfx::TextureId src = 0;
+  int src_w = 0, src_h = 0;
+  gfx::Format src_fmt = gfx::Format::Unknown;
+  std::array<int, 8> remap{};  // the pointer remap set (SetPointerRemap)
+  // Sharp bilinear: the whole-number nearest-neighbour step.
+  gfx::TextureId mid = 0;
+  int mid_w = 0, mid_h = 0;
 };
 std::map<uint32_t, WinSurface> g_windows;
+
+// GameConfig::vsync, or <ID>_VSYNC.
+bool Vsync() {
+  const char* e = Env("VSYNC");
+  if (e && *e) return *e != '0';
+  return Game().vsync;
+}
+
+// GameConfig::gdi_scale, or <ID>_GDI_SCALE.
+win32::GameConfig::GdiScale ScaleMode() {
+  using M = win32::GameConfig::GdiScale;
+  static const M m = [] {
+    const char* e = Env("GDI_SCALE");
+    if (!e || !*e) return Game().gdi_scale;
+    if (!std::strcmp(e, "nearest")) return M::Nearest;
+    if (!std::strcmp(e, "integer")) return M::Integer;
+    if (!std::strcmp(e, "sharp")) return M::SharpBilinear;
+    FatalF("GDI_SCALE=%s: expected nearest, integer or sharp", e);
+  }();
+  return m;
+}
 
 // The window's target at its current client size; null off the main
 // thread (SDL video belongs to it) or before the window has a host window.
@@ -172,7 +205,7 @@ WinSurface* WinFor(uint32_t hwnd) {
   w = std::max(w, 1);
   h = std::max(h, 1);
   if (w != s.w || h != s.h) {
-    s.dev->ResetSwapChain(w, h, false);
+    s.dev->ResetSwapChain(w, h, Vsync());
     gfx::TextureId t = s.dev->CreateTexture(w, h, 1, gfx::Format::X8R8G8B8, true);
     s.dev->FillTexture(t, {0, 0, w, h}, 0xFF000000u);
     if (s.target) {
@@ -767,15 +800,61 @@ void DrawToWindow(uint32_t hwnd, const Surf& src, int sx, int sy, int sw, int sh
   gfx::Rect dr{map(lx, sx, sw, dx, dw), map(ty, sy, sh, dy, dh), map(rx, sx, sw, dx, dw),
                map(by, sy, sh, dy, dh)};
   int w = x1 - x0, h = y1 - y0;
+  using Mode = win32::GameConfig::GdiScale;
+  const Mode mode = ScaleMode();
+  std::array<int, 8> remap{};
+  if (mode == Mode::Integer && dw >= sw && dh >= sh) {
+    // Square pixels: a whole-number scale, centred in what was asked for.
+    int k = std::max(1, std::min(dw / sw, dh / sh));
+    if (k * sw != dw || k * sh != dh) {
+      FillWindow(hwnd, dx, dy, dx + dw, dy + dh, 0);
+      int ox = dx + (dw - k * sw) / 2, oy = dy + (dh - k * sh) / 2;
+      dr = {ox + k * (lx - sx), oy + k * (ty - sy), ox + k * (rx - sx), oy + k * (by - sy)};
+      remap = {ox, oy, k * sw, k * sh, dx, dy, dw, dh};
+    }
+  }
+  // Clicks go where the game drew what is shown there.
+  if (remap != win->remap) {
+    win->remap = remap;
+    SetPointerRemap(hwnd, remap[0], remap[1], remap[2], remap[3], remap[4], remap[5], remap[6],
+                    remap[7]);
+  }
   gfx::Format fmt = gfx::Format::Unknown;
   if (src.bpp == 32 && !src.masks[0]) fmt = gfx::Format::X8R8G8B8;
   else if (src.bpp == 24) fmt = gfx::Format::R8G8B8;
   else if (src.bpp == 16 && (!src.masks[0] || src.masks[0] == 0x7C00)) fmt = gfx::Format::X1R5G5B5;
   else if (src.bpp == 16 && src.masks[0] == 0xF800 && src.masks[1] == 0x07E0) fmt = gfx::Format::R5G6B5;
-  win->dev->SetRenderTarget(win->target, 0);
+  // Uploads w x h pixels at `p` and scales them onto dr, nearest-neighbour
+  // (crisp pixels, as GDI's own stretching).
+  auto draw = [&](const uint8_t* p, uint32_t pitch, gfx::Format f) {
+    if (!win->src || win->src_w < w || win->src_h < h || win->src_fmt != f) {
+      if (win->src) win->dev->DestroyTexture(win->src);
+      win->src_w = std::max(w, win->src_w);
+      win->src_h = std::max(h, win->src_h);
+      win->src_fmt = f;
+      win->src = win->dev->CreateTexture(win->src_w, win->src_h, 1, f, true);
+    }
+    win->dev->UpdateTexture(win->src, 0, {0, 0, w, h}, p, pitch);
+    const int drw = dr.right - dr.left, drh = dr.bottom - dr.top;
+    const int k = std::min(drw / w, drh / h);
+    if (mode != Mode::SharpBilinear || k < 1 || (k * w == drw && k * h == drh)) {
+      win->dev->StretchRect({win->src, 0}, {0, 0, w, h}, {win->target, 0}, dr, false);
+      return;
+    }
+    // Sharp bilinear: whole-number nearest-neighbour into `mid`, then the
+    // rest of the way filtered.
+    if (!win->mid || win->mid_w < k * w || win->mid_h < k * h) {
+      if (win->mid) win->dev->DestroyTexture(win->mid);
+      win->mid_w = std::max(k * w, win->mid_w);
+      win->mid_h = std::max(k * h, win->mid_h);
+      win->mid = win->dev->CreateTexture(win->mid_w, win->mid_h, 1, gfx::Format::X8R8G8B8, true);
+    }
+    win->dev->StretchRect({win->src, 0}, {0, 0, w, h}, {win->mid, 0}, {0, 0, k * w, k * h}, false);
+    win->dev->StretchRect({win->mid, 0}, {0, 0, k * w, k * h}, {win->target, 0}, dr, true);
+  };
   if (fmt != gfx::Format::Unknown && !mx && !my && src.stride > 0) {
     // Straight from the DIB's memory.
-    win->dev->Blit(src.row0, uint32_t(src.stride), fmt, {x0, y0, x1, y1}, dr, false, 0);
+    draw(src.row0 + y0 * src.stride + size_t(x0) * (src.bpp / 8), uint32_t(src.stride), fmt);
     return;
   }
   static std::vector<uint8_t> tmp;
@@ -786,7 +865,7 @@ void DrawToWindow(uint32_t hwnd, const Surf& src, int sx, int sy, int sw, int sh
     for (int y = 0; y < h; y++)
       std::memcpy(&tmp[row * y], src.row0 + (my ? y1 - 1 - y : y0 + y) * src.stride + size_t(x0) * (src.bpp / 8),
                   row);
-    win->dev->Blit(tmp.data(), uint32_t(row), fmt, {0, 0, w, h}, dr, false, 0);
+    draw(tmp.data(), uint32_t(row), fmt);
     return;
   }
   // Palettes, other masks, mirroring: convert.
@@ -795,7 +874,7 @@ void DrawToWindow(uint32_t hwnd, const Surf& src, int sx, int sy, int sw, int sh
   for (int y = 0; y < h; y++)
     for (int x = 0; x < w; x++)
       px[size_t(y) * w + x] = ReadPx(src, mx ? x1 - 1 - x : x0 + x, my ? y1 - 1 - y : y0 + y);
-  win->dev->Blit(px, uint32_t(w) * 4, gfx::Format::X8R8G8B8, {0, 0, w, h}, dr, false, 0);
+  draw(tmp.data(), uint32_t(w) * 4, gfx::Format::X8R8G8B8);
 }
 
 uint32_t StretchImpl(uint32_t hdst, int dx, int dy, int dw, int dh, uint32_t hsrc, int sx, int sy,
