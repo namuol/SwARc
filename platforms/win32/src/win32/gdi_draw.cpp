@@ -32,6 +32,7 @@
 
 #include "runtime/gfx/present.h"
 #include "runtime/log.h"
+#include "win32/font_raster.h"
 #include "win32/gdi_state.h"
 #include "win32/hle.h"
 #include "win32/kernel32_state.h"
@@ -76,6 +77,16 @@ std::map<uint32_t, Palette> g_palettes;
 std::map<uint32_t, Brush> g_brushes;
 std::map<uint32_t, Dc> g_dcs;
 
+// Fonts (CreateFont*) and each DC's text state (any DC, window DCs too).
+std::map<uint32_t, FontDesc> g_fonts;
+struct TextState {
+  uint32_t font = 0;  // 0: the stock SYSTEM_FONT
+  uint32_t color = 0, bk_color = 0xFFFFFF;
+  int bk_mode = 2;  // OPAQUE
+  uint32_t align = 0;
+};
+std::map<uint32_t, TextState> g_text;
+
 // A memory DC's initial bitmap: the stock 1x1 monochrome bitmap
 // (GetStockObject has no index for it; this is its handle here).
 constexpr uint32_t kStockBitmap = 0x00E000FF;
@@ -111,6 +122,29 @@ uint32_t BrushColor(uint32_t h) {
     return kSys[h - 1];
   }
   return 0;
+}
+
+// Stock fonts (GetStockObject OEM_FIXED_FONT 10 .. DEFAULT_GUI_FONT 17).
+constexpr uint32_t kStockSystemFont = 0x00E0000D;
+bool IsFont(uint32_t h) {
+  if (g_fonts.count(h)) return true;
+  if ((h & 0xFFFFFF00) != 0x00E00000) return false;
+  uint32_t i = h & 0xFF;
+  return (i >= 10 && i <= 14) || i == 16 || i == 17;
+}
+FontDesc StockFont(uint32_t i) {
+  switch (i) {
+    case 10: case 11: case 16: return {"Courier New", 16, 400, false};  // fixed
+    case 12: case 17: return {"MS Sans Serif", -11, 400, false};       // ANSI_VAR, GUI
+    default: return {"System", 16, 700, false};                       // SYSTEM_FONT
+  }
+}
+FontDesc FontOfDc(uint32_t hdc) {
+  auto t = g_text.find(hdc);
+  uint32_t h = t == g_text.end() ? 0 : t->second.font;
+  auto f = g_fonts.find(h);
+  if (f != g_fonts.end()) return f->second;
+  return StockFont(h ? h & 0xFF : 13);
 }
 
 // ---- windows: a render target each ------------------------------------------------
@@ -492,6 +526,7 @@ HLE("gdi32.dll", CreateCompatibleDC, 1) {
 
 HLE("gdi32.dll", DeleteDC, 1) {
   std::lock_guard<std::recursive_mutex> l(g_mu);
+  g_text.erase(Arg(c, 0));
   return g_dcs.erase(Arg(c, 0)) ? 1 : (WindowForDc(Arg(c, 0)) ? 1 : 0);
 }
 
@@ -531,6 +566,7 @@ HLE("gdi32.dll", DeleteObject, 1) {
   }
   g_palettes.erase(h);
   g_brushes.erase(h);
+  g_fonts.erase(h);
   return 1;
 }
 
@@ -540,6 +576,12 @@ HLE("gdi32.dll", DeleteObject, 1) {
 HLE("gdi32.dll", SelectObject, 2) {
   std::lock_guard<std::recursive_mutex> l(g_mu);
   uint32_t hdc = Arg(c, 0), h = Arg(c, 1);
+  if (IsFont(h)) {
+    TextState& t = g_text[hdc];
+    uint32_t prev = t.font ? t.font : kStockSystemFont;
+    t.font = h == kStockSystemFont ? 0 : h;
+    return prev;
+  }
   auto d = g_dcs.find(hdc);
   if (d != g_dcs.end()) {
     if (g_bitmaps.count(h) || h == kStockBitmap) {
@@ -908,6 +950,231 @@ HLE("user32.dll", ScrollDC, 7) {
   return 1;
 }
 
+
+// ---- text ---------------------------------------------------------------------------
+// Fonts are the host's (font_raster.h); text is drawn into memory DCs'
+// pixels (DIB sections, DirectDraw surfaces' GetDC). Text on a window DC
+// is measured but not drawn.
+
+FontDesc ReadLogFont(gaddr lf) {
+  FontDesc f;
+  f.height = int32_t(Rd32(lf));
+  f.weight = int32_t(Rd32(lf + 16));
+  f.italic = Rd8(lf + 20) != 0;
+  char face[33] = {};
+  for (int i = 0; i < 32; i++) face[i] = char(Rd8(lf + 28 + i));
+  f.face = face;
+  return f;
+}
+
+HLE("gdi32.dll", CreateFontIndirectA, 1) {
+  std::lock_guard<std::recursive_mutex> l(g_mu);
+  uint32_t h = NewHandle();
+  g_fonts[h] = ReadLogFont(Arg(c, 0));
+  return h;
+}
+
+// (height, width, escapement, orientation, weight, italic, underline,
+// strikeout, charset, out precision, clip precision, quality, pitch and
+// family, face)
+HLE("gdi32.dll", CreateFontA, 14) {
+  std::lock_guard<std::recursive_mutex> l(g_mu);
+  FontDesc f;
+  f.height = int32_t(Arg(c, 0));
+  f.weight = int32_t(Arg(c, 4));
+  f.italic = Arg(c, 5) != 0;
+  if (gaddr face = Arg(c, 13))
+    for (int i = 0; i < 32 && Rd8(face + i); i++) f.face += char(Rd8(face + i));
+  uint32_t h = NewHandle();
+  g_fonts[h] = f;
+  return h;
+}
+
+HLE("gdi32.dll", SetTextColor, 2) {
+  std::lock_guard<std::recursive_mutex> l(g_mu);
+  uint32_t& v = g_text[Arg(c, 0)].color;
+  uint32_t prev = v;
+  v = Arg(c, 1);
+  return prev;
+}
+HLE("gdi32.dll", GetTextColor, 1) {
+  std::lock_guard<std::recursive_mutex> l(g_mu);
+  return g_text[Arg(c, 0)].color;
+}
+HLE("gdi32.dll", SetBkColor, 2) {
+  std::lock_guard<std::recursive_mutex> l(g_mu);
+  uint32_t& v = g_text[Arg(c, 0)].bk_color;
+  uint32_t prev = v;
+  v = Arg(c, 1);
+  return prev;
+}
+HLE("gdi32.dll", GetBkColor, 1) {
+  std::lock_guard<std::recursive_mutex> l(g_mu);
+  return g_text[Arg(c, 0)].bk_color;
+}
+HLE("gdi32.dll", SetBkMode, 2) {
+  std::lock_guard<std::recursive_mutex> l(g_mu);
+  int& v = g_text[Arg(c, 0)].bk_mode;
+  int prev = v;
+  v = int(Arg(c, 1));
+  return uint32_t(prev);
+}
+HLE("gdi32.dll", GetBkMode, 1) {
+  std::lock_guard<std::recursive_mutex> l(g_mu);
+  return uint32_t(g_text[Arg(c, 0)].bk_mode);
+}
+HLE("gdi32.dll", SetTextAlign, 2) {
+  std::lock_guard<std::recursive_mutex> l(g_mu);
+  uint32_t& v = g_text[Arg(c, 0)].align;
+  uint32_t prev = v;
+  v = Arg(c, 1);
+  return prev;
+}
+HLE("gdi32.dll", GetTextAlign, 1) {
+  std::lock_guard<std::recursive_mutex> l(g_mu);
+  return g_text[Arg(c, 0)].align;
+}
+
+std::string GuestText(gaddr s, int n) {
+  std::string t;
+  if (!s || n <= 0) return t;
+  t.resize(size_t(n));
+  for (int i = 0; i < n; i++) t[size_t(i)] = char(Rd8(s + uint32_t(i)));
+  return t;
+}
+
+HLE("gdi32.dll", GetTextMetricsA, 2) {
+  FontDesc f;
+  {
+    std::lock_guard<std::recursive_mutex> l(g_mu);
+    f = FontOfDc(Arg(c, 0));
+  }
+  const FontMetrics m = MeasureFont(f);
+  uint32_t tm = Arg(c, 1);
+  std::memset(GPtr(tm), 0, 56);
+  Wr32(tm + 0, uint32_t(m.ascent + m.descent));  // tmHeight
+  Wr32(tm + 4, uint32_t(m.ascent));
+  Wr32(tm + 8, uint32_t(m.descent));
+  Wr32(tm + 20, uint32_t(m.ave_width));
+  Wr32(tm + 24, uint32_t(m.max_width));
+  Wr32(tm + 28, uint32_t(f.weight ? f.weight : 400));
+  Wr32(tm + 36, 96);   // tmDigitizedAspectX
+  Wr32(tm + 40, 96);   // tmDigitizedAspectY
+  Wr8(tm + 44, 0x20);  // tmFirstChar
+  Wr8(tm + 45, 0xFF);  // tmLastChar
+  Wr8(tm + 46, '?');   // tmDefaultChar
+  Wr8(tm + 47, ' ');   // tmBreakChar
+  Wr8(tm + 48, f.italic ? 1 : 0);
+  Wr8(tm + 51, 0x26);  // tmPitchAndFamily: variable pitch, TrueType, swiss
+  return 1;
+}
+
+HLE("gdi32.dll", GetCharWidthA, 4) {
+  FontDesc f;
+  {
+    std::lock_guard<std::recursive_mutex> l(g_mu);
+    f = FontOfDc(Arg(c, 0));
+  }
+  uint32_t first = Arg(c, 1), last = Arg(c, 2), buf = Arg(c, 3);
+  for (uint32_t ch = first; ch <= last && ch <= 0xFF; ch++) {
+    char b = char(ch);
+    Wr32(buf + 4 * (ch - first), uint32_t(TextWidth(f, &b, 1)));
+  }
+  return 1;
+}
+
+uint32_t TextExtent(Ctx& c) {
+  FontDesc f;
+  {
+    std::lock_guard<std::recursive_mutex> l(g_mu);
+    f = FontOfDc(Arg(c, 0));
+  }
+  const std::string t = GuestText(Arg(c, 1), int(Arg(c, 2)));
+  const FontMetrics m = MeasureFont(f);
+  Wr32(Arg(c, 3), uint32_t(TextWidth(f, t.data(), int(t.size()))));
+  Wr32(Arg(c, 3) + 4, uint32_t(m.ascent + m.descent));
+  return 1;
+}
+HLE("gdi32.dll", GetTextExtentPoint32A, 4) { return TextExtent(c); }
+HLE("gdi32.dll", GetTextExtentPointA, 4) { return TextExtent(c); }
+
+struct IRect {
+  int l, t, r, b;
+};
+
+// Draws `t` at (x, y) per the DC's alignment, colours and background mode;
+// `opaque` (ETO_OPAQUE) is filled with the background colour first, `clip`
+// (ETO_CLIPPED) limits the text.
+void DrawTextAt(uint32_t hdc, int x, int y, const std::string& t, const IRect* clip,
+                const IRect* opaque) {
+  FontDesc f;
+  TextState st;
+  Surf s;
+  {
+    std::lock_guard<std::recursive_mutex> l(g_mu);
+    f = FontOfDc(hdc);
+    auto it = g_text.find(hdc);
+    if (it != g_text.end()) st = it->second;
+    s = SurfOfDc(hdc);
+  }
+  if (!s) {
+    static bool warned = false;
+    if (!warned) WarnF("gdi32: text on a window DC is not drawn\n");
+    warned = true;
+    return;
+  }
+  const uint32_t fg = ColorRefToXrgb(st.color & 0xFFFFFF), bg = ColorRefToXrgb(st.bk_color & 0xFFFFFF);
+  if (opaque) FillSurf(s, opaque->l, opaque->t, opaque->r, opaque->b, bg);
+  if (t.empty()) return;
+  std::vector<uint8_t> mask;
+  int w = 0, h = 0;
+  RasterizeText(f, t.data(), int(t.size()), &mask, &w, &h);
+  const FontMetrics m = MeasureFont(f);
+  switch (st.align & 6) {  // TA_CENTER 6, TA_RIGHT 2
+    case 6: x -= w / 2; break;
+    case 2: x -= w; break;
+  }
+  if ((st.align & 24) == 24) y -= m.ascent;  // TA_BASELINE
+  else if (st.align & 8) y -= h;             // TA_BOTTOM
+  IRect lim{0, 0, s.w, s.h};
+  if (clip) lim = {std::max(lim.l, clip->l), std::max(lim.t, clip->t), std::min(lim.r, clip->r),
+                   std::min(lim.b, clip->b)};
+  if (st.bk_mode == 2)
+    FillSurf(s, std::max(x, lim.l), std::max(y, lim.t), std::min(x + w, lim.r),
+             std::min(y + h, lim.b), bg);
+  for (int j = 0; j < h; j++) {
+    const int py = y + j;
+    if (py < lim.t || py >= lim.b) continue;
+    for (int i = 0; i < w; i++) {
+      const int px = x + i;
+      if (px < lim.l || px >= lim.r || !mask[size_t(j) * w + i]) continue;
+      WritePx(s, px, py, fg);
+    }
+  }
+}
+
+// (hdc, x, y, string, count)
+HLE("gdi32.dll", TextOutA, 5) {
+  DrawTextAt(Arg(c, 0), int32_t(Arg(c, 1)), int32_t(Arg(c, 2)),
+             GuestText(Arg(c, 3), int32_t(Arg(c, 4))), nullptr, nullptr);
+  return 1;
+}
+
+// (hdc, x, y, options, rect, string, count, dx): ETO_OPAQUE (2) and
+// ETO_CLIPPED (4) with the rectangle; per-character spacing is ignored.
+HLE("gdi32.dll", ExtTextOutA, 8) {
+  uint32_t opts = Arg(c, 3);
+  IRect r{};
+  bool have = Arg(c, 4) != 0;
+  if (have)
+    r = {int32_t(Rd32(Arg(c, 4))), int32_t(Rd32(Arg(c, 4) + 4)), int32_t(Rd32(Arg(c, 4) + 8)),
+         int32_t(Rd32(Arg(c, 4) + 12))};
+  DrawTextAt(Arg(c, 0), int32_t(Arg(c, 1)), int32_t(Arg(c, 2)),
+             GuestText(Arg(c, 5), int32_t(Arg(c, 6))), have && (opts & 4) ? &r : nullptr,
+             have && (opts & 2) ? &r : nullptr);
+  return 1;
+}
+
 }  // namespace
 
 uint32_t GdiDcForMemory(uint32_t bits, int w, int h, int bpp, uint32_t pitch, uint32_t rmask,
@@ -943,6 +1210,7 @@ void GdiReleaseMemoryDc(uint32_t hdc) {
   if (d == g_dcs.end()) return;
   g_bitmaps.erase(d->second.bitmap);
   g_dcs.erase(d);
+  g_text.erase(hdc);
 }
 
 }  // namespace recomp::hle

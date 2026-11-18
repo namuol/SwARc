@@ -67,13 +67,8 @@ uint32_t NewGdi() { return g_next_gdi += 0x10; }
 
 // Stock objects get fixed handles so repeated GetStockObject calls agree.
 HLE("gdi32.dll", GetStockObject, 1) { return 0x00E00000u | (Arg(c, 0) & 0xFF); }
-HLE("gdi32.dll", CreateFontA, 14) { return NewGdi(); }
-HLE("gdi32.dll", CreateFontIndirectA, 1) { return NewGdi(); }
 HLE("gdi32.dll", CreateHatchBrush, 2) { return NewGdi(); }
 
-HLE("gdi32.dll", SetBkMode, 2) { return 2; }      // previous: OPAQUE
-HLE("gdi32.dll", SetTextColor, 2) { return 0; }
-HLE("gdi32.dll", SetBkColor, 2) { return 0xFFFFFF; }
 
 HLE("gdi32.dll", GetDeviceCaps, 2) {
   switch (Arg(c, 1)) {
@@ -93,39 +88,10 @@ HLE("gdi32.dll", GetDeviceCaps, 2) {
   }
 }
 
-// Metrics of a generic 16 px proportional font.
-HLE("gdi32.dll", GetTextMetricsA, 2) {
-  uint32_t tm = Arg(c, 1);
-  std::memset(GPtr(tm), 0, 56);
-  Wr32(tm + 0, 16);   // tmHeight
-  Wr32(tm + 4, 13);   // tmAscent
-  Wr32(tm + 8, 3);    // tmDescent
-  Wr32(tm + 20, 7);   // tmAveCharWidth
-  Wr32(tm + 24, 14);  // tmMaxCharWidth
-  Wr32(tm + 28, 400); // tmWeight
-  Wr32(tm + 36, 96);  // tmDigitizedAspectX
-  Wr32(tm + 40, 96);  // tmDigitizedAspectY
-  Wr8(tm + 44, 0x20); // tmFirstChar
-  Wr8(tm + 45, 0xFF); // tmLastChar
-  Wr8(tm + 46, '?');  // tmDefaultChar
-  Wr8(tm + 47, ' ');  // tmBreakChar
-  Wr8(tm + 51, 0x26); // tmPitchAndFamily: variable pitch, TrueType, swiss
-  return 1;
-}
-
-HLE("gdi32.dll", GetCharWidthA, 4) {
-  uint32_t first = Arg(c, 1), last = Arg(c, 2), buf = Arg(c, 3);
-  for (uint32_t ch = first; ch <= last; ch++) Wr32(buf + 4 * (ch - first), 7);
-  return 1;
-}
-
 HLE("gdi32.dll", TextOutW, 5) { return 1; }
-HLE("gdi32.dll", ExtTextOutA, 8) { return 1; }
 HLE("gdi32.dll", GetPixel, 3) { return 0; }
 HLE("gdi32.dll", DPtoLP, 3) { return 1; }
 
-// Drawing to a DC has no output (see the top of this file).
-HLE("gdi32.dll", TextOutA, 5) { return 1; }
 
 HLE("gdi32.dll", GetDIBits, 7) {
   WarnF("GetDIBits: no GDI surfaces; returning 0 lines\n");

@@ -41,6 +41,9 @@ namespace recomp {
 constexpr SDL_MouseID kTestPointer = 0xD51D51;
 // TEST_INPUT "warp": resolved to a relative move when injected.
 constexpr SDL_MouseID kWarp = 0xD51D52;
+// TEST_INPUT relative moves ("move", "goto", a resolved "warp"): they carry
+// no host position, so they always move the cursor by their motion.
+constexpr SDL_MouseID kTestRelative = 0xD51D53;
 
 namespace {
 
@@ -616,7 +619,13 @@ void HandleSdlEvent(const SDL_Event& e) {
       }
       AttachClip();
       bool clipped = g_clip.on && g_clip.hwnd == h;
-      if (clipped || ExclusiveSize(h, &mw, &mh)) {
+      // In exclusive mode the cursor is virtual only while the game
+      // re-centres it (mouse look). A game that just reads GetCursorPos,
+      // as RTS menus and maps do, gets the host pointer's position mapped
+      // onto its screen, so its own cursor stays under the real one.
+      bool relative = e.motion.which == kTestRelative ||
+                      int64_t(TickCount()) - g_last_recentre_ms <= 250;
+      if (clipped || (relative && ExclusiveSize(h, &mw, &mh))) {
         // Virtual cursor: the game recentres it with SetCursorPos every
         // frame and steers its own pointer by the difference, as on a
         // fullscreen Windows desktop. Real motion moves the virtual
@@ -640,6 +649,10 @@ void HandleSdlEvent(const SDL_Event& e) {
         }
       } else {
         int x = int((e.motion.x - cm.x0) * cm.kx), y = int((e.motion.y - cm.y0) * cm.ky);
+        if (e.motion.which == kTestPointer) {  // already client pixels
+          x = int(e.motion.x);
+          y = int(e.motion.y);
+        }
         if (cm.fitted) {
           // Over the black bars: the pointer is at the screen's edge.
           x = std::clamp(x, 0, std::max(cm.cw - 1, 0));
@@ -1034,6 +1047,7 @@ void InjectTestInput() {
     auto motion = [](double t, float dx, float dy) {
       SDL_Event e{};
       e.type = SDL_EVENT_MOUSE_MOTION;
+      e.motion.which = kTestRelative;
       e.motion.xrel = dx;
       e.motion.yrel = dy;
       return TestEvent{t, e};
@@ -1135,7 +1149,7 @@ void InjectTestInput() {
         uint32_t h = HwndForSdl(id);
         int ox = 0, oy = 0;
         if (h) WindowOrigin(h, &ox, &oy);
-        e.motion.which = 0;
+        e.motion.which = kTestRelative;
         e.motion.xrel = e.motion.x - float(g_mouse_x - ox);
         e.motion.yrel = e.motion.y - float(g_mouse_y - oy);
       }

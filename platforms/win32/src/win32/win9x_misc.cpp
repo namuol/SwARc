@@ -170,13 +170,8 @@ HLE("user32.dll", WaitForInputIdle, 2) { return 0; }
 HLE("user32.dll", WinHelpA, 4) { return 1; }
 
 // ---- gdi32 -------------------------------------------------------------------------
-// Text on window DCs is not drawn (the game draws its own fonts into
-// surfaces); these keep the calls that set up GDI text consistent.
+// Text (fonts, colours, measuring, drawing) is in gdi_draw.cpp.
 
-HLE("gdi32.dll", GetBkColor, 1) { return 0xFFFFFF; }
-HLE("gdi32.dll", GetBkMode, 1) { return 2; }  // OPAQUE
-HLE("gdi32.dll", GetTextColor, 1) { return 0; }
-HLE("gdi32.dll", SetTextAlign, 2) { return 0; }
 HLE("gdi32.dll", SaveDC, 1) { return 1; }
 HLE("gdi32.dll", RestoreDC, 2) { return 1; }
 HLE("gdi32.dll", SetGraphicsMode, 2) { return 1; }
@@ -187,12 +182,6 @@ HLE("gdi32.dll", SetViewportOrgEx, 4) {
 }
 HLE("gdi32.dll", SetWindowOrgEx, 4) {
   if (Arg(c, 3)) Wr32(Arg(c, 3), 0), Wr32(Arg(c, 3) + 4, 0);
-  return 1;
-}
-// GetTextExtentPoint32A(hdc, str, len, SIZE*): the system font's 8x16 cells.
-HLE("gdi32.dll", GetTextExtentPoint32A, 4) {
-  Wr32(Arg(c, 3), Arg(c, 2) * 8);
-  Wr32(Arg(c, 3) + 4, 16);
   return 1;
 }
 

@@ -528,6 +528,39 @@ void Pull(Surface& s, const guest::RECT& r) {
 // A present skipped by the throttle is done later, from the message pump
 // (g_pump_present), so a burst of drawing that ends inside the 8 ms still
 // reaches the screen.
+// Dev aid: <ID>_CURSOR_MARK=1 draws a magenta cross on each front-buffer
+// present where the game reads the cursor (GetCursorPos), to compare with
+// the host pointer and with the game's own cursor. It never reaches the
+// game: the pixels under it are put back after the present.
+bool CursorMarkOn() {
+  static const bool on = [] {
+    const char* e = Env("CURSOR_MARK");
+    return e && *e && *e != '0';
+  }();
+  return on;
+}
+
+void DrawCursorMark(gfx::Rect* saved, std::vector<uint32_t>* under) {
+  constexpr int kArm = 6;  // cross arm length in pixels
+  int x = 0, y = 0;
+  CursorInClient(g_state.hwnd, &x, &y);
+  const int w = PrimaryWidth(), h = PrimaryHeight();
+  gfx::Rect r{std::max(x - kArm, 0), std::max(y - kArm, 0), std::min(x + kArm + 1, w),
+              std::min(y + kArm + 1, h)};
+  if (r.right <= r.left || r.bottom <= r.top) return;
+  const int rw = r.right - r.left, rh = r.bottom - r.top;
+  under->resize(size_t(rw) * rh);
+  Gfx()->ReadBackFront(r, under->data(), uint32_t(rw) * 4, gfx::Format::X8R8G8B8);
+  std::vector<uint32_t> px(*under);
+  for (int j = 0; j < rh; j++)
+    for (int i = 0; i < rw; i++) {
+      const int gx = r.left + i, gy = r.top + j;
+      if (gx == x || gy == y) px[size_t(j) * rw + i] = 0x00FF00FF;
+    }
+  Gfx()->BlitFront(px.data(), uint32_t(rw) * 4, gfx::Format::X8R8G8B8, {0, 0, rw, rh}, r);
+  *saved = r;
+}
+
 Uint64 g_last_front_ms = 0;
 bool g_front_pending = false;
 
@@ -537,15 +570,44 @@ void PresentFrontIfDue() {
   if (now - g_last_front_ms < 8) return;
   g_front_pending = false;
   g_last_front_ms = now;
+  const bool mark = CursorMarkOn();
+  gfx::Rect saved{};
+  std::vector<uint32_t> under;
+  if (mark) DrawCursorMark(&saved, &under);
   gfx::PresentFrontWithDevAids(*Gfx(), PrimaryWidth(), PrimaryHeight());
+  if (mark && !under.empty())  // the game's own pixels back
+    Gfx()->BlitFront(under.data(), uint32_t(saved.right - saved.left) * 4,
+                     gfx::Format::X8R8G8B8, {0, 0, saved.right - saved.left,
+                     saved.bottom - saved.top}, saved);
+  WatchdogFrame();
 }
 
 void PushFront(Surface& s, const gfx::Rect& r) {
   if (r.right <= r.left || r.bottom <= r.top) return;
   Gfx()->BlitFront(GPtr(s.mem), s.pitch, s.fmt, r, r);
+  // A game drawing on the primary is alive even when nothing reaches the
+  // screen for a while (a still menu redraws nothing): tell the watchdog,
+  // which otherwise only hears of back-buffer flips.
+  WatchdogFrame();
   if (SDL_GetTicks() - g_last_present_ms <= 50) return;  // frames are being presented
   g_front_pending = true;
-  if (!g_pump_present) g_pump_present = [] { PresentFrontIfDue(); };
+  if (!g_pump_present)
+    g_pump_present = [] {
+      // The game is pumping messages: alive, even if a still menu draws
+      // nothing for a while.
+      WatchdogFrame();
+      // With the cursor mark on, a moved cursor is worth a present even
+      // when the game draws nothing (menus showing the system cursor).
+      if (CursorMarkOn()) {
+        static int last_x = -1, last_y = -1;
+        int x = 0, y = 0;
+        CursorInClient(g_state.hwnd, &x, &y);
+        if (x != last_x || y != last_y) g_front_pending = true;
+        last_x = x;
+        last_y = y;
+      }
+      PresentFrontIfDue();
+    };
   PresentFrontIfDue();
 }
 
