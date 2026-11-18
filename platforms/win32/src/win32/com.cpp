@@ -53,6 +53,18 @@ uint32_t Vtable(const char* dll, const char* iface,
   return vt;
 }
 
+uint32_t VtableOf(const char* dll, const char* key,
+                  const std::vector<std::string>& handlers) {
+  std::lock_guard<std::recursive_mutex> l(g_mu);
+  auto it = g_vtables.find(key);
+  if (it != g_vtables.end()) return it->second;
+  uint32_t vt = HeapAllocProcess(uint32_t(handlers.size() * 4), false);
+  for (size_t i = 0; i < handlers.size(); i++)
+    Wr32(vt + 4 * uint32_t(i), hle::ThunkFor(dll, handlers[i]));
+  g_vtables[key] = vt;
+  return vt;
+}
+
 uint32_t Publish(std::shared_ptr<Object> obj, uint32_t vtable) {
   uint32_t p = HeapAllocProcess(16, true);
   Wr32(p, vtable);

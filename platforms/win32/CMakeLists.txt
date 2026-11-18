@@ -26,6 +26,7 @@ add_library(recomp_win32 SHARED
   src/win32/hle.cpp
   src/win32/kernel32.cpp
   src/win32/winmm_timer.cpp
+  src/win32/winmm_wave.cpp
   src/win32/kernel32_file.cpp
   src/win32/kernel32_sync.cpp
   src/win32/kernel32_seh.cpp
@@ -35,8 +36,10 @@ add_library(recomp_win32 SHARED
   src/win32/user32_input.cpp
   src/win32/user32_window.cpp
   src/win32/gdi32.cpp
+  src/win32/gdi_draw.cpp
   src/win32/present_overlay.cpp
   src/win32/shell_net.cpp
+  src/win32/win9x_misc.cpp
   src/win32/ws2_32.cpp
   src/win32/com.cpp)
 target_include_directories(recomp_win32 PUBLIC src)
@@ -83,6 +86,10 @@ target_link_libraries(recomp_xinput PUBLIC recomp_win32)
 
 # DirectInput 8 (keyboard and mouse) on the event pump's raw input; it
 # lists the XInput pads as game controllers.
+# GDI+ bitmaps (load, LockBits, save) on SDL's image codecs.
+add_library(recomp_gdiplus SHARED src/win32/gdiplus.cpp)
+target_link_libraries(recomp_gdiplus PUBLIC recomp_win32)
+
 add_library(recomp_dinput8 SHARED src/win32/dinput8.cpp)
 target_link_libraries(recomp_dinput8 PUBLIC recomp_win32 recomp_xinput)
 
@@ -107,7 +114,7 @@ target_link_libraries(recomp_opengl PUBLIC recomp_win32 recomp_gfx)
 add_library(recomp_ucrt SHARED src/win32/ucrt.cpp
             src/win32/ucrt_stdio.cpp src/win32/ucrt_time.cpp
             src/win32/vcruntime.cpp src/win32/vcruntime_eh.cpp
-            src/win32/msvcp140.cpp)
+            src/win32/msvcp140.cpp src/win32/msvcrt.cpp)
 target_link_libraries(recomp_ucrt PUBLIC recomp_win32 PRIVATE coremath)
 
 # Statically linked MSVC CRTs (32-bit guests): native functions a

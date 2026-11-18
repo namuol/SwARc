@@ -343,7 +343,32 @@ HLE_NAMED("binkw32.dll", "_BinkOpen@8", BinkOpen, 2) {
   uint32_t src = Arg(c, 0), flags = Arg(c, 1);
   auto m = std::make_unique<Movie>();
   std::string what;
-  if (flags & kBinkFromMemory) {
+  if (flags & 0x800000) {
+    // BINKFILEHANDLE: src is an open file handle positioned at the movie
+    // (inside an archive). Its bytes are read with the game's ReadFile
+    // (the size is in the Bink header) and played from memory.
+    uint32_t read_file = ProcAddress(ModuleHandle("kernel32.dll"), "ReadFile");
+    uint32_t buf = HeapAllocProcess(12, true), got = buf + 8;
+    CallGuest(c, read_file, {src, buf, 8, got, 0});
+    if (Rd32(got) != 8 || std::memcmp(GPtr(buf), "BIK", 3) != 0) {
+      HeapFreeProcess(buf);
+      WarnF("binkw32: BinkOpen: no Bink header at the file handle's position\n");
+      return 0;
+    }
+    uint32_t size = Le32(GPtr(buf) + 4) + 8;
+    m->data.assign(GPtr(buf), GPtr(buf) + 8);
+    HeapFreeProcess(buf);
+    uint32_t chunk = HeapAllocProcess(65536 + 4, false), cgot = chunk + 65536;
+    while (m->data.size() < size) {
+      uint32_t want = std::min<uint32_t>(65536, size - uint32_t(m->data.size()));
+      CallGuest(c, read_file, {src, chunk, want, cgot, 0});
+      uint32_t n = Rd32(cgot);
+      if (!n) break;
+      m->data.insert(m->data.end(), GPtr(chunk), GPtr(chunk) + n);
+    }
+    HeapFreeProcess(chunk);
+    what = "a file handle";
+  } else if (flags & kBinkFromMemory) {
     if (!EnsureReadable(c, src, 8) || std::memcmp(GPtr(src), "BIK", 3) != 0) {
       WarnF("binkw32: BinkOpen: no Bink header at %08X\n", src);
       return 0;
@@ -573,6 +598,46 @@ HLE_NAMED("binkw32.dll", "_BinkSetVolume@12", BinkSetVolume, 3) {
     if (t.voice) t.voice->volume = v;
   }
   return 0;
+}
+
+// The older BinkSetVolume(HBINK, volume): every track.
+HLE_NAMED("binkw32.dll", "_BinkSetVolume@8", BinkSetVolume8, 2) {
+  std::lock_guard<std::mutex> l(g_mu);
+  Movie* m = Find(Arg(c, 0), "BinkSetVolume");
+  if (!m) return 0;
+  float v = float(std::min<uint32_t>(Arg(c, 1), 65536)) / 32768.0f;
+  std::lock_guard<std::mutex> ml(audio::GetMixer().mu());
+  for (Track& t : m->tracks) {
+    t.volume = v;
+    if (t.voice) t.voice->volume = v;
+  }
+  return 0;
+}
+
+// BinkGetError(): the last error's text; there is none to report.
+HLE_NAMED("binkw32.dll", "_BinkGetError@0", BinkGetError, 0) {
+  static uint32_t s = 0;
+  if (!s) s = HeapAllocProcess(4, true);
+  return s;
+}
+
+// BinkDDSurfaceType(LPDIRECTDRAWSURFACE): the BINKSURFACE* type matching the
+// surface's pixel format, read with IDirectDrawSurface::GetPixelFormat
+// (vtable slot 21); -1 when no Bink type matches.
+HLE_NAMED("binkw32.dll", "_BinkDDSurfaceType@4", BinkDDSurfaceType, 1) {
+  uint32_t surf = Arg(c, 0);
+  if (!surf) return uint32_t(-1);
+  uint32_t pf = HeapAllocProcess(32, true);
+  Wr32(pf, 32);
+  CallGuest(c, Rd32(Rd32(surf) + 21 * 4), {surf, pf});
+  uint32_t bits = Rd32(pf + 12), r = Rd32(pf + 16), g = Rd32(pf + 20);
+  HeapFreeProcess(pf);
+  if (bits == 32) return 3;                   // BINKSURFACE32
+  if (bits == 24) return 1;                   // BINKSURFACE24
+  if (bits == 16 && r == 0xF800) return 10;   // BINKSURFACE565
+  if (bits == 16 && r == 0x7C00) return 9;    // BINKSURFACE555
+  (void)g;
+  return uint32_t(-1);
 }
 
 // BinkGetRealtime(HBINK, BINKREALTIME*, frames): the frame position and

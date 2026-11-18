@@ -79,6 +79,10 @@ struct State {
   gfx::TextureId target = 0;
   gfx::DepthId target_depth = 0;
   bool vsync = false;
+  // The interface version surfaces are created through (1-3: the
+  // IDirectDraw/IDirectDraw2 CreateSurface of DirectX 3-6 games, whose
+  // DDSURFACEDESC is the 108-byte one; 7: DDSURFACEDESC2).
+  int surface_version = 7;
 };
 State& St();
 // The gfx device, created on first use for the cooperative window.
@@ -105,6 +109,10 @@ struct Surface : com::Object {
   bool has_ck_src = false;
   guest::DDCOLORKEY ck_src{};
   bool locked = false;
+  // 7: IDirectDrawSurface7; 3: IDirectDrawSurface..3 (DDSURFACEDESC,
+  // DDSCAPS of one DWORD).
+  int version = 7;
+  uint32_t hdc = 0;  // GetDC's memory DC over `mem`, until ReleaseDC
   // Back buffer and primary: `mem` mirrors the GPU image lazily. Lock
   // reads back only what the game touches, Unlock uploads only rows it
   // changed (games often lock just to wait for the GPU).

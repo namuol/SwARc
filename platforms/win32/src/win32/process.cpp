@@ -188,8 +188,6 @@ int RunProcess(const win32::GameConfig& game, const std::string& exe_path,
   p.pump_events = PumpHostEvents;
   w.game_args = game_args;
   std::string err;
-  if (!w.img.Load(exe_path, p.mem, &err, 0, hle::ImportThunk))
-    FatalF("%s", err.c_str());
   for (const auto& d : game.lifted_dlls) {
     Module& m = w.modules.emplace_back();
     m.name = hle::NormaliseDll(d.name);
@@ -197,6 +195,25 @@ int RunProcess(const win32::GameConfig& game, const std::string& exe_path,
     m.base = d.base;
     MapModule(m);
   }
+  // The EXE's imports from a lifted DLL bind to that DLL's exports (by
+  // name, or "#<ordinal>"), as Windows' loader binds static imports; the
+  // rest go to the HLE.
+  auto bind = [&w](const std::string& dll, const std::string& name) -> gaddr {
+    std::string n = hle::NormaliseDll(dll);
+    for (Module& m : w.modules) {
+      if (m.name != n) continue;
+      m.static_import = true;
+      bool by_ordinal = !name.empty() && name[0] == '#';
+      uint32_t ordinal = by_ordinal ? uint32_t(std::stoul(name.substr(1))) : 0;
+      for (const PeExport& e : m.img.exports)
+        if (by_ordinal ? e.ordinal == ordinal : e.name == name) return e.va;
+      FatalF("%s imports %s!%s, which %s does not export", Game().exe_name.c_str(), dll.c_str(),
+             name.c_str(), m.name.c_str());
+    }
+    return hle::ImportThunk(dll, name);
+  };
+  if (!w.img.Load(exe_path, p.mem, &err, 0, bind))
+    FatalF("%s", err.c_str());
 
   if (p.x64) {
     // Everything above 4 GiB, below the TEBs.
@@ -264,7 +281,20 @@ int RunProcess(const win32::GameConfig& game, const std::string& exe_path,
 
   Thread* main = CreateGuestThread(w.img.stack_reserve);
   RegisterMainThread(main);
-  return int(RunMainThread(main, [&](Ctx& c) { return CallGuest(c, w.img.entry, {}); }));
+  return int(RunMainThread(main, [&](Ctx& c) {
+    // DLLs the EXE imports from are loaded (one reference) and initialised
+    // first, on the main thread, as Windows' loader does before the EXE's
+    // entry point.
+    for (Module& m : w.modules) {
+      if (!m.static_import) continue;
+      m.refs = 1;
+      if (!m.img.entry) continue;
+      m.stale = true;
+      if (!uint32_t(CallGuest(c, m.img.entry, {m.img.image_base, 1 /* PROCESS_ATTACH */, 0})))
+        FatalF("%s: DllMain(PROCESS_ATTACH) failed", m.name.c_str());
+    }
+    return CallGuest(c, w.img.entry, {});
+  }));
 }
 
 }  // namespace recomp

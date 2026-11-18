@@ -5,8 +5,10 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 
+#include "runtime/env.h"
 #include "runtime/log.h"
 
 namespace recomp::audio {
@@ -139,6 +141,44 @@ bool Prime(Voice& v) {
   return true;
 }
 
+// Dev aid: <ID>_MIX_DUMP=file.wav writes everything the mixer plays (16-bit
+// stereo at the mixer's rate) to a WAV file, to check audio without
+// listening. The header's sizes are rewritten as data comes in.
+struct MixDump {
+  FILE* f = nullptr;
+  uint32_t bytes = 0;
+  int rate = 0;
+  void Header() {
+    auto u32 = [&](uint32_t v) { std::fwrite(&v, 4, 1, f); };
+    auto u16 = [&](uint16_t v) { std::fwrite(&v, 2, 1, f); };
+    std::fseek(f, 0, SEEK_SET);
+    std::fwrite("RIFF", 1, 4, f); u32(36 + bytes); std::fwrite("WAVEfmt ", 1, 8, f);
+    u32(16); u16(1); u16(2); u32(uint32_t(rate)); u32(uint32_t(rate) * 4); u16(4); u16(16);
+    std::fwrite("data", 1, 4, f); u32(bytes);
+    std::fseek(f, 0, SEEK_END);
+  }
+  void Write(const float* buf, int frames, int r) {
+    static bool tried = false;
+    if (!tried) {
+      tried = true;
+      if (const char* p = Env("MIX_DUMP")) {
+        f = std::fopen(p, "wb");
+        rate = r;
+        if (f) Header();
+      }
+    }
+    if (!f) return;
+    for (int i = 0; i < frames * 2; i++) {
+      float v = std::clamp(buf[i], -1.0f, 1.0f);
+      int16_t x = int16_t(v * 32767.0f);
+      std::fwrite(&x, 2, 1, f);
+    }
+    bytes += uint32_t(frames) * 4;
+    Header();
+  }
+};
+MixDump g_mix_dump;
+
 void SDLCALL AudioCallback(void* ud, SDL_AudioStream* s, int additional, int) {
   auto* m = static_cast<Mixer*>(ud);
   float buf[kChunk * 2];
@@ -146,6 +186,7 @@ void SDLCALL AudioCallback(void* ud, SDL_AudioStream* s, int additional, int) {
   while (frames > 0) {
     int n = std::min(frames, kChunk);
     m->Mix(buf, n);
+    g_mix_dump.Write(buf, n, m->rate());
     SDL_PutAudioStreamData(s, buf, n * int(2 * sizeof(float)));
     frames -= n;
   }

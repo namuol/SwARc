@@ -878,6 +878,103 @@ HLE("kernel32.dll", GetDiskFreeSpaceExA, 4) {
   return 1;
 }
 
+
+// ---- the W forms of the path queries --------------------------------------------
+
+// CopyOut for a WCHAR buffer of `size` characters.
+uint32_t CopyOutW(uint32_t buf, uint32_t size, const std::string& s) {
+  if (size > s.size()) {
+    PutWStr(buf, s);
+    return uint32_t(s.size());
+  }
+  return uint32_t(s.size() + 1);
+}
+
+HLE("kernel32.dll", GetCurrentDirectoryW, 2) { return CopyOutW(Arg(c, 1), Arg(c, 0), GuestCurrentDir()); }
+
+// SetCurrentDirectory: relative paths resolve against the new directory.
+uint32_t SetCurrentDirectory(const std::string& g) {
+  std::string full = AbsGuest(g);
+  while (full.size() > 3 && full.back() == '\\') full.pop_back();
+  struct stat st;
+  if (stat(HostPath(full).c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
+    SetLastError(3);  // ERROR_PATH_NOT_FOUND
+    return 0;
+  }
+  std::lock_guard<std::mutex> l(g_cwd_mu);
+  g_cwd = full;
+  return 1;
+}
+HLE("kernel32.dll", SetCurrentDirectoryA, 1) { return SetCurrentDirectory(GStr(Arg(c, 0))); }
+HLE("kernel32.dll", SetCurrentDirectoryW, 1) { return SetCurrentDirectory(WidePath(Arg(c, 0))); }
+
+HLE("kernel32.dll", GetFullPathNameW, 4) {
+  std::string full = AbsGuest(WidePath(Arg(c, 0)));
+  uint32_t size = Arg(c, 1), buf = Arg(c, 2), filepart = Arg(c, 3);
+  uint32_t r = CopyOutW(buf, size, full);
+  if (r == full.size() && filepart) {
+    size_t s = full.find_last_of('\\');
+    Wr32(filepart, s == std::string::npos || s + 1 == full.size() ? 0 : buf + uint32_t(2 * (s + 1)));
+  }
+  return r;
+}
+
+HLE("kernel32.dll", GetTempPathW, 2) {
+  MakeDirs(UserDataRoot() + "/TEMP");
+  return CopyOutW(Arg(c, 1), Arg(c, 0), "C:\\TEMP\\");
+}
+
+HLE("kernel32.dll", GetWindowsDirectoryA, 2) { return CopyOut(Arg(c, 0), Arg(c, 1), "C:\\WINDOWS"); }
+HLE("kernel32.dll", GetWindowsDirectoryW, 2) { return CopyOutW(Arg(c, 0), Arg(c, 1), "C:\\WINDOWS"); }
+
+HLE("kernel32.dll", GetDiskFreeSpaceExW, 4) {
+  if (Arg(c, 1)) Wr64(Arg(c, 1), 8ull << 30);
+  if (Arg(c, 2)) Wr64(Arg(c, 2), 64ull << 30);
+  if (Arg(c, 3)) Wr64(Arg(c, 3), 8ull << 30);
+  return 1;
+}
+
+// CreateDirectoryExW(template, new, security): the template's attributes
+// are not copied.
+HLE("kernel32.dll", CreateDirectoryExW, 3) { return CreateDirectory(WidePath(Arg(c, 1))); }
+
+HLE("kernel32.dll", FindFirstFileExA, 6) {
+  if (Arg(c, 1) > 1 || Arg(c, 3) > 1) {
+    SetLastError(kErrorInvalidParameter);
+    return kInvalidHandle;
+  }
+  return FindFirst(GStr(Arg(c, 0)), Arg(c, 2), false);
+}
+
+// CopyFileW(from, to, failIfExists)
+HLE("kernel32.dll", CopyFileW, 3) {
+  std::string from = HostPath(WidePath(Arg(c, 0)));
+  std::string to = HostPath(WidePath(Arg(c, 1)), PathAccess::kWrite);
+  int in = open(from.c_str(), O_RDONLY | O_CLOEXEC);
+  if (in < 0) {
+    SetLastError(ErrnoToWin(errno));
+    return 0;
+  }
+  int out = open(to.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | (Arg(c, 2) ? O_EXCL : 0), 0644);
+  if (out < 0) {
+    SetLastError(errno == EEXIST ? 80 /* ERROR_FILE_EXISTS */ : ErrnoToWin(errno));
+    close(in);
+    return 0;
+  }
+  char buf[65536];
+  ssize_t n;
+  bool ok = true;
+  while ((n = read(in, buf, sizeof buf)) > 0) ok &= write(out, buf, size_t(n)) == n;
+  close(in);
+  close(out);
+  if (!ok) SetLastError(39);  // ERROR_HANDLE_DISK_FULL
+  return ok ? 1 : 0;
+}
+
+// SetFileTime(file, creation, access, write): file times are the host's;
+// the request succeeds without changing them.
+HLE("kernel32.dll", SetFileTime, 4) { return 1; }
+
 }  // namespace
 }  // namespace hle
 }  // namespace recomp

@@ -351,12 +351,44 @@ HLE_NAMED("dsound.dll", "#2", DirectSoundEnumerateA, 2) {
   return DS_OK;
 }
 
+// DirectSoundCreate (ordinal 1), the DirectX 3-7 entry: IDirectSound is
+// a prefix of IDirectSound8, so the same object serves it.
+HLE_NAMED("dsound.dll", "#1", DirectSoundCreate, 3) {
+  if (!Arg(c, 1)) return DSERR_INVALIDPARAM;
+  Wr32(Arg(c, 1), 0);
+  if (Arg(c, 2)) return DSERR_NOAGGREGATION;
+  if (!M().Open(48000)) return DSERR_NODRIVER;
+  Wr32(Arg(c, 1), com::Publish(std::make_shared<DirectSound>(), DirectSoundVtable()));
+  return DS_OK;
+}
+
 HLE_NAMED("dsound.dll", "#11", DirectSoundCreate8, 3) {
   if (!Arg(c, 1)) return DSERR_INVALIDPARAM;
   Wr32(Arg(c, 1), 0);
   if (Arg(c, 2)) return DSERR_NOAGGREGATION;
   if (!M().Open(48000)) return DSERR_NODRIVER;
   Wr32(Arg(c, 1), com::Publish(std::make_shared<DirectSound>(), DirectSoundVtable()));
+  return DS_OK;
+}
+
+// CoCreateInstance of CLSID_DirectSound or CLSID_DirectSound8: an object
+// not yet initialised; the creator calls IDirectSound::Initialize(guid)
+// before using it, as DirectSoundCreate would.
+uint32_t CreateDirectSoundCo(uint32_t iid, uint32_t* out) {
+  *out = 0;
+  if (!com::GuidEq(iid, kIID_IDirectSound8) && !com::GuidEq(iid, kIID_IDirectSound))
+    return com::kE_NOINTERFACE;
+  *out = com::Publish(std::make_shared<DirectSound>(), DirectSoundVtable());
+  return DS_OK;
+}
+constexpr guest::GUID kCLSID_DirectSound = {0x47D4D946, 0x62E8, 0x11CF, {0x93, 0xBC, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00}};
+constexpr guest::GUID kCLSID_DirectSound8 = {0x3901CC3F, 0x84B5, 0x4FA4, {0xBA, 0x35, 0xAA, 0x81, 0x72, 0xB8, 0xA0, 0x9B}};
+com::CoClassRegistrar reg_dsound{kCLSID_DirectSound, &CreateDirectSoundCo};
+com::CoClassRegistrar reg_dsound8{kCLSID_DirectSound8, &CreateDirectSoundCo};
+
+// (lpcGuid): opens the primary device, as DirectSoundCreate8 does.
+HLE_NAMED("dsound.dll", "IDirectSound8::Initialize", DS8_Initialize, 2) {
+  if (!M().Open(48000)) return DSERR_NODRIVER;
   return DS_OK;
 }
 
@@ -432,6 +464,8 @@ HLE_NAMED("dsound.dll", "IDirectSound8::CreateSoundBuffer", DS8_CreateSoundBuffe
   if (!ReadFormat(fmt, &d->fmt)) return DSERR_BADFORMAT;
   if (bytes < 4 || bytes > 0x0FFFFFFF) return DSERR_INVALIDPARAM;
   bytes -= bytes % d->fmt.block;
+  RECOMP_TRACE("  buffer: %u Hz, %u channels, %u bits, %u bytes, flags %X\n", d->fmt.rate,
+               d->fmt.channels, d->fmt.bits, bytes, flags);
   if ((flags & DSBCAPS_CTRL3D) && d->fmt.channels != 1) return DSERR_INVALIDPARAM;
   d->bytes.assign(bytes, d->fmt.bits == 8 ? 0x80 : 0);
   d->mem = HeapAllocProcess(bytes, true);
@@ -561,6 +595,7 @@ HLE_NAMED("dsound.dll", "IDirectSoundBuffer8::GetCurrentPosition", DSB8_GetCurre
                 ? uint32_t(b->src->ReadFrame()) * b->data->fmt.block
                 : play;
   }
+  RECOMP_TRACE("  play %u write %u\n", play, write);
   if (Arg(c, 1)) Wr32(Arg(c, 1), play);
   if (Arg(c, 2)) Wr32(Arg(c, 2), write);
   return DS_OK;

@@ -31,6 +31,11 @@ struct Object {
 // method names, in vtable order.
 uint32_t Vtable(const char* dll, const char* iface,
                 const std::vector<const char*>& methods);
+// The same, for an interface whose methods are (some of) another's: each
+// entry names its handler in full ("IOther::Method"). `key` names the
+// vtable (built once per key).
+uint32_t VtableOf(const char* dll, const char* key,
+                  const std::vector<std::string>& handlers);
 
 // Gives `obj` its guest pointer with `vtable`. Returns the pointer.
 uint32_t Publish(std::shared_ptr<Object> obj, uint32_t vtable);

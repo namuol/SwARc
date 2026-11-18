@@ -1,7 +1,6 @@
-// gdi32: device contexts, fonts and metrics. The game draws through
-// DirectDraw; GDI is only queried (metrics, device caps). Drawing calls
-// succeed without output. If the game turns out to render glyphs through
-// GDI (TextOutW/GetDIBits suggest IME text), real rasterisation goes here.
+// gdi32: fonts, text and metrics. Bitmaps, DCs and blits are in
+// gdi_draw.cpp. Text drawing succeeds without output; games that draw
+// glyphs through GDI need real rasterisation here.
 
 #include <atomic>
 #include <cstdio>
@@ -71,12 +70,6 @@ HLE("gdi32.dll", GetStockObject, 1) { return 0x00E00000u | (Arg(c, 0) & 0xFF); }
 HLE("gdi32.dll", CreateFontA, 14) { return NewGdi(); }
 HLE("gdi32.dll", CreateFontIndirectA, 1) { return NewGdi(); }
 HLE("gdi32.dll", CreateHatchBrush, 2) { return NewGdi(); }
-HLE("gdi32.dll", CreateSolidBrush, 1) { return NewGdi(); }
-HLE("gdi32.dll", CreateCompatibleDC, 1) { return NewGdi(); }
-HLE("gdi32.dll", CreateCompatibleBitmap, 3) { return NewGdi(); }
-HLE("gdi32.dll", DeleteObject, 1) { return 1; }
-HLE("gdi32.dll", DeleteDC, 1) { return 1; }
-HLE("gdi32.dll", SelectObject, 2) { return 0x00E00000u; }
 
 HLE("gdi32.dll", SetBkMode, 2) { return 2; }      // previous: OPAQUE
 HLE("gdi32.dll", SetTextColor, 2) { return 0; }
@@ -131,36 +124,8 @@ HLE("gdi32.dll", ExtTextOutA, 8) { return 1; }
 HLE("gdi32.dll", GetPixel, 3) { return 0; }
 HLE("gdi32.dll", DPtoLP, 3) { return 1; }
 
-// GetObjectA(h, size, out): a file bitmap as a BITMAP (24 bytes: bmType 0,
-// width, height, bytes per row rounded to 2 bytes as GDI does, one plane,
-// bits per pixel, no bits pointer for a device-dependent bitmap). Returns
-// the bytes written, or the size needed when out is NULL. Other objects
-// have nothing to describe here: 0.
-HLE("gdi32.dll", GetObjectA, 3) {
-  uint32_t h = Arg(c, 0), size = Arg(c, 1), out = Arg(c, 2);
-  BitmapDesc d;
-  if (!FindBitmap(h, &d)) {
-    WarnF("GetObjectA(%08X): not a bitmap loaded from a file\n", h);
-    return 0;
-  }
-  if (!out) return 24;
-  if (size < 24) return 0;
-  std::memset(GPtr(out), 0, 24);
-  Wr32(out + 4, uint32_t(d.width));
-  Wr32(out + 8, uint32_t(d.height));
-  Wr32(out + 12, ((uint32_t(d.width) * d.bits_per_pixel + 15) / 16) * 2);
-  Wr16(out + 16, 1);
-  Wr16(out + 18, d.bits_per_pixel);
-  return 24;
-}
-
-// GetCurrentObject(hdc, type): the stock object of that kind; DCs here
-// hold no selection (SelectObject returns a stock handle too).
-HLE("gdi32.dll", GetCurrentObject, 2) { return 0x00E00000u; }
-
 // Drawing to a DC has no output (see the top of this file).
 HLE("gdi32.dll", TextOutA, 5) { return 1; }
-HLE("gdi32.dll", BitBlt, 9) { return 1; }
 
 HLE("gdi32.dll", GetDIBits, 7) {
   WarnF("GetDIBits: no GDI surfaces; returning 0 lines\n");

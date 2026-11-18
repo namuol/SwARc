@@ -109,6 +109,7 @@ struct Module {
   int refs = 0;        // LoadLibrary count (under kernel32's loader lock)
   bool stale = false;  // has run since it was mapped: map afresh on load
   int tls_index = -1;  // its static TLS slot (x64 guests), -1: none
+  bool static_import = false;  // the EXE imports from it: loaded before the EXE runs
 };
 
 // The Win32 side of g_proc.

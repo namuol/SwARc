@@ -25,6 +25,10 @@ struct GameConfig {
   // $XDG_DATA_HOME/<id>, and dev/test switches are read from environment
   // variables named <ID>_<SWITCH> (GAME_TRACE, ...; runtime/env.h).
   std::string id;
+  // Whether CPUID reports MMX (32-bit guests). The lifter does not
+  // translate MMX instructions: a game with MMX code paths it picks by
+  // CPUID (blitters of the late 1990s) runs its plain x86 ones without it.
+  bool cpu_mmx = true;
 };
 
 // Processors reported to the game (PEB, GetSystemInfo): never 1. Games

@@ -39,6 +39,8 @@ namespace recomp {
 // SDL_MouseID of <ID>_TEST_INPUT "pointer" events: they stand for the host
 // pointer, which automated (background) runs otherwise ignore.
 constexpr SDL_MouseID kTestPointer = 0xD51D51;
+// TEST_INPUT "warp": resolved to a relative move when injected.
+constexpr SDL_MouseID kWarp = 0xD51D52;
 
 namespace {
 
@@ -84,6 +86,10 @@ struct Window {
   uint32_t tid = 0;
   bool visible = false, enabled = true, destroyed = false;
   bool minimized = false;      // as the game asked (IsIconic)
+  // Maximized (ShowWindow SW_SHOWMAXIMIZED): the window rect is the
+  // screen's (its frame outside it), and the rect to restore is kept.
+  bool maximized = false;
+  int nx = 0, ny = 0, nw = 0, nh = 0;
   int mode_w = 0, mode_h = 0;  // DirectDraw exclusive mode, see header
   // Host fullscreen (UpdateFullscreen), entered for a screen of fs_w x fs_h.
   bool fullscreen = false;
@@ -93,6 +99,23 @@ struct Window {
   // `title`; selection, font, image and check state are kept here.
   uint32_t sel_lo = 0, sel_hi = 0, font = 0, image = 0, check = 0;
   uint32_t limit = 30000;  // edit text limit (EM_SETLIMITTEXT)
+  // A dialog (user32_window.cpp, "dialog boxes"): no host window of its
+  // own; it is drawn by the game into its window, and the mouse reaches it
+  // through RouteMouse. A dialog's or a child's rect is relative to its
+  // owner's or parent's client area (x, y), as the game created it.
+  bool is_dialog = false;
+  // Needs painting (InvalidateRect, shown): WM_PAINT is synthesised for
+  // it when its thread's queue has nothing else, until it is validated
+  // (BeginPaint, ValidateRect, DefWindowProc's WM_PAINT).
+  bool dirty = false;
+  bool dialog_ended = false;
+  uint32_t dialog_result = 0;
+  // List box / combo box items and selection; trackbar / scroll bar range
+  // and position.
+  std::vector<std::pair<std::string, uint32_t>> items;
+  int32_t cur_sel = -1, top_index = 0;
+  int32_t range_lo = 0, range_hi = 100, pos = 0;
+  bool dropped = false;
 };
 
 struct Msg {
@@ -315,15 +338,87 @@ void SetKey(uint8_t vk, bool down) {
   g_key_down[vk] = down;
 }
 
+// The screen position of a window's rect: a child's or a dialog's x, y are
+// relative to its parent's (owner's) client area.
+void WindowScreenPos(const Window& w, int* x, int* y);
+
 void WindowOrigin(uint32_t hwnd, int* x, int* y) {
   *x = *y = 0;
   std::lock_guard<std::recursive_mutex> l(g_mu);
   if (Window* w = Win(hwnd)) {
-    int cw, ch;
+    int cw, ch, sx, sy;
     ClientSize(*w, &cw, &ch);
-    *x = w->x + (w->w - cw) / 2;
-    *y = w->y + (w->h - ch) - (w->w - cw) / 2;
+    WindowScreenPos(*w, &sx, &sy);
+    *x = sx + (w->w - cw) / 2;
+    *y = sy + (w->h - ch) - (w->w - cw) / 2;
   }
+}
+
+void WindowScreenPos(const Window& w, int* x, int* y) {
+  *x = w.x;
+  *y = w.y;
+  if ((w.style & WS_CHILD) || w.is_dialog) {
+    int px = 0, py = 0;
+    if (w.parent) WindowOrigin(w.parent, &px, &py);
+    *x += px;
+    *y += py;
+  }
+}
+
+bool ContainsScreen(const Window& w, int sx, int sy) {
+  int x, y;
+  WindowScreenPos(w, &x, &y);
+  return sx >= x && sy >= y && sx < x + w.w && sy < y + w.h;
+}
+
+// Whether hwnd is `top` or one of its dialogs (owner chain).
+bool OwnedBy(uint32_t hwnd, uint32_t top) {
+  for (int i = 0; hwnd && i < 16; i++) {
+    if (hwnd == top) return true;
+    Window* w = Win(hwnd);
+    if (!w) return false;
+    hwnd = w->parent;
+  }
+  return false;
+}
+
+// The window the mouse at screen sx, sy over top-level `top` talks to: the
+// newest visible dialog of `top` under it, then the deepest visible,
+// enabled child there (a static without SS_NOTIFY is transparent, as its
+// WM_NCHITTEST answers HTTRANSPARENT); `top` when no dialog is open.
+// *cx, *cy: the point in that window's client area.
+uint32_t RouteMouse(uint32_t top, int sx, int sy, int* cx, int* cy) {
+  uint32_t node = top;
+  {
+    std::lock_guard<std::recursive_mutex> l(g_mu);
+    uint32_t dlg = 0;
+    bool any = false;
+    for (auto& [hw, w] : g_windows)
+      if (!w.destroyed && w.is_dialog && w.visible && OwnedBy(hw, top)) {
+        any = true;
+        if (ContainsScreen(w, sx, sy)) dlg = hw;
+      }
+    if (any) {
+      if (dlg) node = dlg;
+      for (int depth = 0; depth < 8; depth++) {
+        uint32_t best = 0;
+        for (auto& [hw, w] : g_windows) {
+          if (w.destroyed || w.parent != node || !(w.style & WS_CHILD) || !w.visible ||
+              !w.enabled || !ContainsScreen(w, sx, sy))
+            continue;
+          if (w.cls == "static" && !(w.style & 0x100 /* SS_NOTIFY */)) continue;
+          best = hw;
+        }
+        if (!best) break;
+        node = best;
+      }
+    }
+  }
+  int ox, oy;
+  WindowOrigin(node, &ox, &oy);
+  *cx = sx - ox;
+  *cy = sy - oy;
+  return node;
 }
 
 // True (with the mode size) while hwnd is in DirectDraw exclusive mode.
@@ -553,7 +648,11 @@ void HandleSdlEvent(const SDL_Event& e) {
         g_mouse_x = ox + x;
         g_mouse_y = oy + y;
       }
-      Post(h, WM_MOUSEMOVE, MouseKeys(), MkLparam(g_mouse_x - ox, g_mouse_y - oy));
+      {
+        int cx, cy;
+        uint32_t t = RouteMouse(h, g_mouse_x, g_mouse_y, &cx, &cy);
+        Post(t, WM_MOUSEMOVE, MouseKeys(), MkLparam(cx, cy));
+      }
       break;
     }
     case SDL_EVENT_WINDOW_MOUSE_LEAVE:
@@ -588,7 +687,12 @@ void HandleSdlEvent(const SDL_Event& e) {
         dbl = down && w && (w->class_style & CS_DBLCLKS) && e.button.clicks == 2;
       }
       uint32_t msg = !down ? base + 1 : dbl ? base + 2 : base;
-      Post(h, msg, MouseKeys(), MkLparam(x, y));
+      int cx, cy;
+      uint32_t t = RouteMouse(h, g_mouse_x, g_mouse_y, &cx, &cy);
+      if (t == h)
+        Post(h, msg, MouseKeys(), MkLparam(x, y));
+      else
+        Post(t, msg, MouseKeys(), MkLparam(cx, cy));
       break;
     }
     case SDL_EVENT_MOUSE_WHEEL: {
@@ -647,7 +751,51 @@ bool TakeMessage(uint32_t hwnd, uint32_t lo, uint32_t hi, bool remove, Msg* out)
     if (remove) t.due = int64_t(now) + t.elapse;
     return true;
   }
+  // WM_PAINT for the first dirty visible window of this thread (parents
+  // before their children: they were created first).
+  constexpr uint32_t kWmPaint = 0x000F;
+  if (!lo && !hi ? true : (kWmPaint >= lo && kWmPaint <= hi)) {
+    for (auto& [h, w] : g_windows) {
+      if (w.destroyed || !w.dirty || !w.visible || w.tid != CurrentThread()->tid) continue;
+      if (hwnd && h != hwnd) continue;
+      *out = Msg{h, kWmPaint, 0, 0, now, g_mouse_x, g_mouse_y};
+      return true;
+    }
+  }
   return false;
+}
+
+// Marks hwnd (and with `children`, its descendants) as needing paint.
+void Invalidate(uint32_t hwnd, bool children) {
+  std::lock_guard<std::recursive_mutex> l(g_mu);
+  if (!hwnd) {
+    for (auto& [h, w] : g_windows) w.dirty = true;
+    return;
+  }
+  if (Window* w = Win(hwnd)) w->dirty = true;
+  if (!children) return;
+  for (auto& [h, w] : g_windows)
+    if (w.parent == hwnd && (w.style & WS_CHILD)) Invalidate(h, true);
+}
+
+// A child window or dialog moved or resized: the part of its parent it
+// uncovered needs painting (the parent is invalidated whole), and so does
+// the window itself.
+void ExposeParent(uint32_t hwnd) {
+  uint32_t parent = 0;
+  {
+    std::lock_guard<std::recursive_mutex> l(g_mu);
+    Window* w = Win(hwnd);
+    if (!w || !w->visible || !((w->style & WS_CHILD) || w->is_dialog)) return;
+    parent = w->parent;
+  }
+  if (parent) Invalidate(parent, false);
+  Invalidate(hwnd, false);
+}
+
+void Validate(uint32_t hwnd) {
+  std::lock_guard<std::recursive_mutex> l(g_mu);
+  if (Window* w = Win(hwnd)) w->dirty = false;
 }
 
 
@@ -921,6 +1069,16 @@ void InjectTestInput() {
         q.push_back({t, e});
       } else if (c == "move" && n == 4) {
         q.push_back(motion(t, std::atof(a), std::atof(b)));
+      } else if (c == "warp" && n == 4) {
+        // To a client point in one relative move computed when it is
+        // injected (no homing: a cursor at the screen edge scrolls many
+        // games' maps). Marked by `which` = kWarp, x/y = the target.
+        SDL_Event e{};
+        e.type = SDL_EVENT_MOUSE_MOTION;
+        e.motion.which = kWarp;
+        e.motion.x = std::atof(a);
+        e.motion.y = std::atof(b);
+        q.push_back({t, e});
       } else if (c == "click") {
         bool right = n >= 3 && std::string(a) == "right";
         SDL_Event e{};
@@ -973,6 +1131,14 @@ void InjectTestInput() {
       if (moved) break;
       moved = true;
       e.motion.windowID = id;
+      if (e.motion.which == kWarp) {
+        uint32_t h = HwndForSdl(id);
+        int ox = 0, oy = 0;
+        if (h) WindowOrigin(h, &ox, &oy);
+        e.motion.which = 0;
+        e.motion.xrel = e.motion.x - float(g_mouse_x - ox);
+        e.motion.yrel = e.motion.y - float(g_mouse_y - oy);
+      }
     } else if (e.type == SDL_EVENT_KEY_DOWN || e.type == SDL_EVENT_KEY_UP) {
       e.key.windowID = id;
     } else {
@@ -1067,8 +1233,18 @@ void DeliverHostEvent(const SDL_Event& e) {
 void PumpHostEvents() {
   if (!g_sdl_up || !OnMainThread()) return;
   InjectTestStall();
+  // The window system is asked for new events at most every 2 ms: games
+  // of the DirectDraw era call PeekMessage in tight loops (between movie
+  // frames, say), and each Cocoa pump costs about a millisecond. Events
+  // already queued are delivered on every call.
+  static Uint64 last_pump_ns = 0;
+  Uint64 now_ns = SDL_GetTicksNS();
+  if (now_ns - last_pump_ns >= 2000000) {
+    last_pump_ns = now_ns;
+    SDL_PumpEvents();
+  }
   SDL_Event e;
-  while (SDL_PollEvent(&e)) {
+  while (SDL_PeepEvents(&e, 1, SDL_GETEVENT, SDL_EVENT_FIRST, SDL_EVENT_LAST) > 0) {
     // Automated runs take input only from <ID>_TEST_INPUT: their windows
     // are on someone's desktop and stray clicks must not drive them.
     if (Background() && (e.type == SDL_EVENT_MOUSE_MOTION ||
@@ -1084,8 +1260,11 @@ void PumpHostEvents() {
   }
   InjectTestFocus();
   InjectTestInput();
+  if (g_pump_present) g_pump_present();
   WatchdogHeartbeat();
 }
+
+void (*g_pump_present)() = nullptr;
 
 uint32_t DcForWindow(uint32_t hwnd) { return hwnd ? 0x40000000u | hwnd : 0x00D00001u; }
 
@@ -1106,6 +1285,16 @@ void SetExclusiveMode(uint32_t hwnd, int w, int h) {
     win->mode_w = w;
     win->mode_h = h;
     sdl = win->fullscreen ? nullptr : win->sdl;
+    // A DirectDraw mode switch changes the screen the game sees
+    // (GetSystemMetrics), as ChangeDisplaySettings does, and fullscreen
+    // exclusive DirectDraw sizes the cooperative window to cover it.
+    g_display_w = w ? w : g_desktop_w;
+    g_display_h = w ? h : g_desktop_h;
+    if (w && !(win->style & WS_CHILD)) {
+      win->x = win->y = 0;
+      win->w = w;
+      win->h = h;
+    }
   }
   if (sdl && w) SDL_SetWindowSize(sdl, ToPoints(sdl, w), ToPoints(sdl, h));
   UpdateFullscreen(hwnd);
@@ -1171,15 +1360,27 @@ std::string ClassKey(uint32_t name) {
 // The system control classes every process has (see "built-in control
 // classes" below). Their window procedures are host handlers behind
 // thunks, so games can subclass them and chain with CallWindowProc.
+constexpr uint32_t kDlgWindowExtraBytes = 30;  // DLGWINDOWEXTRA
+
 void EnsureSystemClasses() {
   std::lock_guard<std::recursive_mutex> l(g_mu);
   if (g_classes.count("edit")) return;
-  for (const char* n : {"static", "edit", "button"}) {
+  for (const char* n : {"static", "edit", "button", "listbox", "combobox", "scrollbar"}) {
     WndClass k;
     k.name = n;
     k.wndproc = ThunkFor("user32.dll", std::string("<") + n + ">");
     k.atom = g_next_atom++;
     g_classes[n] = k;
+  }
+  // The trackbar (comctl32) and the dialog class #32770 (atom 32770).
+  for (auto [name, proc] : {std::pair<const char*, const char*>{"msctls_trackbar32", "<trackbar>"},
+                            {"#32770", "<dialog>"}}) {
+    WndClass k;
+    k.name = name;
+    k.wndproc = ThunkFor("user32.dll", proc);
+    k.wnd_extra = std::string(name) == "#32770" ? kDlgWindowExtraBytes : 0;
+    k.atom = g_next_atom++;
+    g_classes[name] = k;
   }
 }
 
@@ -1225,6 +1426,9 @@ HLE("user32.dll", SetClassLongA, 3) {
 
 // ---- windows ---------------------------------------------------------------
 
+// Set while the dialog code creates a dialog window: it gets no host window.
+thread_local bool t_creating_dialog = false;
+
 HLE("user32.dll", CreateWindowExA, 12) {
   uint32_t exstyle = Arg(c, 0), cls_va = Arg(c, 1), title_va = Arg(c, 2),
            style = Arg(c, 3), parent = Arg(c, 8), menu = Arg(c, 9),
@@ -1266,11 +1470,12 @@ HLE("user32.dll", CreateWindowExA, 12) {
   win.h = h;
   win.title = title_va ? GStr(title_va) : "";
   win.tid = CurrentThread()->tid;
+  win.is_dialog = t_creating_dialog;
   // A top-level window gets its host window here, on the main thread.
   // Windows created by other threads (games keep hidden helper windows
   // on worker threads, as message targets) get theirs when first shown:
   // SDL, and Cocoa on macOS, create windows only on the main thread.
-  if (!(style & WS_CHILD) && OnMainThread()) CreateHostWindow(win);
+  if (!(style & WS_CHILD) && !win.is_dialog && OnMainThread()) CreateHostWindow(win);
   uint32_t hwnd = win.hwnd;
   {
     std::lock_guard<std::recursive_mutex> l(g_mu);
@@ -1309,6 +1514,7 @@ HLE("user32.dll", CreateWindowExA, 12) {
       std::lock_guard<std::recursive_mutex> l(g_mu);
       if (Window* wp = Win(hwnd)) {
         wp->visible = true;
+        wp->dirty = true;
         if (wp->sdl) SDL_ShowWindow(wp->sdl);
       }
     }
@@ -1347,6 +1553,42 @@ HLE("user32.dll", IsWindow, 1) {
   return Win(Arg(c, 0)) ? 1 : 0;
 }
 
+void ApplyRect(uint32_t hwnd, int x, int y, int w, int h, bool move, bool size);
+
+// SW_SHOWMAXIMIZED: the window takes the screen, its border outside it and
+// its caption (if any) at the top, as Windows places a maximized window.
+// A window without caption or frame then covers the whole screen, which is
+// how games make a borderless fullscreen window (UpdateFullscreen). Showing
+// it normal (SW_SHOWNORMAL, SW_RESTORE) puts the previous rect back.
+void SetMaximized(uint32_t hwnd, bool on) {
+  int x, y, w, h;
+  {
+    std::lock_guard<std::recursive_mutex> l(g_mu);
+    Window* win = Win(hwnd);
+    if (!win || (win->style & WS_CHILD) || win->maximized == on) return;
+    win->maximized = on;
+    if (on) {
+      win->nx = win->x;
+      win->ny = win->y;
+      win->nw = win->w;
+      win->nh = win->h;
+      int border, caption, sw, sh;
+      FrameSize(win->style, &border, &caption);
+      ScreenFor(*win, &sw, &sh);
+      x = -border;
+      y = -border;
+      w = sw + 2 * border;
+      h = sh + 2 * border;
+    } else {
+      x = win->nx;
+      y = win->ny;
+      w = win->nw;
+      h = win->nh;
+    }
+  }
+  ApplyRect(hwnd, x, y, w, h, true, true);
+}
+
 HLE("user32.dll", ShowWindow, 2) {
   uint32_t hwnd = Arg(c, 0), cmd = Arg(c, 1);
   bool was, show = cmd != 0;  // SW_HIDE = 0
@@ -1366,11 +1608,13 @@ HLE("user32.dll", ShowWindow, 2) {
     if (!w) return 0;
     was = w->visible;
     w->visible = show;
+    if (show && !was) Invalidate(hwnd, true);
+    if (!show && was && w->parent) Invalidate(w->parent, false);
     if (minimize) w->minimized = true;
     if (restore) w->minimized = false;
     // A top-level window created off the main thread has no host window
     // yet (CreateWindowExA): it gets one when it is first shown.
-    if (show && !w->sdl && !(w->style & WS_CHILD) && !w->destroyed) {
+    if (show && !w->sdl && !(w->style & WS_CHILD) && !w->is_dialog && !w->destroyed) {
       if (!OnMainThread())
         FatalF("ShowWindow(%08X): a window created off the main thread is shown from "
                "another thread; host windows can only be made on the main thread",
@@ -1392,6 +1636,8 @@ HLE("user32.dll", ShowWindow, 2) {
       if (restore && !exclusive) SDL_RestoreWindow(sdl);
     }
   }
+  if (cmd == 3) SetMaximized(hwnd, true);              // SW_SHOWMAXIMIZED
+  else if (cmd == 1 || cmd == 9) SetMaximized(hwnd, false);  // SW_SHOWNORMAL, SW_RESTORE
   UpdateFullscreen(hwnd);
   if (show != was) Send(hwnd, WM_SHOWWINDOW, show ? 1 : 0, 0);
   bool activate = false;
@@ -1420,10 +1666,64 @@ HLE("user32.dll", CloseWindow, 1) {
   return 1;
 }
 
-HLE("user32.dll", UpdateWindow, 1) { return 1; }
-HLE("user32.dll", InvalidateRect, 3) { return 1; }
+// UpdateWindow: paints now (WM_PAINT sent) if the window needs it.
+HLE("user32.dll", UpdateWindow, 1) {
+  bool dirty;
+  {
+    std::lock_guard<std::recursive_mutex> l(g_mu);
+    Window* w = Win(Arg(c, 0));
+    dirty = w && w->dirty && w->visible;
+  }
+  if (dirty) Send(Arg(c, 0), 0x000F, 0, 0);
+  return 1;
+}
+HLE("user32.dll", InvalidateRect, 3) {
+  Invalidate(Arg(c, 0), false);
+  return 1;
+}
+// GetUpdateRect(hwnd, RECT*, erase): the whole client area while the
+// window needs painting (the update region is not tracked finer), else
+// empty. It does not validate.
+HLE("user32.dll", GetUpdateRect, 3) {
+  bool dirty = false;
+  int cw = 0, ch = 0;
+  {
+    std::lock_guard<std::recursive_mutex> l(g_mu);
+    if (Window* w = Win(Arg(c, 0))) {
+      dirty = w->dirty;
+      ClientSize(*w, &cw, &ch);
+    }
+  }
+  if (uint32_t rc = Arg(c, 1)) {
+    Wr32(rc, 0);
+    Wr32(rc + 4, 0);
+    Wr32(rc + 8, dirty ? uint32_t(cw) : 0);
+    Wr32(rc + 12, dirty ? uint32_t(ch) : 0);
+  }
+  return dirty ? 1 : 0;
+}
+
+HLE("user32.dll", ValidateRect, 2) {
+  Validate(Arg(c, 0));
+  return 1;
+}
 // Nothing is drawn through GDI, so there is nothing to repaint.
-HLE("user32.dll", RedrawWindow, 4) { return 1; }
+// RedrawWindow(hwnd, rect, region, flags): RDW_INVALIDATE (1) marks it,
+// RDW_ALLCHILDREN (0x80) its children too, RDW_UPDATENOW (0x100) paints now.
+HLE("user32.dll", RedrawWindow, 4) {
+  uint32_t flags = Arg(c, 3);
+  if (flags & 1) Invalidate(Arg(c, 0), flags & 0x80);
+  if (flags & 0x100) {
+    bool dirty;
+    {
+      std::lock_guard<std::recursive_mutex> l(g_mu);
+      Window* w = Win(Arg(c, 0));
+      dirty = w && w->dirty && w->visible;
+    }
+    if (dirty) Send(Arg(c, 0), 0x000F, 0, 0);
+  }
+  return 1;
+}
 
 HLE("user32.dll", IsWindowVisible, 1) {
   std::lock_guard<std::recursive_mutex> l(g_mu);
@@ -1462,8 +1762,21 @@ HLE("user32.dll", IsIconic, 1) {
 // Like Windows, WM_SIZE/WM_MOVE are only sent when the size/position
 // actually changes (the game re-applies its rect from its WM_SIZE handler;
 // sending unconditionally recurses forever).
+// A drop-down combo box's window is its face only (item height + 6): the
+// height a template or MoveWindow gives it is the drop-down list's, which
+// Windows keeps apart. Games centre the face's text in the window rect.
+int ComboFaceHeight(const Window& w, int h) {
+  if (w.cls != "combobox" || (w.style & 3) == 1 /* CBS_SIMPLE */) return h;
+  uint32_t ih = w.limit == 30000 ? 16 : w.limit;
+  return std::min(h, int(ih) + 6);
+}
+
 void ApplyRect(uint32_t hwnd, int x, int y, int w, int h, bool move, bool size) {
   SDL_Window* sdl = nullptr;
+  {
+    std::lock_guard<std::recursive_mutex> l(g_mu);
+    if (Window* win = Win(hwnd)) h = ComboFaceHeight(*win, h);
+  }
   int cw = 0, ch = 0;
   bool moved = false, sized = false;
   {
@@ -1487,6 +1800,8 @@ void ApplyRect(uint32_t hwnd, int x, int y, int w, int h, bool move, bool size) 
   }
   if (sdl && sized) SDL_SetWindowSize(sdl, ToPoints(sdl, cw), ToPoints(sdl, ch));
   if (moved || sized) UpdateFullscreen(hwnd);
+  if (moved || sized) ExposeParent(hwnd);
+
   if (sized) Send(hwnd, WM_SIZE, 0, MkLparam(cw, ch));
   if (moved) Send(hwnd, WM_MOVE, 0, MkLparam(x, y));
 }
@@ -1510,6 +1825,7 @@ HLE("user32.dll", SetWindowPos, 7) {
 HLE("user32.dll", MoveWindow, 6) {
   ApplyRect(Arg(c, 0), int32_t(Arg(c, 1)), int32_t(Arg(c, 2)),
             int32_t(Arg(c, 3)), int32_t(Arg(c, 4)), true, true);
+  if (Arg(c, 5)) Invalidate(Arg(c, 0), true);
   return 1;
 }
 
@@ -1522,6 +1838,41 @@ HLE("user32.dll", AdjustWindowRect, 3) {
   Wr32(rc + 8, Rd32(rc + 8) + border);
   Wr32(rc + 12, Rd32(rc + 12) + border);
   return 1;
+}
+
+// AdjustWindowRectEx(rect, style, menu, exstyle): the extended style adds
+// nothing to the frame here.
+HLE("user32.dll", AdjustWindowRectEx, 4) {
+  uint32_t rc = Arg(c, 0);
+  int border, caption;
+  FrameSize(Arg(c, 1), &border, &caption);
+  Wr32(rc + 0, Rd32(rc + 0) - border);
+  Wr32(rc + 4, Rd32(rc + 4) - border - caption);
+  Wr32(rc + 8, Rd32(rc + 8) + border);
+  Wr32(rc + 12, Rd32(rc + 12) + border);
+  return 1;
+}
+
+HLE("user32.dll", CopyRect, 2) {
+  if (!Arg(c, 0) || !Arg(c, 1)) return 0;
+  for (int i = 0; i < 16; i += 4) Wr32(Arg(c, 0) + i, Rd32(Arg(c, 1) + i));
+  return 1;
+}
+
+HLE("user32.dll", OffsetRect, 3) {
+  uint32_t rc = Arg(c, 0);
+  if (!rc) return 0;
+  Wr32(rc + 0, Rd32(rc + 0) + Arg(c, 1));
+  Wr32(rc + 4, Rd32(rc + 4) + Arg(c, 2));
+  Wr32(rc + 8, Rd32(rc + 8) + Arg(c, 1));
+  Wr32(rc + 12, Rd32(rc + 12) + Arg(c, 2));
+  return 1;
+}
+
+HLE("user32.dll", IsZoomed, 1) {
+  std::lock_guard<std::recursive_mutex> l(g_mu);
+  Window* w = Win(Arg(c, 0));
+  return w && w->maximized ? 1 : 0;
 }
 
 HLE("user32.dll", GetClientRect, 2) {
@@ -1571,10 +1922,12 @@ HLE("user32.dll", GetWindowRect, 2) {
   std::lock_guard<std::recursive_mutex> l(g_mu);
   Window* w = Win(hwnd);
   if (!w) return 0;
-  Wr32(rc, uint32_t(w->x));
-  Wr32(rc + 4, uint32_t(w->y));
-  Wr32(rc + 8, uint32_t(w->x + w->w));
-  Wr32(rc + 12, uint32_t(w->y + w->h));
+  int sx, sy;
+  WindowScreenPos(*w, &sx, &sy);
+  Wr32(rc, uint32_t(sx));
+  Wr32(rc + 4, uint32_t(sy));
+  Wr32(rc + 8, uint32_t(sx + w->w));
+  Wr32(rc + 12, uint32_t(sy + w->h));
   return 1;
 }
 
@@ -1745,6 +2098,16 @@ HLE("user32.dll", GetForegroundWindow, 0) {
 // SetForegroundWindow learn they are active this way.
 HLE("user32.dll", SetForegroundWindow, 1) {
   uint32_t hwnd = Arg(c, 0);
+  // A child window cannot be the foreground window: its top-level
+  // ancestor is activated (a game's child dialogs leave it active).
+  {
+    std::lock_guard<std::recursive_mutex> l(g_mu);
+    for (int i = 0; i < 16; i++) {
+      Window* w = Win(hwnd);
+      if (!w || !(w->style & WS_CHILD) || !w->parent) break;
+      hwnd = w->parent;
+    }
+  }
   if (SDL_Window* s = SdlWindowFor(hwnd)) SDL_RaiseWindow(s);
   bool activate = false;
   {
@@ -1962,6 +2325,7 @@ HLE("user32.dll", DefWindowProcA, 4) {
       return 0;
     }
     case WM_ERASEBKGND: return 1;
+    case 0x000F: Validate(hwnd); return 0;  // WM_PAINT
     case WM_NCHITTEST: return 1;  // HTCLIENT
     case WM_SYSCOMMAND:
       if ((wp & 0xFFF0) == 0xF060) Post(hwnd, WM_CLOSE, 0, 0);  // SC_CLOSE
@@ -1977,6 +2341,484 @@ HLE("user32.dll", DefWindowProcA, 4) {
     default:
       return 0;
   }
+}
+
+uint32_t CallDefWindowProc(Ctx& c, uint32_t hwnd, uint32_t msg, uint32_t wp, uint32_t lp);
+
+// ---- dialog boxes ------------------------------------------------------------------
+//
+// CreateDialog*/DialogBox* build a dialog from its template: a window of
+// class #32770 (or the template's class) whose procedure is DefDlgProc
+// ("<dialog>"), which calls the game's dialog procedure, and one child
+// window per item. Dialogs get no host window (Window::is_dialog): games
+// of the DirectDraw era draw their dialogs themselves into their full-
+// screen window, and RouteMouse sends the mouse to the dialog and its
+// controls. A modal DialogBox runs its own message loop until EndDialog.
+// Dialog units are converted with the base units of MS Sans Serif 8 (6x13)
+// for DS_SETFONT templates, of the system font (8x16) otherwise.
+
+constexpr uint32_t WM_INITDIALOG = 0x0110, WM_COMMAND = 0x0111, WM_HSCROLL = 0x0114,
+                   WM_VSCROLL = 0x0115;
+constexpr uint32_t DS_SETFONT = 0x40, DS_CENTER = 0x800;
+constexpr uint32_t WS_TABSTOP = 0x00010000;
+constexpr uint32_t kDlgWindowExtra = 30;  // DWL_MSGRESULT 0, DWL_DLGPROC 4, DWL_USER 8
+
+std::string ReadWStrAt(uint32_t* p) {
+  std::string s;
+  for (;;) {
+    uint16_t ch = Rd16(*p);
+    *p += 2;
+    if (!ch) break;
+    s.push_back(ch < 256 ? char(ch) : '?');
+  }
+  return s;
+}
+
+// sz_Or_Ord: 0 (none), 0xFFFF then an ordinal ("#n"), or a UTF-16 string.
+std::string ReadSzOrOrd(uint32_t* p) {
+  uint16_t first = Rd16(*p);
+  if (first == 0) {
+    *p += 2;
+    return "";
+  }
+  if (first == 0xFFFF) {
+    uint16_t ord = Rd16(*p + 2);
+    *p += 4;
+    return "#" + std::to_string(ord);
+  }
+  return ReadWStrAt(p);
+}
+
+std::string ControlClassName(const std::string& k) {
+  static const std::map<std::string, std::string> atoms = {
+      {"#128", "button"}, {"#129", "edit"},      {"#130", "static"},
+      {"#131", "listbox"}, {"#132", "scrollbar"}, {"#133", "combobox"}};
+  auto it = atoms.find(k);
+  return it != atoms.end() ? it->second : Lower(k);
+}
+
+uint32_t UserProc(const char* name) { return ProcAddress(ModuleHandle("user32.dll"), name); }
+
+uint32_t GuestStr(const std::string& s) {
+  uint32_t p = HeapAllocProcess(uint32_t(s.size()) + 1, false);
+  PutStr(p, s);
+  return p;
+}
+
+uint32_t CreateDialogFromTemplate(Ctx& c, uint32_t hinst, uint32_t t, uint32_t owner,
+                                  uint32_t dlgproc, uint32_t param) {
+  uint32_t p = t;
+  bool ex = Rd16(p) == 1 && Rd16(p + 2) == 0xFFFF;
+  uint32_t style, exstyle, count;
+  if (ex) {
+    exstyle = Rd32(p + 8);
+    style = Rd32(p + 12);
+    count = Rd16(p + 16);
+    p += 18;
+  } else {
+    style = Rd32(p);
+    exstyle = Rd32(p + 4);
+    count = Rd16(p + 8);
+    p += 10;
+  }
+  int16_t dx = int16_t(Rd16(p)), dy = int16_t(Rd16(p + 2)), dcx = int16_t(Rd16(p + 4)),
+          dcy = int16_t(Rd16(p + 6));
+  p += 8;
+  std::string menu = ReadSzOrOrd(&p);
+  std::string cls = ReadSzOrOrd(&p);
+  std::string title = ReadSzOrOrd(&p);
+  (void)menu;
+  int font_pt = 0;
+  std::string face;
+  if (style & DS_SETFONT) {
+    font_pt = Rd16(p);
+    p += ex ? 6 : 2;  // point size (and weight, italic, charset)
+    face = ReadWStrAt(&p);
+  }
+  RECOMP_TRACE("  dialog font: %d pt \"%s\"\n", font_pt, face.c_str());
+  const int bux = (style & DS_SETFONT) ? 6 : 8, buy = (style & DS_SETFONT) ? 13 : 16;
+  auto px = [&](int v) { return v * bux / 4; };
+  auto py = [&](int v) { return v * buy / 8; };
+  int w = px(dcx), h = py(dcy), x = px(dx), y = py(dy);
+  if (style & DS_CENTER) {
+    int ow = 640, oh = 480;
+    std::lock_guard<std::recursive_mutex> l(g_mu);
+    if (Window* o = Win(owner)) {
+      int cw, ch;
+      ClientSize(*o, &cw, &ch);
+      GameClientSize(*o, &ow, &oh);
+      (void)cw;
+      (void)ch;
+    }
+    x = (ow - w) / 2;
+    y = (oh - h) / 2;
+  }
+  RECOMP_TRACE("  dialog template: %u items, style %08X, %d,%d %dx%d, class \"%s\", \"%s\"\n",
+               count, style, x, y, w, h, cls.c_str(), title.c_str());
+
+  EnsureSystemClasses();
+  uint32_t create = UserProc("CreateWindowExA");
+  std::string dcls = cls.empty() ? "#32770" : cls;
+  uint32_t cls_s = GuestStr(dcls), title_s = GuestStr(title);
+  t_creating_dialog = true;
+  uint32_t hdlg = uint32_t(CallGuest(c, create, {exstyle, cls_s, title_s, style & ~WS_VISIBLE,
+                                                 uint32_t(x), uint32_t(y), uint32_t(w), uint32_t(h),
+                                                 owner, 0, hinst, 0}));
+  t_creating_dialog = false;
+  HeapFreeProcess(cls_s);
+  HeapFreeProcess(title_s);
+  if (!hdlg) {
+    WarnF("CreateDialog: the dialog window (class %s) could not be created\n", dcls.c_str());
+    return 0;
+  }
+  {
+    std::lock_guard<std::recursive_mutex> l(g_mu);
+    Window* d = Win(hdlg);
+    if (d->extra.size() < kDlgWindowExtra) d->extra.resize(kDlgWindowExtra, 0);
+    std::memcpy(d->extra.data() + 4, &dlgproc, 4);
+  }
+
+  uint32_t focus = 0;
+  for (uint32_t i = 0; i < count; i++) {
+    p = (p + 3) & ~3u;
+    uint32_t istyle, iexstyle, id;
+    if (ex) {
+      iexstyle = Rd32(p + 4);
+      istyle = Rd32(p + 8);
+      p += 12;
+    } else {
+      istyle = Rd32(p);
+      iexstyle = Rd32(p + 4);
+      p += 8;
+    }
+    int16_t ix = int16_t(Rd16(p)), iy = int16_t(Rd16(p + 2)), icx = int16_t(Rd16(p + 4)),
+            icy = int16_t(Rd16(p + 6));
+    p += 8;
+    if (ex) {
+      id = Rd32(p);
+      p += 4;
+    } else {
+      id = Rd16(p);
+      p += 2;
+    }
+    std::string icls = ControlClassName(ReadSzOrOrd(&p));
+    std::string ititle = ReadSzOrOrd(&p);
+    if (!ititle.empty() && ititle[0] == '#') ititle.clear();  // an icon/bitmap ordinal
+    uint16_t extra = Rd16(p);
+    uint32_t data = extra ? p + 2 : 0;
+    p += 2 + extra;
+    uint32_t cs = GuestStr(icls), ts = GuestStr(ititle);
+    uint32_t hc = uint32_t(CallGuest(
+        c, create, {iexstyle, cs, ts, istyle | WS_CHILD, uint32_t(px(ix)), uint32_t(py(iy)),
+                    uint32_t(px(icx)), uint32_t(py(icy)), hdlg, id, hinst, data}));
+    HeapFreeProcess(cs);
+    HeapFreeProcess(ts);
+    if (!hc) {
+      WarnF("CreateDialog: control %u (class %s) could not be created\n", id, icls.c_str());
+      continue;
+    }
+    if (!focus && (istyle & WS_TABSTOP)) focus = hc;
+  }
+  Send(hdlg, WM_INITDIALOG, focus, param);
+  if (style & WS_VISIBLE) CallGuest(c, UserProc("ShowWindow"), {hdlg, 5 /* SW_SHOW */});
+  return hdlg;
+}
+
+// RT_DIALOG resource `name` of module `hinst` (the EXE or a loaded DLL).
+uint32_t DialogResource(uint32_t hinst, uint32_t name) {
+  Ctx& c = CurrentThread()->ctx;
+  uint32_t r = uint32_t(CallGuest(c, ProcAddress(ModuleHandle("kernel32.dll"), "FindResourceA"),
+                                  {hinst, name, 5}));
+  if (!r) return 0;
+  return uint32_t(CallGuest(c, ProcAddress(ModuleHandle("kernel32.dll"), "LoadResource"),
+                            {hinst, r}));
+}
+
+// The modal loop of DialogBox: messages are dispatched until EndDialog.
+uint32_t RunModal(Ctx& c, uint32_t hdlg) {
+  if (!hdlg) return uint32_t(-1);
+  CallGuest(c, UserProc("ShowWindow"), {hdlg, 5});
+  uint32_t m = HeapAllocProcess(28, true);
+  uint32_t dispatch = UserProc("DispatchMessageA"), translate = UserProc("TranslateMessage");
+  for (;;) {
+    {
+      std::lock_guard<std::recursive_mutex> l(g_mu);
+      Window* d = Win(hdlg);
+      if (!d || d->dialog_ended) break;
+    }
+    PumpHostEvents();
+    Msg msg;
+    if (TakeMessage(0, 0, 0, true, &msg)) {
+      PutMsg(m, msg);
+      CallGuest(c, translate, {m});
+      CallGuest(c, dispatch, {m});
+    } else if (OnMainThread() && g_sdl_up) {
+      SDL_WaitEventTimeout(nullptr, 10);
+    } else {
+      std::unique_lock<std::recursive_mutex> l(g_mu);
+      g_queue_cv.wait_for(l, std::chrono::milliseconds(10));
+    }
+  }
+  HeapFreeProcess(m);
+  uint32_t result = 0;
+  {
+    std::lock_guard<std::recursive_mutex> l(g_mu);
+    if (Window* d = Win(hdlg)) result = d->dialog_result;
+  }
+  CallGuest(c, UserProc("DestroyWindow"), {hdlg});
+  return result;
+}
+
+HLE("user32.dll", CreateDialogIndirectParamA, 5) {
+  return CreateDialogFromTemplate(c, Arg(c, 0), Arg(c, 1), Arg(c, 2), Arg(c, 3), Arg(c, 4));
+}
+
+HLE("user32.dll", CreateDialogParamA, 5) {
+  uint32_t t = DialogResource(Arg(c, 0), Arg(c, 1));
+  if (!t) {
+    WarnF("CreateDialogParamA: no dialog resource %X\n", Arg(c, 1));
+    return 0;
+  }
+  return CreateDialogFromTemplate(c, Arg(c, 0), t, Arg(c, 2), Arg(c, 3), Arg(c, 4));
+}
+
+HLE("user32.dll", DialogBoxIndirectParamA, 5) {
+  return RunModal(c, CreateDialogFromTemplate(c, Arg(c, 0), Arg(c, 1), Arg(c, 2), Arg(c, 3),
+                                              Arg(c, 4)));
+}
+
+HLE("user32.dll", DialogBoxParamA, 5) {
+  uint32_t t = DialogResource(Arg(c, 0), Arg(c, 1));
+  if (!t) {
+    WarnF("DialogBoxParamA: no dialog resource %X\n", Arg(c, 1));
+    return uint32_t(-1);
+  }
+  return RunModal(c, CreateDialogFromTemplate(c, Arg(c, 0), t, Arg(c, 2), Arg(c, 3), Arg(c, 4)));
+}
+
+HLE("user32.dll", EndDialog, 2) {
+  std::lock_guard<std::recursive_mutex> l(g_mu);
+  Window* d = Win(Arg(c, 0));
+  if (!d) return 0;
+  d->dialog_ended = true;
+  d->dialog_result = Arg(c, 1);
+  d->visible = false;
+  return 1;
+}
+
+// DefDlgProc: the dialog procedure first; what it does not handle gets the
+// default. Its result is the message's, for the messages whose result is
+// the procedure's return value, else DWL_MSGRESULT.
+uint32_t DefDlg(Ctx& c, uint32_t hwnd, uint32_t msg, uint32_t wp, uint32_t lp) {
+  uint32_t proc = 0;
+  {
+    std::lock_guard<std::recursive_mutex> l(g_mu);
+    Window* w = Win(hwnd);
+    if (!w) return 0;
+    if (w->extra.size() >= 8) std::memcpy(&proc, w->extra.data() + 4, 4);
+  }
+  if (proc) {
+    uint32_t r = uint32_t(CallGuest(c, proc, {hwnd, msg, wp, lp}));
+    if (r) {
+      if (msg == WM_INITDIALOG || (msg >= 0x0132 && msg <= 0x0138) || msg == 0x0039 ||
+          msg == 0x002E || msg == 0x002F || msg == 0x0037)
+        return r;
+      std::lock_guard<std::recursive_mutex> l(g_mu);
+      Window* w = Win(hwnd);
+      uint32_t res = 0;
+      if (w && w->extra.size() >= 4) std::memcpy(&res, w->extra.data(), 4);
+      return res;
+    }
+  }
+  switch (msg) {
+    case WM_NCCREATE: return 1;
+    case WM_CLOSE: Post(hwnd, WM_COMMAND, 2 /* IDCANCEL */, 0); return 0;
+    case WM_ERASEBKGND: return 1;
+    case WM_INITDIALOG: return 1;
+    default: return CallDefWindowProc(c, hwnd, msg, wp, lp);
+  }
+}
+
+HLE_NAMED("user32.dll", "<dialog>", DialogWndProc, 4) {
+  return DefDlg(c, Arg(c, 0), Arg(c, 1), Arg(c, 2), Arg(c, 3));
+}
+
+HLE("user32.dll", DefDlgProcA, 4) {
+  // Called by a dialog class's own window procedure: the default only.
+  uint32_t hwnd = Arg(c, 0), msg = Arg(c, 1), wp = Arg(c, 2), lp = Arg(c, 3);
+  switch (msg) {
+    case WM_CLOSE: Post(hwnd, WM_COMMAND, 2, 0); return 0;
+    case WM_INITDIALOG: return 1;
+    default: return DefDlg(c, hwnd, msg, wp, lp);
+  }
+}
+
+uint32_t DlgItem(uint32_t dlg, uint32_t id) {
+  std::lock_guard<std::recursive_mutex> l(g_mu);
+  for (auto& [h, w] : g_windows)
+    if (!w.destroyed && w.parent == dlg && (w.style & WS_CHILD) && w.id == id) return h;
+  return 0;
+}
+
+HLE("user32.dll", GetDlgItem, 2) { return DlgItem(Arg(c, 0), Arg(c, 1)); }
+
+HLE("user32.dll", GetDlgCtrlID, 1) {
+  std::lock_guard<std::recursive_mutex> l(g_mu);
+  Window* w = Win(Arg(c, 0));
+  return w ? w->id : 0;
+}
+
+HLE("user32.dll", SendDlgItemMessageA, 5) {
+  uint32_t h = DlgItem(Arg(c, 0), Arg(c, 1));
+  return h ? Send(h, Arg(c, 2), Arg(c, 3), Arg(c, 4)) : 0;
+}
+
+HLE("user32.dll", SetDlgItemTextA, 3) {
+  uint32_t h = DlgItem(Arg(c, 0), Arg(c, 1));
+  return h ? (Send(h, WM_SETTEXT, 0, Arg(c, 2)), 1) : 0;
+}
+
+HLE("user32.dll", GetDlgItemTextA, 4) {
+  uint32_t h = DlgItem(Arg(c, 0), Arg(c, 1));
+  if (!h) {
+    if (Arg(c, 2) && Arg(c, 3)) Wr8(Arg(c, 2), 0);
+    return 0;
+  }
+  return Send(h, WM_GETTEXT, Arg(c, 3), Arg(c, 2));
+}
+
+HLE("user32.dll", SetDlgItemInt, 4) {
+  uint32_t h = DlgItem(Arg(c, 0), Arg(c, 1));
+  if (!h) return 0;
+  std::string s = Arg(c, 3) ? std::to_string(int32_t(Arg(c, 2))) : std::to_string(Arg(c, 2));
+  uint32_t g = GuestStr(s);
+  Send(h, WM_SETTEXT, 0, g);
+  HeapFreeProcess(g);
+  return 1;
+}
+
+HLE("user32.dll", GetDlgItemInt, 4) {
+  uint32_t h = DlgItem(Arg(c, 0), Arg(c, 1));
+  std::string t;
+  {
+    std::lock_guard<std::recursive_mutex> l(g_mu);
+    if (Window* w = Win(h)) t = w->title;
+  }
+  char* end = nullptr;
+  long v = std::strtol(t.c_str(), &end, 10);
+  bool ok = h && !t.empty() && end && !*end;
+  if (Arg(c, 2)) Wr32(Arg(c, 2), ok ? 1 : 0);
+  return ok ? uint32_t(v) : 0;
+}
+
+HLE("user32.dll", CheckDlgButton, 3) {
+  uint32_t h = DlgItem(Arg(c, 0), Arg(c, 1));
+  return h ? (Send(h, 0x00F1 /* BM_SETCHECK */, Arg(c, 2), 0), 1) : 0;
+}
+
+HLE("user32.dll", IsDlgButtonChecked, 2) {
+  uint32_t h = DlgItem(Arg(c, 0), Arg(c, 1));
+  return h ? Send(h, 0x00F0 /* BM_GETCHECK */, 0, 0) : 0;
+}
+
+HLE("user32.dll", CheckRadioButton, 4) {
+  for (uint32_t id = Arg(c, 1); id <= Arg(c, 2); id++)
+    if (uint32_t h = DlgItem(Arg(c, 0), id)) Send(h, 0x00F1, id == Arg(c, 3) ? 1 : 0, 0);
+  return 1;
+}
+
+HLE("user32.dll", GetNextDlgTabItem, 3) { return 0; }
+
+HLE("user32.dll", MapDialogRect, 2) {
+  uint32_t rc = Arg(c, 1);
+  for (int i = 0; i < 4; i++) {
+    int32_t v = int32_t(Rd32(rc + 4 * uint32_t(i)));
+    Wr32(rc + 4 * uint32_t(i), uint32_t(i % 2 == 0 ? v * 6 / 4 : v * 13 / 8));
+  }
+  return 1;
+}
+
+HLE("user32.dll", GetDialogBaseUnits, 0) { return MkLparam(8, 16); }
+
+// Children of `parent`, in creation order; with `deep`, their children
+// after each.
+void Children(uint32_t parent, bool deep, std::vector<uint32_t>* out) {
+  std::vector<uint32_t> direct;
+  {
+    std::lock_guard<std::recursive_mutex> l(g_mu);
+    for (auto& [h, w] : g_windows)
+      if (!w.destroyed && w.parent == parent && (w.style & WS_CHILD)) direct.push_back(h);
+  }
+  for (uint32_t h : direct) {
+    out->push_back(h);
+    if (deep) Children(h, true, out);
+  }
+}
+
+HLE("user32.dll", EnumChildWindows, 3) {
+  std::vector<uint32_t> kids;
+  Children(Arg(c, 0), true, &kids);
+  for (uint32_t h : kids)
+    if (!CallGuest(c, Arg(c, 1), {h, Arg(c, 2)})) break;
+  return 1;
+}
+
+HLE("user32.dll", GetClassNameA, 3) {
+  std::string n;
+  {
+    std::lock_guard<std::recursive_mutex> l(g_mu);
+    Window* w = Win(Arg(c, 0));
+    if (!w) return 0;
+    static const std::map<std::string, std::string> nice = {
+        {"button", "Button"}, {"edit", "Edit"}, {"static", "Static"}, {"listbox", "ListBox"},
+        {"combobox", "ComboBox"}, {"scrollbar", "ScrollBar"}};
+    auto it = nice.find(w->cls);
+    n = it != nice.end() ? it->second : w->cls;
+  }
+  return CopyOut(Arg(c, 1), Arg(c, 2), n.substr(0, Arg(c, 2) ? Arg(c, 2) - 1 : 0));
+}
+
+HLE("user32.dll", GetTopWindow, 1) {
+  std::vector<uint32_t> kids;
+  Children(Arg(c, 0), false, &kids);
+  return kids.empty() ? 0 : kids.front();
+}
+
+HLE("user32.dll", ChildWindowFromPoint, 3) {
+  int32_t x = int32_t(Arg(c, 1)), y = int32_t(Arg(c, 2));
+  int ox, oy;
+  WindowOrigin(Arg(c, 0), &ox, &oy);
+  std::lock_guard<std::recursive_mutex> l(g_mu);
+  uint32_t best = Arg(c, 0);
+  for (auto& [h, w] : g_windows)
+    if (!w.destroyed && w.parent == Arg(c, 0) && (w.style & WS_CHILD) &&
+        ContainsScreen(w, ox + x, oy + y))
+      best = h;
+  return best;
+}
+
+// ChildWindowFromPointEx(parent, x, y, flags): as ChildWindowFromPoint.
+HLE("user32.dll", ChildWindowFromPointEx, 4) {
+  int32_t x = int32_t(Arg(c, 1)), y = int32_t(Arg(c, 2));
+  int ox, oy;
+  WindowOrigin(Arg(c, 0), &ox, &oy);
+  std::lock_guard<std::recursive_mutex> l(g_mu);
+  uint32_t best = Arg(c, 0);
+  for (auto& [h, w] : g_windows)
+    if (!w.destroyed && w.parent == Arg(c, 0) && (w.style & WS_CHILD) &&
+        (!(Arg(c, 3) & 1) || w.visible) && ContainsScreen(w, ox + x, oy + y))
+      best = h;
+  return best;
+}
+
+HLE("user32.dll", WindowFromPoint, 2) {
+  std::lock_guard<std::recursive_mutex> l(g_mu);
+  uint32_t top = 0;
+  for (auto& [h, w] : g_windows)
+    if (!w.destroyed && w.sdl && w.visible) top = h;
+  if (!top) return 0;
+  int cx, cy;
+  return RouteMouse(top, int32_t(Arg(c, 0)), int32_t(Arg(c, 1)), &cx, &cy);
 }
 
 // ---- built-in control classes ------------------------------------------------------
@@ -2073,6 +2915,26 @@ HLE_NAMED("user32.dll", "<button>", ButtonWndProc, 4) {
       case BM_GETCHECK: return w->check;
       case BM_SETCHECK: w->check = wp; return 0;
       case BM_GETSTATE: return w->check;
+      case 0x00F4: return 0;  // BM_SETSTYLE
+      case 0x00F5:            // BM_CLICK
+      case WM_LBUTTONUP: {
+        // A click: auto check boxes toggle, auto radio buttons check (and
+        // their siblings uncheck); then BN_CLICKED to the parent.
+        uint32_t type = w->style & 0xF;
+        if (type == 3 /* BS_AUTOCHECKBOX */) w->check = !w->check;
+        if (type == 6 /* BS_AUTO3STATE */) w->check = (w->check + 1) % 3;
+        if (type == 9 /* BS_AUTORADIOBUTTON */) {
+          for (auto& [h, o] : g_windows)
+            if (!o.destroyed && o.parent == w->parent && o.cls == "button" && (o.style & 0xF) == 9)
+              o.check = 0;
+          w->check = 1;
+        }
+        if (type == 7 /* BS_GROUPBOX */) return 0;
+        // Posted (the lock is held): it arrives through the game's loop.
+        if (w->parent) Post(w->parent, 0x0111 /* WM_COMMAND */, w->id & 0xFFFF, hwnd);
+        return 0;
+      }
+      case WM_LBUTTONDOWN: return 0;
     }
     if (msg >= 0x00F0 && msg <= 0x00FF) {
       UnhandledControlMsg("button", msg);
@@ -2157,6 +3019,420 @@ HLE_NAMED("user32.dll", "<edit>", EditWndProc, 4) {
     return 0;
   }
   return CallDefWindowProc(c, hwnd, msg, wp, lp);
+}
+
+// ---- list boxes, combo boxes, trackbars, scroll bars ---------------------------------
+//
+// Their items, selection, range and position are kept; nothing is drawn
+// (games that use them in their own dialogs draw them, owner-draw or from
+// the state). A click selects (a list box's row from its item height, a
+// combo box's next item, a trackbar's position from x) and notifies the
+// parent as the real controls do.
+
+constexpr uint32_t LBS_NOTIFY = 0x1, LBS_SORT = 0x2, LBS_OWNERDRAWFIXED = 0x10,
+                   LBS_OWNERDRAWVARIABLE = 0x20, LBS_HASSTRINGS = 0x40;
+constexpr uint32_t CBS_SORT = 0x100, CBS_OWNERDRAWFIXED = 0x10, CBS_OWNERDRAWVARIABLE = 0x20,
+                   CBS_HASSTRINGS = 0x200;
+constexpr uint32_t LB_ERR = 0xFFFFFFFF;
+
+void NotifyParent(uint32_t hwnd, uint32_t code) {
+  uint32_t parent = 0, id = 0;
+  {
+    std::lock_guard<std::recursive_mutex> l(g_mu);
+    Window* w = Win(hwnd);
+    if (!w) return;
+    parent = w->parent;
+    id = w->id;
+  }
+  if (parent) Send(parent, WM_COMMAND, (id & 0xFFFF) | (code << 16), hwnd);
+}
+
+// Item messages shared by list and combo boxes, given each one's codes.
+struct ItemMsgs {
+  uint32_t add, insert, del, reset, setsel, getsel, gettext, gettextlen, count, findstr,
+      findexact, selectstr, getdata, setdata;
+  bool strings, sort;
+};
+
+bool ItemMsg(Window& w, const ItemMsgs& k, uint32_t msg, uint32_t wp, uint32_t lp, uint32_t* r) {
+  auto text_of = [&](uint32_t v) { return k.strings ? (v ? GStr(v) : std::string()) : std::string(); };
+  auto data_of = [&](uint32_t v) { return k.strings ? 0u : v; };
+  auto find = [&](uint32_t start, const std::string& s, bool exact) -> uint32_t {
+    size_t n = w.items.size();
+    for (size_t i = 0; i < n; i++) {
+      size_t j = (size_t(int32_t(start) + 1) + i) % n;
+      std::string a = Lower(w.items[j].first), b = Lower(s);
+      if (exact ? a == b : a.compare(0, b.size(), b) == 0) return uint32_t(j);
+    }
+    return LB_ERR;
+  };
+  if (msg == k.add) {
+    std::pair<std::string, uint32_t> it{text_of(lp), data_of(lp)};
+    size_t at = w.items.size();
+    if (k.sort && k.strings)
+      at = size_t(std::upper_bound(w.items.begin(), w.items.end(), it,
+                                   [](auto& a, auto& b) { return Lower(a.first) < Lower(b.first); }) -
+                  w.items.begin());
+    w.items.insert(w.items.begin() + long(at), it);
+    *r = uint32_t(at);
+  } else if (msg == k.insert) {
+    size_t at = int32_t(wp) < 0 || wp > w.items.size() ? w.items.size() : wp;
+    w.items.insert(w.items.begin() + long(at), {text_of(lp), data_of(lp)});
+    *r = uint32_t(at);
+  } else if (msg == k.del) {
+    if (wp >= w.items.size()) { *r = LB_ERR; return true; }
+    w.items.erase(w.items.begin() + long(wp));
+    if (w.cur_sel >= int32_t(w.items.size())) w.cur_sel = -1;
+    *r = uint32_t(w.items.size());
+  } else if (msg == k.reset) {
+    w.items.clear();
+    w.cur_sel = -1;
+    w.top_index = 0;
+    *r = 0;
+  } else if (msg == k.setsel) {
+    w.cur_sel = int32_t(wp) < int32_t(w.items.size()) ? int32_t(wp) : -1;
+    if (w.cur_sel >= 0 && w.cls == "combobox") w.title = w.items[size_t(w.cur_sel)].first;
+    *r = w.cur_sel < 0 ? LB_ERR : uint32_t(w.cur_sel);
+  } else if (msg == k.getsel) {
+    *r = uint32_t(w.cur_sel);
+  } else if (msg == k.gettext) {
+    if (wp >= w.items.size()) { *r = LB_ERR; return true; }
+    if (k.strings) {
+      PutStr(lp, w.items[wp].first);
+      *r = uint32_t(w.items[wp].first.size());
+    } else {
+      Wr32(lp, w.items[wp].second);
+      *r = 4;
+    }
+  } else if (msg == k.gettextlen) {
+    *r = wp < w.items.size() ? (k.strings ? uint32_t(w.items[wp].first.size()) : 4) : LB_ERR;
+  } else if (msg == k.count) {
+    *r = uint32_t(w.items.size());
+  } else if (msg == k.findstr || msg == k.findexact || msg == k.selectstr) {
+    *r = w.items.empty() ? LB_ERR : find(wp, lp ? GStr(lp) : "", msg == k.findexact);
+    if (msg == k.selectstr && *r != LB_ERR) w.cur_sel = int32_t(*r);
+  } else if (msg == k.getdata) {
+    *r = wp < w.items.size() ? w.items[wp].second : LB_ERR;
+  } else if (msg == k.setdata) {
+    if (wp >= w.items.size()) { *r = LB_ERR; return true; }
+    w.items[wp].second = lp;
+    *r = 0;
+  } else {
+    return false;
+  }
+  return true;
+}
+
+uint32_t ItemHeight(const Window& w) { return w.limit == 30000 ? 16 : w.limit; }  // reused field
+
+// Owner-drawn list and combo boxes: WM_MEASUREITEM to the parent when the
+// control is created (its item height), WM_DRAWITEM for each visible item
+// (a combo box: its selection, in the face) when it paints.
+constexpr uint32_t WM_DRAWITEM = 0x002B, WM_MEASUREITEM = 0x002C;
+constexpr uint32_t ODT_LISTBOX = 2, ODT_COMBOBOX = 3;
+
+bool IsOwnerDraw(const Window& w) {
+  if (w.cls == "listbox") return w.style & (LBS_OWNERDRAWFIXED | LBS_OWNERDRAWVARIABLE);
+  if (w.cls == "combobox") return w.style & (CBS_OWNERDRAWFIXED | CBS_OWNERDRAWVARIABLE);
+  return false;
+}
+
+void MeasureOwnerDraw(uint32_t hwnd) {
+  uint32_t parent, id, type;
+  {
+    std::lock_guard<std::recursive_mutex> l(g_mu);
+    Window* w = Win(hwnd);
+    if (!w || !IsOwnerDraw(*w) || !w->parent) return;
+    parent = w->parent;
+    id = w->id;
+    type = w->cls == "listbox" ? ODT_LISTBOX : ODT_COMBOBOX;
+  }
+  uint32_t mi = HeapAllocProcess(24, true);
+  Wr32(mi + 0, type);
+  Wr32(mi + 4, id);
+  Wr32(mi + 8, 0);
+  Wr32(mi + 16, 16);  // itemHeight: the default
+  Send(parent, WM_MEASUREITEM, id, mi);
+  uint32_t h = Rd32(mi + 16);
+  HeapFreeProcess(mi);
+  std::lock_guard<std::recursive_mutex> l(g_mu);
+  if (Window* w = Win(hwnd)) w->limit = h ? h : 16;
+}
+
+void PaintOwnerDraw(uint32_t hwnd) {
+  struct Item { uint32_t id, state, data; int top, bottom; };
+  std::vector<Item> items;
+  uint32_t parent, ctl, type;
+  int width;
+  {
+    std::lock_guard<std::recursive_mutex> l(g_mu);
+    Window* w = Win(hwnd);
+    if (!w || !w->parent) return;
+    parent = w->parent;
+    ctl = w->id;
+    width = w->w;
+    int ih = int(ItemHeight(*w));
+    if (w->cls == "listbox") {
+      type = ODT_LISTBOX;
+      for (int i = w->top_index; i < int(w->items.size()); i++) {
+        int y = (i - w->top_index) * ih;
+        if (y >= w->h) break;
+        items.push_back({uint32_t(i), i == w->cur_sel ? 1u : 0u, w->items[size_t(i)].second, y, y + ih});
+      }
+    } else {
+      type = ODT_COMBOBOX;
+      uint32_t data = w->cur_sel >= 0 && w->cur_sel < int(w->items.size())
+                          ? w->items[size_t(w->cur_sel)].second
+                          : 0;
+      // The face (selection field); ODS_COMBOBOXEDIT (0x1000).
+      items.push_back({uint32_t(w->cur_sel), 0x1000, data, 0, std::min(w->h, ih + 4)});
+      width = std::max(0, w->w - 16);  // left of the drop-down button
+    }
+  }
+  uint32_t dis = HeapAllocProcess(48, true);
+  for (const Item& it : items) {
+    Wr32(dis + 0, type);
+    Wr32(dis + 4, ctl);
+    Wr32(dis + 8, it.id);
+    Wr32(dis + 12, 1);  // ODA_DRAWENTIRE
+    Wr32(dis + 16, it.state);
+    Wr32(dis + 20, hwnd);
+    Wr32(dis + 24, DcForWindow(hwnd));
+    Wr32(dis + 28, 0);
+    Wr32(dis + 32, uint32_t(it.top));
+    Wr32(dis + 36, uint32_t(width));
+    Wr32(dis + 40, uint32_t(it.bottom));
+    Wr32(dis + 44, it.data);
+    Send(parent, WM_DRAWITEM, ctl, dis);
+  }
+  HeapFreeProcess(dis);
+}
+
+HLE_NAMED("user32.dll", "<listbox>", ListBoxWndProc, 4) {
+  uint32_t hwnd = Arg(c, 0), msg = Arg(c, 1), wp = Arg(c, 2), lp = Arg(c, 3), r = 0;
+  if (msg == WM_CREATE) {
+    MeasureOwnerDraw(hwnd);
+    return 0;
+  }
+  if (msg == 0x000F /* WM_PAINT */) {
+    bool od;
+    {
+      std::lock_guard<std::recursive_mutex> l(g_mu);
+      Window* w = Win(hwnd);
+      od = w && IsOwnerDraw(*w);
+    }
+    if (od) PaintOwnerDraw(hwnd);
+    Validate(hwnd);
+    return 0;
+  }
+  bool notify = false, dbl = false;
+  {
+    std::lock_guard<std::recursive_mutex> l(g_mu);
+    Window* w = Win(hwnd);
+    if (!w) return 0;
+    if (CommonControlMsg(*w, msg, wp, lp, &r)) return r;
+    bool strings = (w->style & LBS_HASSTRINGS) ||
+                   !(w->style & (LBS_OWNERDRAWFIXED | LBS_OWNERDRAWVARIABLE));
+    static const ItemMsgs kLb{0x180, 0x181, 0x182, 0x184, 0x186, 0x188, 0x189, 0x18A,
+                              0x18B, 0x18F, 0x1A2, 0x18C, 0x199, 0x19A, true, false};
+    ItemMsgs k = kLb;
+    k.strings = strings;
+    k.sort = w->style & LBS_SORT;
+    if (ItemMsg(*w, k, msg, wp, lp, &r)) return r;
+    switch (msg) {
+      case 0x185:  // LB_SETSEL (multi-select): one selection kept
+        if (wp) w->cur_sel = int32_t(lp);
+        return 0;
+      case 0x187: return int32_t(wp) == w->cur_sel ? 1 : 0;           // LB_GETSEL
+      case 0x190: return w->cur_sel >= 0 ? 1 : 0;                      // LB_GETSELCOUNT
+      case 0x191:                                                       // LB_GETSELITEMS
+        if (w->cur_sel < 0 || !wp) return 0;
+        Wr32(lp, uint32_t(w->cur_sel));
+        return 1;
+      case 0x18E: return uint32_t(w->top_index);                       // LB_GETTOPINDEX
+      case 0x197: w->top_index = int32_t(wp); return 0;                // LB_SETTOPINDEX
+      case 0x19E: w->cur_sel = int32_t(wp); return 0;                  // LB_SETCARETINDEX
+      case 0x19F: return uint32_t(w->cur_sel);                         // LB_GETCARETINDEX
+      case 0x1A0: w->limit = lp & 0xFFFF; return 0;                    // LB_SETITEMHEIGHT
+      case 0x1A1: return ItemHeight(*w);                               // LB_GETITEMHEIGHT
+      case 0x198: {                                                    // LB_GETITEMRECT
+        int32_t y = (int32_t(wp) - w->top_index) * int32_t(ItemHeight(*w));
+        Wr32(lp, 0);
+        Wr32(lp + 4, uint32_t(y));
+        Wr32(lp + 8, uint32_t(w->w));
+        Wr32(lp + 12, uint32_t(y + int32_t(ItemHeight(*w))));
+        return 0;
+      }
+      case 0x1A9: return 0;                                             // LB_ITEMFROMPOINT
+      case 0x194: case 0x195: case 0x196: return 0;                    // horizontal extent
+      case WM_LBUTTONDOWN:
+      case WM_LBUTTONDBLCLK: {
+        int32_t row = w->top_index + int32_t(int16_t(lp >> 16)) / int32_t(ItemHeight(*w));
+        if (row >= 0 && row < int32_t(w->items.size())) {
+          w->cur_sel = row;
+          notify = w->style & LBS_NOTIFY;
+          dbl = msg == WM_LBUTTONDBLCLK;
+        }
+        break;
+      }
+      default:
+        if (msg >= 0x0180 && msg <= 0x01AF) {
+          UnhandledControlMsg("listbox", msg);
+          return 0;
+        }
+        return CallDefWindowProc(c, hwnd, msg, wp, lp);
+    }
+  }
+  if (notify) NotifyParent(hwnd, dbl ? 2 /* LBN_DBLCLK */ : 1 /* LBN_SELCHANGE */);
+  return 0;
+}
+
+HLE_NAMED("user32.dll", "<combobox>", ComboBoxWndProc, 4) {
+  uint32_t hwnd = Arg(c, 0), msg = Arg(c, 1), wp = Arg(c, 2), lp = Arg(c, 3), r = 0;
+  if (msg == WM_CREATE) {
+    MeasureOwnerDraw(hwnd);
+    std::lock_guard<std::recursive_mutex> l(g_mu);
+    if (Window* w = Win(hwnd)) w->h = ComboFaceHeight(*w, w->h);
+    return 0;
+  }
+  if (msg == 0x000F /* WM_PAINT */) {
+    bool od;
+    {
+      std::lock_guard<std::recursive_mutex> l(g_mu);
+      Window* w = Win(hwnd);
+      od = w && IsOwnerDraw(*w);
+    }
+    if (od) PaintOwnerDraw(hwnd);
+    Validate(hwnd);
+    return 0;
+  }
+  bool notify = false;
+  {
+    std::lock_guard<std::recursive_mutex> l(g_mu);
+    Window* w = Win(hwnd);
+    if (!w) return 0;
+    if (CommonControlMsg(*w, msg, wp, lp, &r)) return r;
+    bool strings = (w->style & CBS_HASSTRINGS) ||
+                   !(w->style & (CBS_OWNERDRAWFIXED | CBS_OWNERDRAWVARIABLE));
+    static const ItemMsgs kCb{0x143, 0x14A, 0x144, 0x14B, 0x14E, 0x147, 0x148, 0x149,
+                              0x146, 0x14C, 0x158, 0x14D, 0x150, 0x151, true, false};
+    ItemMsgs k = kCb;
+    k.strings = strings;
+    k.sort = w->style & CBS_SORT;
+    if (ItemMsg(*w, k, msg, wp, lp, &r)) return r;
+    switch (msg) {
+      case 0x14F: w->dropped = wp != 0; return 1;                     // CB_SHOWDROPDOWN
+      case 0x157: return w->dropped ? 1 : 0;                           // CB_GETDROPPEDSTATE
+      case 0x153: w->limit = lp & 0xFFFF; return 0;                    // CB_SETITEMHEIGHT
+      case 0x154: return ItemHeight(*w);                               // CB_GETITEMHEIGHT
+      case 0x141: case 0x142: case 0x155: case 0x156: return 1;        // limit, edit sel, ext UI
+      case 0x140: return 0;                                             // CB_GETEDITSEL
+      case 0x152: {                                                     // CB_GETDROPPEDCONTROLRECT
+        int sx, sy;
+        WindowScreenPos(*w, &sx, &sy);
+        Wr32(lp, uint32_t(sx));
+        Wr32(lp + 4, uint32_t(sy));
+        Wr32(lp + 8, uint32_t(sx + w->w));
+        Wr32(lp + 12, uint32_t(sy + w->h));
+        return 1;
+      }
+      case WM_LBUTTONDOWN:
+        if (!w->items.empty()) {
+          w->cur_sel = (w->cur_sel + 1) % int32_t(w->items.size());
+          w->title = w->items[size_t(w->cur_sel)].first;
+          notify = true;
+        }
+        break;
+      default:
+        if (msg >= 0x0140 && msg <= 0x016F) {
+          UnhandledControlMsg("combobox", msg);
+          return 0;
+        }
+        return CallDefWindowProc(c, hwnd, msg, wp, lp);
+    }
+  }
+  if (notify) NotifyParent(hwnd, 1 /* CBN_SELCHANGE */);
+  return 0;
+}
+
+HLE_NAMED("user32.dll", "<trackbar>", TrackbarWndProc, 4) {
+  uint32_t hwnd = Arg(c, 0), msg = Arg(c, 1), wp = Arg(c, 2), lp = Arg(c, 3), r = 0;
+  uint32_t parent = 0, pos = 0;
+  {
+    std::lock_guard<std::recursive_mutex> l(g_mu);
+    Window* w = Win(hwnd);
+    if (!w) return 0;
+    if (CommonControlMsg(*w, msg, wp, lp, &r)) return r;
+    switch (msg) {
+      case 0x400: return uint32_t(w->pos);                              // TBM_GETPOS
+      case 0x401: return uint32_t(w->range_lo);                         // TBM_GETRANGEMIN
+      case 0x402: return uint32_t(w->range_hi);                         // TBM_GETRANGEMAX
+      case 0x405: w->pos = std::clamp(int32_t(lp), w->range_lo, w->range_hi); return 0;
+      case 0x406: w->range_lo = int16_t(lp); w->range_hi = int16_t(lp >> 16); return 0;
+      case 0x407: w->range_lo = int32_t(lp); return 0;
+      case 0x408: w->range_hi = int32_t(lp); return 0;
+      case WM_LBUTTONDOWN: {
+        int32_t x = int16_t(lp);
+        int32_t span = std::max(1, w->w - 1);
+        w->pos = std::clamp(w->range_lo + x * (w->range_hi - w->range_lo) / span, w->range_lo,
+                            w->range_hi);
+        parent = w->parent;
+        pos = uint32_t(w->pos);
+        break;
+      }
+      default:
+        if (msg >= 0x0400 && msg <= 0x0430) return 0;  // tics, page/line size, selection
+        return CallDefWindowProc(c, hwnd, msg, wp, lp);
+    }
+  }
+  if (parent) Send(parent, WM_HSCROLL, 4 /* TB_THUMBPOSITION */ | (pos << 16), hwnd);
+  return 0;
+}
+
+HLE_NAMED("user32.dll", "<scrollbar>", ScrollBarWndProc, 4) {
+  uint32_t hwnd = Arg(c, 0), msg = Arg(c, 1), wp = Arg(c, 2), lp = Arg(c, 3), r = 0;
+  uint32_t parent = 0, code = 0, sbmsg = WM_VSCROLL;
+  {
+    std::lock_guard<std::recursive_mutex> l(g_mu);
+    Window* w = Win(hwnd);
+    if (!w) return 0;
+    if (CommonControlMsg(*w, msg, wp, lp, &r)) return r;
+    switch (msg) {
+      case 0xE0: r = uint32_t(w->pos); w->pos = int32_t(wp); return r;  // SBM_SETPOS
+      case 0xE1: return uint32_t(w->pos);                               // SBM_GETPOS
+      case 0xE2: case 0xE6: w->range_lo = int32_t(wp); w->range_hi = int32_t(lp); return 0;
+      case 0xE3:                                                        // SBM_GETRANGE
+        if (wp) Wr32(wp, uint32_t(w->range_lo));
+        if (lp) Wr32(lp, uint32_t(w->range_hi));
+        return 1;
+      case 0xE9: case 0xEA: {  // SBM_SETSCROLLINFO / SBM_GETSCROLLINFO: SCROLLINFO at lp
+        uint32_t mask = Rd32(lp + 4);
+        if (msg == 0xE9) {
+          if (mask & 1) { w->range_lo = int32_t(Rd32(lp + 8)); w->range_hi = int32_t(Rd32(lp + 12)); }
+          if (mask & 4) w->pos = int32_t(Rd32(lp + 20));
+          return uint32_t(w->pos);
+        }
+        if (mask & 1) { Wr32(lp + 8, uint32_t(w->range_lo)); Wr32(lp + 12, uint32_t(w->range_hi)); }
+        if (mask & 2) Wr32(lp + 16, 1);
+        if (mask & 4) Wr32(lp + 20, uint32_t(w->pos));
+        if (mask & 0x10) Wr32(lp + 24, uint32_t(w->pos));
+        return 1;
+      }
+      case WM_LBUTTONDOWN: {
+        bool horz = !(w->style & 1);  // SBS_VERT
+        int32_t at = horz ? int16_t(lp) : int16_t(lp >> 16);
+        int32_t len = horz ? w->w : w->h;
+        code = at < len / 2 ? 0 /* SB_LINEUP */ : 1 /* SB_LINEDOWN */;
+        sbmsg = horz ? WM_HSCROLL : WM_VSCROLL;
+        parent = w->parent;
+        break;
+      }
+      default:
+        return CallDefWindowProc(c, hwnd, msg, wp, lp);
+    }
+  }
+  if (parent) Send(parent, sbmsg, code, hwnd);
+  return 0;
 }
 
 HLE("user32.dll", MsgWaitForMultipleObjects, 5) {
@@ -2317,6 +3593,11 @@ HLE("user32.dll", SetCapture, 1) {
   return old;
 }
 
+HLE("user32.dll", GetCapture, 0) {
+  std::lock_guard<std::recursive_mutex> l(g_mu);
+  return g_capture;
+}
+
 HLE("user32.dll", ReleaseCapture, 0) {
   std::lock_guard<std::recursive_mutex> l(g_mu);
   g_capture = 0;
@@ -2400,10 +3681,18 @@ HLE("user32.dll", BeginPaint, 2) {
   uint32_t ps = Arg(c, 1), dc = DcForWindow(Arg(c, 0));
   std::memset(GPtr(ps), 0, 64);
   Wr32(ps, dc);
+  // rcPaint: the whole client area.
+  int cw = 0, ch = 0;
+  {
+    std::lock_guard<std::recursive_mutex> l(g_mu);
+    if (Window* w = Win(Arg(c, 0))) ClientSize(*w, &cw, &ch);
+  }
+  Wr32(ps + 16, uint32_t(cw));
+  Wr32(ps + 20, uint32_t(ch));
+  Validate(Arg(c, 0));
   return dc;
 }
 HLE("user32.dll", EndPaint, 2) { return 1; }
-HLE("user32.dll", FillRect, 3) { return 1; }
 HLE("user32.dll", DrawTextA, 5) { return 16; }
 HLE("user32.dll", DrawFrameControl, 4) { return 1; }
 

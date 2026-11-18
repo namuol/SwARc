@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <vector>
 
 #include "runtime/env.h"
@@ -16,7 +17,13 @@ namespace recomp::gfx {
 // Dev aid: <ID>_SHOT_EVERY=N saves every Nth presented frame (from frame
 // <ID>_SHOT_FROM on) as $<ID>_SHOT_DIR/frame_NNNNN.bmp (default dir: current
 // directory).
-void PresentWithDevAids(Device& dev, int w, int h) {
+namespace {
+
+int frame = 0;  // frames presented (back or front buffer)
+
+// <ID>_SHOT_EVERY / _SHOT_FROM / _SHOT_DIR: counts presented frames (back
+// or front buffer) and saves the due ones, read by `read`.
+void MaybeShoot(int w, int h, const std::function<void(uint8_t*, uint32_t)>& read) {
   static const int every = [] {
     const char* e = Env("SHOT_EVERY");
     return e ? std::atoi(e) : 0;
@@ -25,11 +32,10 @@ void PresentWithDevAids(Device& dev, int w, int h) {
     const char* e = Env("SHOT_FROM");
     return e ? std::atoi(e) : 0;
   }();
-  static int frame = 0;
   frame++;
   if (every > 0 && frame >= from && frame % every == 0) {
     std::vector<uint8_t> px(size_t(w) * h * 4);
-    dev.ReadBack({0, 0, w, h}, px.data(), uint32_t(w * 4), Format::X8R8G8B8);
+    read(px.data(), uint32_t(w * 4));
     SDL_Surface* surf = SDL_CreateSurfaceFrom(w, h, SDL_PIXELFORMAT_XRGB8888,
                                               px.data(), w * 4);
     const char* dir = Env("SHOT_DIR");
@@ -40,6 +46,23 @@ void PresentWithDevAids(Device& dev, int w, int h) {
       SDL_DestroySurface(surf);
     }
   }
+}
+
+}  // namespace
+
+// Games that draw on the front buffer (DirectDraw without a back buffer):
+// the same screenshots, of the front buffer.
+void PresentFrontWithDevAids(Device& dev, int w, int h) {
+  MaybeShoot(w, h, [&](uint8_t* px, uint32_t pitch) {
+    dev.ReadBackFront({0, 0, w, h}, px, pitch, Format::X8R8G8B8);
+  });
+  dev.PresentFront();
+}
+
+void PresentWithDevAids(Device& dev, int w, int h) {
+  MaybeShoot(w, h, [&](uint8_t* px, uint32_t pitch) {
+    dev.ReadBack({0, 0, w, h}, px, pitch, Format::X8R8G8B8);
+  });
   dev.Present();
   // <ID>_HITCH=ms: report frames that took longer than that.
   static const double hitch_ms = [] {

@@ -28,6 +28,10 @@ void EnsureSdlVideo();
 // Pumps SDL events into the guest message queues. Main thread only;
 // called from PeekMessage/GetMessage and long waits.
 void PumpHostEvents();
+// Called on every message pump (main thread): a graphics front end with a
+// present it deferred (DirectDraw's throttled front-buffer presents) does
+// it here once it is due.
+extern void (*g_pump_present)();
 
 // Games that link SDL2 themselves (recomp_sdl2): an SDL2 window is an
 // HWND too, so Win32 and DXGI calls on the HWND the game gets from

@@ -5,6 +5,8 @@
 // $XDG_DATA_HOME/<id>/registry.txt. It is seeded with what the retail
 // installer would have written (GameConfig::registry).
 
+#include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -216,6 +218,88 @@ HLE("advapi32.dll", RegSetValueExA, 6) {
   return kErrorSuccess;
 }
 
+// Direct subkeys of `key`, in order (key names as stored: lower case).
+std::vector<std::string> Subkeys(const std::string& key) {
+  std::vector<std::string> out;
+  std::string pre = key + "\\";
+  for (auto it = g_reg.lower_bound(pre); it != g_reg.end() && it->first.compare(0, pre.size(), pre) == 0; ++it)
+    if (it->first.find('\\', pre.size()) == std::string::npos) out.push_back(it->first.substr(pre.size()));
+  return out;
+}
+
+// RegDeleteKeyA(hkey, subkey): only keys without subkeys, as on NT.
+HLE("advapi32.dll", RegDeleteKeyA, 2) {
+  std::lock_guard<std::mutex> l(g_reg_mu);
+  LoadOnce();
+  std::string base = RootName(Arg(c, 0));
+  if (base.empty()) return kErrorInvalidHandle;
+  std::string path = Join(base, GStr(Arg(c, 1)));
+  if (!g_reg.count(path)) return kErrorFileNotFound;
+  if (!Subkeys(path).empty()) return 5;  // ERROR_ACCESS_DENIED
+  g_reg.erase(path);
+  Save();
+  return kErrorSuccess;
+}
+
+// RegEnumKeyExA(hkey, index, name, &name_len, reserved, class, &class_len, &time)
+HLE("advapi32.dll", RegEnumKeyExA, 8) {
+  std::lock_guard<std::mutex> l(g_reg_mu);
+  LoadOnce();
+  std::string key = RootName(Arg(c, 0));
+  if (!g_reg.count(key)) return kErrorInvalidHandle;
+  std::vector<std::string> subs = Subkeys(key);
+  uint32_t i = Arg(c, 1), name = Arg(c, 2), len_p = Arg(c, 3);
+  if (i >= subs.size()) return 259;  // ERROR_NO_MORE_ITEMS
+  const std::string& n = subs[i];
+  if (Rd32(len_p) < n.size() + 1) return kErrorMoreData;
+  PutStr(name, n);
+  Wr32(len_p, uint32_t(n.size()));
+  if (Arg(c, 5) && Arg(c, 6) && Rd32(Arg(c, 6))) Wr8(Arg(c, 5), 0);
+  if (Arg(c, 6)) Wr32(Arg(c, 6), 0);
+  if (Arg(c, 7)) { Wr32(Arg(c, 7), 0); Wr32(Arg(c, 7) + 4, 0); }
+  return kErrorSuccess;
+}
+
+// RegQueryInfoKeyA(hkey, class, &class_len, reserved, &subkeys,
+// &max_subkey_len, &max_class_len, &values, &max_value_name_len,
+// &max_value_len, &security_descriptor_len, &last_write_time)
+HLE("advapi32.dll", RegQueryInfoKeyA, 12) {
+  std::lock_guard<std::mutex> l(g_reg_mu);
+  LoadOnce();
+  std::string key = RootName(Arg(c, 0));
+  auto k = g_reg.find(key);
+  if (k == g_reg.end()) return kErrorInvalidHandle;
+  std::vector<std::string> subs = Subkeys(key);
+  uint32_t max_sub = 0, max_name = 0, max_val = 0;
+  for (const auto& s : subs) max_sub = std::max(max_sub, uint32_t(s.size()));
+  for (const auto& [n, v] : k->second) {
+    max_name = std::max(max_name, uint32_t(n.size()));
+    max_val = std::max(max_val, uint32_t(v.data.size()));
+  }
+  auto put = [&](int i, uint32_t v) { if (Arg(c, i)) Wr32(Arg(c, i), v); };
+  if (Arg(c, 1) && Arg(c, 2) && Rd32(Arg(c, 2))) Wr8(Arg(c, 1), 0);
+  put(2, 0);
+  put(4, uint32_t(subs.size()));
+  put(5, max_sub);
+  put(6, 0);
+  put(7, uint32_t(k->second.size()));
+  put(8, max_name);
+  put(9, max_val);
+  put(10, 0);
+  if (Arg(c, 11)) { Wr32(Arg(c, 11), 0); Wr32(Arg(c, 11) + 4, 0); }
+  return kErrorSuccess;
+}
+
+HLE("advapi32.dll", RegDeleteValueA, 2) {
+  std::lock_guard<std::mutex> l(g_reg_mu);
+  LoadOnce();
+  auto k = g_reg.find(RootName(Arg(c, 0)));
+  if (k == g_reg.end()) return kErrorInvalidHandle;
+  if (!k->second.erase(Lower(Arg(c, 1) ? GStr(Arg(c, 1)) : std::string()))) return kErrorFileNotFound;
+  Save();
+  return kErrorSuccess;
+}
+
 HLE("advapi32.dll", GetUserNameA, 2) {
   std::string n = "Player";
   uint32_t buf = Arg(c, 0), psize = Arg(c, 1);
@@ -247,14 +331,114 @@ HLE64("ole32.dll", CoTaskMemFree, 1) {
 // REGDB_E_CLASSNOTREG reads as "not installed", as on a system without
 // them: DirectPlay8 (multiplayer), the Zone update object and the Game
 // Explorer (VerifyAccess: access is then not denied).
+// Class objects the process registered itself (CoRegisterClassObject):
+// CoCreateInstance asks their IClassFactory first. Games implement COM
+// classes in their own EXE this way (Tiberian Sun's unit locomotors).
+struct ClassObject {
+  uint8_t clsid[16];
+  uint32_t factory;  // IClassFactory*, AddRef'd
+  uint32_t cookie;
+};
+std::vector<ClassObject> g_class_objects;
+uint32_t g_next_cookie = 0x100;
+
+// (rclsid, pUnk, dwClsContext, flags, lpdwRegister)
+HLE("ole32.dll", CoRegisterClassObject, 5) {
+  uint32_t clsid = Arg(c, 0), unk = Arg(c, 1);
+  ClassObject o;
+  std::memcpy(o.clsid, GPtr(clsid), 16);
+  o.factory = unk;
+  o.cookie = g_next_cookie++;
+  CallGuest(c, Rd32(Rd32(unk) + 4), {unk});  // AddRef
+  g_class_objects.push_back(o);
+  if (Arg(c, 4)) Wr32(Arg(c, 4), o.cookie);
+  return 0;
+}
+
+HLE("ole32.dll", CoRevokeClassObject, 1) {
+  for (auto it = g_class_objects.begin(); it != g_class_objects.end(); ++it)
+    if (it->cookie == Arg(c, 0)) {
+      uint32_t f = it->factory;
+      g_class_objects.erase(it);
+      CallGuest(c, Rd32(Rd32(f) + 8), {f});  // Release
+      return 0;
+    }
+  return 0x80040016;  // CO_E_OBJNOTREG
+}
+
+// CoCreateInstance through a registered class object; false if none.
+bool RegisteredClass(Ctx& c, uint32_t clsid, uint32_t iid, uint32_t out, uint32_t* hr) {
+  for (const ClassObject& o : g_class_objects) {
+    if (std::memcmp(o.clsid, GPtr(clsid), 16)) continue;
+    uint32_t f = o.factory;
+    *hr = uint32_t(CallGuest(c, Rd32(Rd32(f) + 12), {f, 0, iid, out}));  // CreateInstance
+    return true;
+  }
+  return false;
+}
+
+// An in-process server the game's installer registered: the DLL named by
+// HKCR\CLSID\{clsid}\InprocServer32 (a lifted DLL), loaded with
+// LoadLibrary, asked for its class factory with DllGetClassObject, whose
+// CreateInstance makes the object, as ole32 does.
+bool InprocServer(Ctx& c, uint32_t clsid, uint32_t iid, uint32_t out, uint32_t* hr) {
+  char k[96];
+  std::snprintf(k, sizeof k,
+                "hkcr\\clsid\\{%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x}\\inprocserver32",
+                Rd32(clsid), Rd16(clsid + 4), Rd16(clsid + 6), Rd8(clsid + 8), Rd8(clsid + 9),
+                Rd8(clsid + 10), Rd8(clsid + 11), Rd8(clsid + 12), Rd8(clsid + 13),
+                Rd8(clsid + 14), Rd8(clsid + 15));
+  std::string dll;
+  {
+    std::lock_guard<std::mutex> l(g_reg_mu);
+    LoadOnce();
+    auto key = g_reg.find(k);
+    if (key == g_reg.end()) return false;
+    auto v = key->second.find("");
+    if (v == key->second.end() || v->second.data.empty()) return false;
+    dll.assign(v->second.data.begin(), v->second.data.end());
+    while (!dll.empty() && !dll.back()) dll.pop_back();
+  }
+  uint32_t tmp = HeapAllocProcess(uint32_t(dll.size()) + 64, true);
+  PutStr(tmp, dll);
+  uint32_t mod = uint32_t(CallGuest(c, ThunkFor("kernel32.dll", "LoadLibraryA"), {tmp}));
+  uint32_t get = 0;
+  if (mod) {
+    PutStr(tmp, "DllGetClassObject");
+    get = uint32_t(CallGuest(c, ThunkFor("kernel32.dll", "GetProcAddress"), {mod, tmp}));
+  }
+  if (!get) {
+    WarnF("CoCreateInstance: in-process server %s not available\n", dll.c_str());
+    HeapFreeProcess(tmp);
+    return false;
+  }
+  // IID_IClassFactory {00000001-0000-0000-C000-000000000046}, then the factory.
+  const uint8_t cf_iid[16] = {1, 0, 0, 0, 0, 0, 0, 0, 0xC0, 0, 0, 0, 0, 0, 0, 0x46};
+  std::memcpy(GPtr(tmp), cf_iid, 16);
+  Wr32(tmp + 16, 0);
+  *hr = uint32_t(CallGuest(c, get, {clsid, tmp, tmp + 16}));
+  uint32_t cf = Rd32(tmp + 16);
+  HeapFreeProcess(tmp);
+  if (*hr || !cf) {
+    if (out) Wr32(out, 0);
+    return true;
+  }
+  uint32_t vt = Rd32(cf);
+  *hr = uint32_t(CallGuest(c, Rd32(vt + 12), {cf, 0, iid, out}));  // CreateInstance
+  CallGuest(c, Rd32(vt + 8), {cf});                                // Release
+  return true;
+}
+
 HLE("ole32.dll", CoCreateInstance, 5) {
-  uint32_t clsid = Arg(c, 0), out = Arg(c, 4);
+  uint32_t clsid = Arg(c, 0), out = Arg(c, 4), hr_inproc = 0;
   if (com::CreateFn create = com::FindCoClass(clsid)) {
     uint32_t obj = 0;
     uint32_t hr = create(Arg(c, 3), &obj);
     if (out) Wr32(out, obj);
     return hr;
   }
+  if (RegisteredClass(c, clsid, Arg(c, 3), out, &hr_inproc)) return hr_inproc;
+  if (InprocServer(c, clsid, Arg(c, 3), out, &hr_inproc)) return hr_inproc;
   WarnF("CoCreateInstance({%08X-...}): class not available\n", Rd32(clsid));
   if (out) Wr32(out, 0);
   return 0x80040154;

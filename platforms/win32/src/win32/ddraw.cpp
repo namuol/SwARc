@@ -1,5 +1,8 @@
 // ddraw: DirectDrawEnumerateExA/DirectDrawCreateEx, IDirectDraw7,
-// IDirectDrawSurface7, IDirectDrawGammaControl, IDirectDrawClipper.
+// IDirectDrawSurface7, IDirectDrawGammaControl, IDirectDrawClipper; and
+// for DirectX 3-6 games DirectDrawCreate, IDirectDraw/IDirectDraw2 and
+// IDirectDrawSurface..3, which are the same objects behind vtables of the
+// older layout (their DDSURFACEDESC is 108 bytes, their DDSCAPS one DWORD).
 //
 // Surfaces:
 //   - Back buffer: the gfx render target. Games present with
@@ -28,6 +31,7 @@
 #include "runtime/gfx/present.h"
 #include "runtime/log.h"
 #include "win32/ddraw_impl.h"
+#include "win32/gdi_state.h"
 #include "win32/hle.h"
 #include "win32/input_state.h"
 #include "win32/kernel32_state.h"
@@ -44,6 +48,13 @@ namespace {
 
 constexpr guest::GUID kIID_IDirectDraw7 = {0x15e65ec0, 0x3b9c, 0x11d2, {0xb9, 0x2f, 0x00, 0x60, 0x97, 0x97, 0xea, 0x5b}};
 constexpr guest::GUID kIID_IDirectDrawSurface7 = {0x06675a80, 0x3b9b, 0x11d2, {0xb9, 0x2f, 0x00, 0x60, 0x97, 0x97, 0xea, 0x5b}};
+constexpr guest::GUID kIID_IDirectDraw = {0x6C14DB80, 0xA733, 0x11CE, {0xA5, 0x21, 0x00, 0x20, 0xAF, 0x0B, 0xE5, 0x60}};
+constexpr guest::GUID kIID_IDirectDraw2 = {0xB3A6F3E0, 0x2B43, 0x11CF, {0xA2, 0xDE, 0x00, 0xAA, 0x00, 0xB9, 0x33, 0x56}};
+constexpr guest::GUID kIID_IDirectDrawSurface = {0x6C14DB81, 0xA733, 0x11CE, {0xA5, 0x21, 0x00, 0x20, 0xAF, 0x0B, 0xE5, 0x60}};
+constexpr guest::GUID kIID_IDirectDrawSurface2 = {0x57805885, 0x6EEC, 0x11CF, {0x94, 0x41, 0xA8, 0x23, 0x03, 0xC1, 0x0E, 0x27}};
+constexpr guest::GUID kIID_IDirectDrawSurface3 = {0xDA044E00, 0x69B2, 0x11D0, {0xA1, 0xD5, 0x00, 0xAA, 0x00, 0xB8, 0xDF, 0xBB}};
+// sizeof(DDSURFACEDESC), the DirectX 3-6 one.
+constexpr uint32_t kDescV1Size = 108;
 constexpr guest::GUID kIID_IDirectDrawGammaControl = {0x69C11C3E, 0xB46B, 0x11D1, {0xAD, 0x7A, 0x00, 0xC0, 0x4F, 0xC2, 0x9B, 0x4E}};
 
 // GameConfig::video_memory_mb, with 8 MB in use (the primary surface).
@@ -233,6 +244,29 @@ uint32_t SurfaceVtable() {
        "GetLOD"});
 }
 
+// IDirectDrawSurface..3: a prefix of IDirectDrawSurface7 (QueryInterface
+// through SetSurfaceDesc), served by its handlers, which size what they
+// write by the surface's version.
+uint32_t LegacySurfaceVtable() {
+  std::vector<std::string> h;
+  for (const char* m :
+       {"QueryInterface", "AddRef", "Release", "AddAttachedSurface",
+        "AddOverlayDirtyRect", "Blt", "BltBatch", "BltFast",
+        "DeleteAttachedSurface", "EnumAttachedSurfaces", "EnumOverlayZOrders",
+        "Flip", "GetAttachedSurface", "GetBltStatus", "GetCaps", "GetClipper",
+        "GetColorKey", "GetDC", "GetFlipStatus", "GetOverlayPosition",
+        "GetPalette", "GetPixelFormat", "GetSurfaceDesc", "Initialize",
+        "IsLost", "Lock", "ReleaseDC", "Restore", "SetClipper", "SetColorKey",
+        "SetOverlayPosition", "SetPalette", "Unlock", "UpdateOverlay",
+        "UpdateOverlayDisplay", "UpdateOverlayZOrder", "GetDDInterface",
+        "PageLock", "PageUnlock", "SetSurfaceDesc"})
+    h.push_back(std::string("IDirectDrawSurface7::") + m);
+  return com::VtableOf("ddraw.dll", "IDirectDrawSurface3", h);
+}
+
+// What a surface reports in a DDSURFACEDESC of its version's size.
+uint32_t DescSize(const Surface& s) { return s.version == 7 ? sizeof(DDSURFACEDESC2) : kDescV1Size; }
+
 bool OnGpu(const Surface& s) {
   return s.kind == Surface::Kind::BackBuffer || s.kind == Surface::Kind::Primary;
 }
@@ -288,7 +322,8 @@ std::shared_ptr<Surface> NewSurface(Surface::Kind kind, int w, int h,
   d.ddsCaps.dwCaps = caps;
   d.ddsCaps.dwCaps2 = caps2;
   d.lPitch = int32_t(gfx::RowPitch(fmt, uint32_t(w)));
-  com::Publish(s, SurfaceVtable());
+  s->version = g_state.surface_version;
+  com::Publish(s, s->version == 7 ? SurfaceVtable() : LegacySurfaceVtable());
   return s;
 }
 
@@ -487,10 +522,31 @@ void Pull(Surface& s, const guest::RECT& r) {
 // Writes rows/rect `r` of the primary's guest memory to the front buffer.
 // It is shown at once only when the game is not presenting frames anyway
 // (each frame replaces the front buffer, cursor included).
+// A game without a back buffer (it blits its frames to the primary) has
+// its front buffer shown at most every 8 ms, so that the many blits of
+// one frame are not each a present.
+// A present skipped by the throttle is done later, from the message pump
+// (g_pump_present), so a burst of drawing that ends inside the 8 ms still
+// reaches the screen.
+Uint64 g_last_front_ms = 0;
+bool g_front_pending = false;
+
+void PresentFrontIfDue() {
+  if (!g_front_pending) return;
+  Uint64 now = SDL_GetTicks();
+  if (now - g_last_front_ms < 8) return;
+  g_front_pending = false;
+  g_last_front_ms = now;
+  gfx::PresentFrontWithDevAids(*Gfx(), PrimaryWidth(), PrimaryHeight());
+}
+
 void PushFront(Surface& s, const gfx::Rect& r) {
   if (r.right <= r.left || r.bottom <= r.top) return;
   Gfx()->BlitFront(GPtr(s.mem), s.pitch, s.fmt, r, r);
-  if (SDL_GetTicks() - g_last_present_ms > 50) Gfx()->PresentFront();
+  if (SDL_GetTicks() - g_last_present_ms <= 50) return;  // frames are being presented
+  g_front_pending = true;
+  if (!g_pump_present) g_pump_present = [] { PresentFrontIfDue(); };
+  PresentFrontIfDue();
 }
 
 // `fill_raw` is DDBLTFX's dwFillColor/dwFillDepth union.
@@ -601,7 +657,42 @@ uint32_t DirectDrawVtable() {
        "GetDeviceIdentifier", "StartModeTest", "EvaluateMode"});
 }
 
-struct DirectDraw : com::Object {};
+struct DirectDraw : com::Object {
+  int version = 7;  // 1: IDirectDraw, 2: IDirectDraw2, 7: IDirectDraw7
+};
+
+// IDirectDraw (1) and IDirectDraw2 (2): prefixes of IDirectDraw7, served
+// by its handlers except SetDisplayMode, whose IDirectDraw form has no
+// refresh rate or flags.
+uint32_t LegacyDirectDrawVtable(int version) {
+  std::vector<std::string> h;
+  for (const char* m :
+       {"QueryInterface", "AddRef", "Release", "Compact", "CreateClipper",
+        "CreatePalette", "CreateSurface", "DuplicateSurface",
+        "EnumDisplayModes", "EnumSurfaces", "FlipToGDISurface", "GetCaps",
+        "GetDisplayMode", "GetFourCCCodes", "GetGDISurface",
+        "GetMonitorFrequency", "GetScanLine", "GetVerticalBlankStatus",
+        "Initialize", "RestoreDisplayMode", "SetCooperativeLevel",
+        "SetDisplayMode", "WaitForVerticalBlank", "GetAvailableVidMem"})
+    h.push_back(std::string("IDirectDraw7::") + m);
+  if (version == 1) {
+    h.pop_back();  // GetAvailableVidMem came with IDirectDraw2
+    h[21] = "IDirectDraw::SetDisplayMode";
+    return com::VtableOf("ddraw.dll", "IDirectDraw", h);
+  }
+  return com::VtableOf("ddraw.dll", "IDirectDraw2", h);
+}
+
+uint32_t NewDirectDraw(int version) {
+  auto dd = std::make_shared<DirectDraw>();
+  dd->version = version;
+  return com::Publish(dd, version == 7 ? DirectDrawVtable() : LegacyDirectDrawVtable(version));
+}
+
+int DdVersion(Ctx& c) {
+  DirectDraw* d = com::As<DirectDraw>(Arg(c, 0));
+  return d ? d->version : 7;
+}
 
 // DirectDrawEnumerateExA(callback, context, flags): one adapter, the
 // primary display (NULL GUID). Callback: BOOL(GUID*, LPSTR desc, LPSTR
@@ -623,8 +714,18 @@ HLE("ddraw.dll", DirectDrawCreateEx, 4) {
     return DDERR_INVALIDPARAMS;
   }
   if (!com::GuidEq(iid, kIID_IDirectDraw7)) return com::kE_NOINTERFACE;
-  auto dd = std::make_shared<DirectDraw>();
-  Wr32(out, com::Publish(dd, DirectDrawVtable()));
+  Wr32(out, NewDirectDraw(7));
+  return DD_OK;
+}
+
+// DirectDrawCreate(guid, IDirectDraw** out, outer): the DirectX 3-6 entry.
+HLE("ddraw.dll", DirectDrawCreate, 3) {
+  uint32_t guid = Arg(c, 0), out = Arg(c, 1);
+  if (guid > 2 && Rd32(guid)) {  // only the primary display (NULL GUID)
+    Wr32(out, 0);
+    return DDERR_INVALIDPARAMS;
+  }
+  Wr32(out, NewDirectDraw(1));
   return DD_OK;
 }
 
@@ -632,9 +733,18 @@ HLE("ddraw.dll", DirectDrawCreateEx, 4) {
 
 HLE_NAMED("ddraw.dll", "IDirectDraw7::QueryInterface", DD7_QueryInterface, 3) {
   uint32_t self = Arg(c, 0), iid = Arg(c, 1), out = Arg(c, 2);
-  if (com::GuidEq(iid, kIID_IDirectDraw7)) {
+  int have = DdVersion(c);
+  int want = com::GuidEq(iid, kIID_IDirectDraw7)  ? 7
+             : com::GuidEq(iid, kIID_IDirectDraw2) ? 2
+             : com::GuidEq(iid, kIID_IDirectDraw)  ? 1
+                                                   : 0;
+  if (want && want == have) {
     com::AddRef(self);
     Wr32(out, self);
+    return DD_OK;
+  }
+  if (want) {  // another interface of the one DirectDraw (its state is global)
+    Wr32(out, NewDirectDraw(want));
     return DD_OK;
   }
   if (com::GuidEq(iid, kIID_IDirect3D7)) {
@@ -674,9 +784,11 @@ HLE_NAMED("ddraw.dll", "IDirectDraw7::EnumDisplayModes", DD7_EnumDisplayModes, 5
   uint32_t cb = Arg(c, 4), ctx = Arg(c, 3);
   EnsureSdlVideo();
   uint32_t d = HeapAllocProcess(sizeof(DDSURFACEDESC2), true);
+  bool v1 = DdVersion(c) < 7;
   for (int bpp : {16, 32})
     for (const ModeSize& m : DisplayModeSizes()) {
       FillModeDesc(G<DDSURFACEDESC2>(d), m.w, m.h, bpp);
+      if (v1) G<DDSURFACEDESC2>(d)->dwSize = kDescV1Size;
       if (!CallGuest(c, cb, {d, ctx})) goto done;
     }
 done:
@@ -688,7 +800,11 @@ HLE_NAMED("ddraw.dll", "IDirectDraw7::GetDisplayMode", DD7_GetDisplayMode, 2) {
   State& s = St();
   EnsureSdlVideo();
   int w = s.mode_w ? s.mode_w : g_display_w, h = s.mode_h ? s.mode_h : g_display_h;
-  FillModeDesc(G<DDSURFACEDESC2>(Arg(c, 1)), w, h, s.mode_bpp ? s.mode_bpp : 32);
+  DDSURFACEDESC2 d;
+  FillModeDesc(&d, w, h, s.mode_bpp ? s.mode_bpp : 32);
+  uint32_t size = DdVersion(c) < 7 ? kDescV1Size : uint32_t(sizeof d);
+  d.dwSize = size;
+  std::memcpy(GPtr(Arg(c, 1)), &d, size);
   return DD_OK;
 }
 
@@ -700,6 +816,18 @@ HLE_NAMED("ddraw.dll", "IDirectDraw7::SetDisplayMode", DD7_SetDisplayMode, 6) {
   s.mode_h = h;
   s.mode_bpp = bpp;
   // The "mode" is the window's client size; the desktop is left alone.
+  SetExclusiveMode(s.hwnd, w, h);
+  if (s.gfx) s.gfx->ResetSwapChain(w, h, s.vsync);
+  return DD_OK;
+}
+
+HLE_NAMED("ddraw.dll", "IDirectDraw::SetDisplayMode", DD1_SetDisplayMode, 4) {
+  State& s = St();
+  int w = int(Arg(c, 1)), h = int(Arg(c, 2)), bpp = int(Arg(c, 3));
+  RECOMP_TRACE("  SetDisplayMode(%d x %d x %d) [IDirectDraw]\n", w, h, bpp);
+  s.mode_w = w;
+  s.mode_h = h;
+  s.mode_bpp = bpp;
   SetExclusiveMode(s.hwnd, w, h);
   if (s.gfx) s.gfx->ResetSwapChain(w, h, s.vsync);
   return DD_OK;
@@ -792,8 +920,19 @@ HLE_NAMED("ddraw.dll", "IDirectDraw7::GetDeviceIdentifier", DD7_GetDeviceIdentif
 }
 
 HLE_NAMED("ddraw.dll", "IDirectDraw7::CreateSurface", DD7_CreateSurface, 4) {
-  uint32_t out = 0;
-  uint32_t hr = CreateSurfaceImpl(Arg(c, 1), &out);
+  uint32_t out = 0, hr;
+  if (DdVersion(c) < 7) {
+    uint32_t d = HeapAllocProcess(sizeof(DDSURFACEDESC2), true);
+    std::memcpy(GPtr(d), GPtr(Arg(c, 1)), kDescV1Size);
+    G<DDSURFACEDESC2>(d)->dwSize = sizeof(DDSURFACEDESC2);
+    St().surface_version = 3;
+    hr = CreateSurfaceImpl(d, &out);
+    HeapFreeProcess(d);
+  } else {
+    St().surface_version = 7;
+    hr = CreateSurfaceImpl(Arg(c, 1), &out);
+  }
+  RECOMP_TRACE("  CreateSurface -> %08X\n", out);
   Wr32(Arg(c, 2), out);
   return hr;
 }
@@ -802,7 +941,11 @@ HLE_NAMED("ddraw.dll", "IDirectDraw7::CreateSurface", DD7_CreateSurface, 4) {
 
 HLE_NAMED("ddraw.dll", "IDirectDrawSurface7::QueryInterface", DDS7_QueryInterface, 3) {
   uint32_t self = Arg(c, 0), iid = Arg(c, 1), out = Arg(c, 2);
-  if (com::GuidEq(iid, kIID_IDirectDrawSurface7)) {
+  bool legacy = com::GuidEq(iid, kIID_IDirectDrawSurface) ||
+                com::GuidEq(iid, kIID_IDirectDrawSurface2) ||
+                com::GuidEq(iid, kIID_IDirectDrawSurface3);
+  if ((legacy && Self(c)->version != 7) ||
+      (com::GuidEq(iid, kIID_IDirectDrawSurface7) && Self(c)->version == 7)) {
     com::AddRef(self);
     Wr32(out, self);
     return DD_OK;
@@ -831,7 +974,8 @@ HLE_NAMED("ddraw.dll", "IDirectDrawSurface7::GetSurfaceDesc", DDS7_GetSurfaceDes
   Surface* s = Self(c);
   DDSURFACEDESC2 d = s->desc;
   d.lpSurface = 0;
-  std::memcpy(GPtr(Arg(c, 1)), &d, sizeof d);
+  d.dwSize = DescSize(*s);
+  std::memcpy(GPtr(Arg(c, 1)), &d, d.dwSize);
   return DD_OK;
 }
 
@@ -841,7 +985,9 @@ HLE_NAMED("ddraw.dll", "IDirectDrawSurface7::GetPixelFormat", DDS7_GetPixelForma
 }
 
 HLE_NAMED("ddraw.dll", "IDirectDrawSurface7::GetCaps", DDS7_GetCaps, 2) {
-  std::memcpy(GPtr(Arg(c, 1)), &Self(c)->desc.ddsCaps, sizeof(guest::DDSCAPS2));
+  Surface* s = Self(c);
+  std::memcpy(GPtr(Arg(c, 1)), &s->desc.ddsCaps,
+              s->version == 7 ? sizeof(guest::DDSCAPS2) : sizeof(guest::DDSCAPS));
   return DD_OK;
 }
 
@@ -921,7 +1067,8 @@ HLE_NAMED("ddraw.dll", "IDirectDrawSurface7::Lock", DDS7_Lock, 5) {
     off = uint32_t(r.top) * s->pitch + uint32_t(r.left) * bpp / 8;
   }
   d.lpSurface = s->mem + off;
-  std::memcpy(GPtr(desc), &d, sizeof d);
+  d.dwSize = DescSize(*s);
+  std::memcpy(GPtr(desc), &d, d.dwSize);
   return DD_OK;
 }
 
@@ -933,6 +1080,47 @@ HLE_NAMED("ddraw.dll", "IDirectDrawSurface7::Unlock", DDS7_Unlock, 2) {
     UploadLevel(*s);
   } else if (OnGpu(*s)) {
     // Write the rows the game edited back.
+    s->shadow->End([s](const lazy::LazyImage::Rect& b) {
+      gfx::Rect r{b.left, b.top, b.right, b.bottom};
+      if (s->kind == Surface::Kind::Primary)
+        PushFront(*s, r);
+      else
+        Gfx()->Blit(GPtr(s->mem), s->pitch, s->fmt, r, r, false, 0);
+    });
+  }
+  return DD_OK;
+}
+
+// GetDC: a GDI memory DC over the surface's pixels (the software GDI of
+// gdi_draw.cpp), for games that draw text or GDI shapes onto a surface.
+// The back buffer and the primary are read back as Lock does, and what
+// GDI changed goes back on ReleaseDC.
+HLE_NAMED("ddraw.dll", "IDirectDrawSurface7::GetDC", DDS7_GetDC, 2) {
+  Surface* s = Self(c);
+  if (s->hdc) return 0x8876021C;  // DDERR_DCALREADYCREATED
+  if (s->kind == Surface::Kind::ZBuffer || gfx::IsCompressed(s->fmt)) return DDERR_UNSUPPORTED;
+  uint32_t bpp = gfx::BitsPerPixel(s->fmt);
+  if (bpp != 16 && bpp != 32) {
+    WarnF("ddraw: GetDC on a %u bpp surface is not supported\n", bpp);
+    return DDERR_UNSUPPORTED;
+  }
+  if (!s->mem) AllocMem(*s);
+  if (OnGpu(*s)) s->shadow->Begin({0, 0, s->width, s->height}, false);
+  const DDPIXELFORMAT& pf = s->desc.ddpfPixelFormat;
+  s->hdc = GdiDcForMemory(s->mem, s->width, s->height, int(bpp), s->pitch, pf.dwRBitMask,
+                          pf.dwGBitMask, pf.dwBBitMask);
+  Wr32(Arg(c, 1), s->hdc);
+  return DD_OK;
+}
+
+HLE_NAMED("ddraw.dll", "IDirectDrawSurface7::ReleaseDC", DDS7_ReleaseDC, 2) {
+  Surface* s = Self(c);
+  if (!s->hdc) return DDERR_NOTLOCKED;
+  GdiReleaseMemoryDc(s->hdc);
+  s->hdc = 0;
+  if (s->kind == Surface::Kind::Texture) {
+    UploadLevel(*s);
+  } else if (OnGpu(*s)) {
     s->shadow->End([s](const lazy::LazyImage::Rect& b) {
       gfx::Rect r{b.left, b.top, b.right, b.bottom};
       if (s->kind == Surface::Kind::Primary)
@@ -1045,6 +1233,54 @@ HLE_NAMED("ddraw.dll", "IDirectDrawSurface7::GetUniquenessValue", DDS7_GetUnique
 }
 
 HLE_NAMED("ddraw.dll", "IDirectDrawSurface7::SetClipper", DDS7_SetClipper, 2) { return DD_OK; }
+
+// ---- IDirectDrawClipper ------------------------------------------------------------
+// Blits are not clipped (InSurface): a clipper only remembers its window,
+// which is all windowed games ask of one.
+
+struct Clipper : com::Object {
+  uint32_t hwnd = 0;
+};
+
+uint32_t ClipperVtable() {
+  return com::Vtable("ddraw.dll", "IDirectDrawClipper",
+                     {"QueryInterface", "AddRef", "Release", "GetClipList", "GetHWnd",
+                      "Initialize", "IsClipListChanged", "SetClipList", "SetHWnd"});
+}
+
+// (flags, LPDIRECTDRAWCLIPPER*, outer)
+HLE_NAMED("ddraw.dll", "IDirectDraw7::CreateClipper", DD7_CreateClipper, 4) {
+  Wr32(Arg(c, 2), com::Publish(std::make_shared<Clipper>(), ClipperVtable()));
+  return DD_OK;
+}
+HLE("ddraw.dll", DirectDrawCreateClipper, 3) {
+  Wr32(Arg(c, 1), com::Publish(std::make_shared<Clipper>(), ClipperVtable()));
+  return DD_OK;
+}
+HLE_NAMED("ddraw.dll", "IDirectDrawClipper::QueryInterface", DDC_QueryInterface, 3) {
+  Wr32(Arg(c, 2), 0);
+  return com::kE_NOINTERFACE;
+}
+HLE_NAMED("ddraw.dll", "IDirectDrawClipper::AddRef", DDC_AddRef, 1) { return com::AddRef(Arg(c, 0)); }
+HLE_NAMED("ddraw.dll", "IDirectDrawClipper::Release", DDC_Release, 1) { return com::Release(Arg(c, 0)); }
+HLE_NAMED("ddraw.dll", "IDirectDrawClipper::SetHWnd", DDC_SetHWnd, 3) {
+  if (Clipper* k = com::As<Clipper>(Arg(c, 0))) k->hwnd = Arg(c, 2);
+  return DD_OK;
+}
+HLE_NAMED("ddraw.dll", "IDirectDrawClipper::GetHWnd", DDC_GetHWnd, 2) {
+  Clipper* k = com::As<Clipper>(Arg(c, 0));
+  Wr32(Arg(c, 1), k ? k->hwnd : 0);
+  return DD_OK;
+}
+HLE_NAMED("ddraw.dll", "IDirectDrawClipper::Initialize", DDC_Initialize, 3) { return DD_OK; }
+HLE_NAMED("ddraw.dll", "IDirectDrawClipper::IsClipListChanged", DDC_IsClipListChanged, 2) {
+  Wr32(Arg(c, 1), 0);
+  return DD_OK;
+}
+HLE_NAMED("ddraw.dll", "IDirectDrawClipper::SetClipList", DDC_SetClipList, 3) { return DD_OK; }
+HLE_NAMED("ddraw.dll", "IDirectDrawClipper::GetClipList", DDC_GetClipList, 4) {
+  return 0x887600CD;  // DDERR_NOCLIPLIST
+}
 
 // ---- IDirectDrawGammaControl -------------------------------------------------------
 // The ramp is stored; applying it needs a post-process pass in the backend

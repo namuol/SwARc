@@ -2,7 +2,9 @@
 // and ends (console title, FormatMessage, CreateProcess); version.dll
 // (version resources).
 
+#include <algorithm>
 #include <cstring>
+#include <mutex>
 #include <ctime>
 #include <string>
 
@@ -17,7 +19,9 @@ namespace {
 using namespace win32;
 
 // ---- resources ------------------------------------------------------------------
-// Only the EXE's own .rsrc exists. Resource "handles" (HRSRC) are guest
+// The EXE's .rsrc and those of loaded lifted DLLs (which include
+// resource-only DLLs such as a game's language DLL: they are mapped, have
+// no code, and LoadLibrary returns their base). Resource "handles" (HRSRC) are guest
 // addresses of IMAGE_RESOURCE_DATA_ENTRY records; LoadResource returns the
 // data pointer and LockResource is the identity, as on Win32.
 
@@ -28,6 +32,21 @@ uint32_t RsrcBase() {
 }
 
 bool IsOwnModule(uint32_t h) { return h == 0 || h == g_win32->img.image_base; }
+
+// The image of module handle `h` (0: the EXE), or null.
+const PeImage* ResImage(uint32_t h) {
+  if (IsOwnModule(h)) return &g_win32->img;
+  // The module list is fixed after startup; a handle names a loaded one.
+  for (const Module& m : g_win32->modules)
+    if (m.refs && m.img.image_base == h) return &m.img;
+  return nullptr;
+}
+
+uint32_t RsrcBaseOf(const PeImage& img) {
+  for (const auto& s : img.sections)
+    if (s.name == ".rsrc") return uint32_t(s.va);
+  return 0;
+}
 
 // Name-or-id argument as a comparable key: "#123" for integer ids. A
 // string "#..." is an id too, read as RtlCharToInteger reads it in base 10
@@ -81,8 +100,9 @@ uint32_t FindEntry(uint32_t rsrc, uint32_t dir, const std::string& key) {
 
 // The IMAGE_RESOURCE_DATA_ENTRY for type/name keys (an empty name: the
 // first one) in language `lang` (0: the first one), or 0.
-uint32_t FindResourceImpl(const std::string& type, const std::string& name, uint32_t lang) {
-  uint32_t rsrc = RsrcBase();
+uint32_t FindResourceIn(const PeImage& img, const std::string& type, const std::string& name,
+                        uint32_t lang) {
+  uint32_t rsrc = RsrcBaseOf(img);
   if (!rsrc) return 0;
   uint32_t t = FindEntry(rsrc, rsrc, type);
   if (!(t & 0x80000000)) return 0;
@@ -95,33 +115,90 @@ uint32_t FindResourceImpl(const std::string& type, const std::string& name, uint
   return rsrc + l;
 }
 
+uint32_t FindResourceImpl(const std::string& type, const std::string& name, uint32_t lang) {
+  return FindResourceIn(g_win32->img, type, name, lang);
+}
+
 HLE("kernel32.dll", FindResourceA, 3) {
-  if (!IsOwnModule(Arg(c, 0))) return 0;
+  const PeImage* img = ResImage(Arg(c, 0));
+  if (!img) return 0;
   std::string type, name;
   if (!ResKey(Arg(c, 2), &type) || !ResKey(Arg(c, 1), &name)) {
     SetLastError(kErrorInvalidParameter);
     return 0;
   }
-  uint32_t r = FindResourceImpl(type, name, 0);
+  uint32_t r = FindResourceIn(*img, type, name, 0);
   if (!r) SetLastError(kErrorResourceNameNotFound);
   return r;
 }
 
 HLE("kernel32.dll", FindResourceExA, 4) {
-  if (!IsOwnModule(Arg(c, 0))) return 0;
+  const PeImage* img = ResImage(Arg(c, 0));
+  if (!img) return 0;
   std::string type, name;
   if (!ResKey(Arg(c, 1), &type) || !ResKey(Arg(c, 2), &name)) {
     SetLastError(kErrorInvalidParameter);
     return 0;
   }
-  uint32_t r = FindResourceImpl(type, name, Arg(c, 3) & 0xFFFF);
+  uint32_t r = FindResourceIn(*img, type, name, Arg(c, 3) & 0xFFFF);
   if (!r) SetLastError(kErrorResourceNameNotFound);
   return r;
 }
 
 HLE("kernel32.dll", LoadResource, 2) {
   uint32_t hrsrc = Arg(c, 1);
-  return hrsrc ? g_win32->img.image_base + Rd32(hrsrc) : 0;
+  const PeImage* img = ResImage(Arg(c, 0));
+  return hrsrc && img ? uint32_t(img->image_base) + Rd32(hrsrc) : 0;
+}
+
+HLE("kernel32.dll", SizeofResource, 2) {
+  uint32_t hrsrc = Arg(c, 1);
+  return hrsrc ? Rd32(hrsrc + 4) : 0;
+}
+
+// String `id` of module `h`: RT_STRING bundle (id / 16) + 1 holds 16
+// counted UTF-16 strings. Returns its address and length (0 if absent).
+uint32_t StringResource(uint32_t h, uint32_t id, uint32_t* len) {
+  *len = 0;
+  const PeImage* img = ResImage(h);
+  if (!img) return 0;
+  uint32_t e = FindResourceIn(*img, "#6", "#" + std::to_string((id >> 4) + 1), 0);
+  if (!e) return 0;
+  uint32_t p = uint32_t(img->image_base) + Rd32(e);
+  for (uint32_t i = 0; i < (id & 15); i++) p += 2 + 2 * uint32_t(Rd16(p));
+  *len = Rd16(p);
+  return p + 2;
+}
+
+// LoadStringA(hInstance, id, buffer, max): the string as ANSI (Latin-1
+// for the code points below 256), cut to max - 1 characters.
+HLE("user32.dll", LoadStringA, 4) {
+  uint32_t len = 0, s = StringResource(Arg(c, 0), Arg(c, 1), &len);
+  uint32_t buf = Arg(c, 2), max = Arg(c, 3);
+  if (!buf || !max) return 0;
+  uint32_t n = std::min(len, max - 1);
+  for (uint32_t i = 0; i < n; i++) {
+    uint16_t ch = Rd16(s + 2 * i);
+    Wr8(buf + i, uint8_t(ch < 256 ? ch : '?'));
+  }
+  Wr8(buf + n, 0);
+  if (!s) SetLastError(kErrorResourceNameNotFound);
+  return n;
+}
+
+// LoadStringW: max 0 returns a read-only pointer to the string itself.
+HLE("user32.dll", LoadStringW, 4) {
+  uint32_t len = 0, s = StringResource(Arg(c, 0), Arg(c, 1), &len);
+  uint32_t buf = Arg(c, 2), max = Arg(c, 3);
+  if (!buf) return 0;
+  if (!max) {
+    Wr32(buf, s);
+    return len;
+  }
+  uint32_t n = std::min(len, max - 1);
+  for (uint32_t i = 0; i < n; i++) Wr16(buf + 2 * i, Rd16(s + 2 * i));
+  Wr16(buf + 2 * n, 0);
+  return n;
 }
 
 HLE("kernel32.dll", LockResource, 1) { return Arg(c, 0); }
@@ -500,6 +577,118 @@ HLE("version.dll", VerQueryValueA, 4) {
     Wr32(out_len, vlen);
   }
   return 1;
+}
+
+
+// ---- W forms -----------------------------------------------------------------------
+
+HLE("kernel32.dll", GetDateFormatW, 6) {
+  std::tm t = TmFromSystemTime(Arg(c, 2));
+  char out[64];
+  if (Arg(c, 1) & 2)  // DATE_LONGDATE
+    std::strftime(out, sizeof out, "%A, %B %d, %Y", &t);
+  else
+    std::snprintf(out, sizeof out, "%d/%d/%d", t.tm_mon + 1, t.tm_mday, t.tm_year + 1900);
+  if (Arg(c, 3)) WarnF("GetDateFormatW: custom picture ignored\n");
+  return PutCounted(Arg(c, 4), Arg(c, 5), out, true);
+}
+
+HLE("kernel32.dll", GetTimeFormatW, 6) {
+  std::tm t = TmFromSystemTime(Arg(c, 2));
+  char out[64];
+  int h = t.tm_hour % 12;
+  if (Arg(c, 1) & 2)  // TIME_NOSECONDS
+    std::snprintf(out, sizeof out, "%d:%02d %s", h ? h : 12, t.tm_min, t.tm_hour < 12 ? "AM" : "PM");
+  else
+    std::snprintf(out, sizeof out, "%d:%02d:%02d %s", h ? h : 12, t.tm_min, t.tm_sec,
+                  t.tm_hour < 12 ? "AM" : "PM");
+  if (Arg(c, 3)) WarnF("GetTimeFormatW: custom picture ignored\n");
+  return PutCounted(Arg(c, 4), Arg(c, 5), out, true);
+}
+
+// The version resource of the game's own EXE, as the A forms (W paths).
+HLE("version.dll", GetFileVersionInfoSizeW, 2) {
+  uint32_t va, size;
+  if (Arg(c, 1)) Wr32(Arg(c, 1), 0);
+  if (!IsOwnExe(NarrowPath(GWStr(Arg(c, 0)))) || !FindVersionResource(&va, &size)) {
+    SetLastError(kErrorFileNotFound);
+    return 0;
+  }
+  return size * 2 + 4;
+}
+
+HLE("version.dll", GetFileVersionInfoW, 4) {
+  uint32_t va, size;
+  uint32_t len = Arg(c, 2), buf = Arg(c, 3);
+  if (!IsOwnExe(NarrowPath(GWStr(Arg(c, 0)))) || !FindVersionResource(&va, &size)) {
+    SetLastError(kErrorFileNotFound);
+    return 0;
+  }
+  std::memcpy(GPtr(buf), GPtr(va), std::min(len, size));
+  if (len >= size + 4) std::memcpy(GPtr(buf + size), "FE2X", 4);
+  return 1;
+}
+
+// VerQueryValueW(block, subblock, out ptr, out len): values point into the
+// block itself (UTF-16 text needs no copy).
+HLE("version.dll", VerQueryValueW, 4) {
+  uint32_t buf = Arg(c, 0), out_ptr = Arg(c, 2), out_len = Arg(c, 3);
+  std::string sub = NarrowPath(GWStr(Arg(c, 1)));
+  std::vector<std::string> path;
+  std::string cur;
+  for (char ch : sub) {
+    if (ch == '\\') {
+      if (!cur.empty()) path.push_back(cur);
+      cur.clear();
+    } else {
+      cur += ch;
+    }
+  }
+  if (!cur.empty()) path.push_back(cur);
+  uint32_t value, vlen;
+  bool text;
+  if (!VersionLookup(buf, path, 0, &value, &vlen, &text)) return 0;
+  Wr32(out_ptr, value);
+  Wr32(out_len, vlen);
+  return 1;
+}
+
+// ---- odds and ends ---------------------------------------------------------------
+
+// File APIs take ANSI (code page) strings, not OEM ones.
+HLE("kernel32.dll", AreFileApisANSI, 0) { return 1; }
+
+HLE("kernel32.dll", OutputDebugStringW, 1) {
+  std::fprintf(stderr, "[guest] %s", Narrow(GWStr(Arg(c, 0))).c_str());
+  return 0;
+}
+
+// No named semaphore is ever shared with another process here; opening
+// one that this process did not create fails as for a missing name.
+HLE("kernel32.dll", OpenSemaphoreA, 3) {
+  SetLastError(2);  // ERROR_FILE_NOT_FOUND
+  return 0;
+}
+
+// Child processes and pipes to them are not supported: games use them for
+// launching tools and browsers. Fails as for a missing program.
+HLE("kernel32.dll", CreateProcessW, 10) {
+  WarnF("CreateProcessW(%s): not supported\n",
+        Arg(c, 1) ? Narrow(GWStr(Arg(c, 1))).c_str()
+                  : (Arg(c, 0) ? Narrow(GWStr(Arg(c, 0))).c_str() : ""));
+  SetLastError(2);  // ERROR_FILE_NOT_FOUND
+  return 0;
+}
+HLE("kernel32.dll", CreatePipe, 4) {
+  WarnF("CreatePipe: not supported\n");
+  SetLastError(50);  // ERROR_NOT_SUPPORTED
+  return 0;
+}
+
+// Device control (volume and disk queries): no devices to talk to.
+HLE("kernel32.dll", DeviceIoControl, 8) {
+  SetLastError(50);  // ERROR_NOT_SUPPORTED
+  return 0;
 }
 
 }  // namespace

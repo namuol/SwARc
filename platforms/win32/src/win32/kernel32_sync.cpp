@@ -324,6 +324,7 @@ uint32_t OpenNamed(gaddr name_va, KObject::Type type) {
 }
 
 HLE("kernel32.dll", OpenMutexA, 3) { return OpenNamed(Arg(c, 2), KObject::Type::Mutex); }
+HLE("kernel32.dll", OpenEventA, 3) { return OpenNamed(Arg(c, 2), KObject::Type::Event); }
 
 HLE("kernel32.dll", ReleaseMutex, 1) {
   GuestSyncPoint sync;

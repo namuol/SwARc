@@ -16,6 +16,8 @@
 namespace recomp::gfx {
 
 void PresentWithDevAids(Device& dev, int w, int h);
+// The same for a frame drawn on the front buffer (Device::PresentFront).
+void PresentFrontWithDevAids(Device& dev, int w, int h);
 
 // The backend every graphics front end uses: <ID>_GFX=d3d9 or gpu; by
 // default SDL_GPU.

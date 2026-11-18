@@ -135,7 +135,11 @@ bool PeImage::Load(const std::string& path, GuestMemory& mem,
     uint32_t rsize = Rd<uint32_t>(d, o + 16);
     uint32_t rptr = Rd<uint32_t>(d, o + 20);
     uint32_t ch = Rd<uint32_t>(d, o + 36);
-    uint32_t n = std::min(vsize ? vsize : rsize, rsize);
+    // Windows maps whole pages: file bytes past VirtualSize up to the next
+    // page boundary are in memory too, and binary patches put code there
+    // (Tiberian Sun's Steam release jumps into .text's slack).
+    uint32_t mapped = vsize ? (vsize + 0xFFFu) & ~0xFFFu : rsize;
+    uint32_t n = std::min(mapped, rsize);
     if (uint64_t(rptr) + n > d.size()) {
       *err = std::string("section ") + name + " runs past end of file";
       return false;
@@ -145,7 +149,7 @@ bool PeImage::Load(const std::string& path, GuestMemory& mem,
       return false;
     }
     std::memcpy(mem.ptr(image_base + va), d.data() + rptr, n);
-    sections.push_back({name, image_base + va, vsize, ch});
+    sections.push_back({name, image_base + va, std::max(vsize, n), ch});
   }
 
   // Base relocations: add the load delta to every HIGHLOW (and, in x64

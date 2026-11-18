@@ -531,8 +531,8 @@ void Cpuid(Ctx& c) {
   // machine (Apple Silicon has no CPUID), and nothing beyond SSE2 is
   // claimed. SSE and SSE2 are reported because every PC these games still
   // run on has them, so their SSE paths are the ones that matter
-  // (x86/sse.h). MMX comes with any SSE CPU; no supported game has
-  // MMX code, and the lifter would report it as unimplemented. Family 6
+  // (x86/sse.h). MMX comes with any SSE CPU; the lifter does not
+  // translate MMX, so a game with MMX paths turns it off (cpu_mmx). Family 6
   // model 13 (Pentium M) is a real SSE2 part without SSE3.
   switch (c.eax) {
     case 0:
@@ -546,6 +546,7 @@ void Cpuid(Ctx& c) {
       c.ebx = 0;
       c.ecx = 0;
       c.edx = 0x0783F9FF;  // fpu tsc cx8 cmov mmx fxsr sse sse2
+      if (g_proc && !g_proc->game.cpu_mmx) c.edx &= ~(1u << 23);
       break;
     default:
       c.eax = c.ebx = c.ecx = c.edx = 0;
@@ -574,7 +575,8 @@ void Probe(Ctx& c, uint64_t va, const char* name) {
 void Probe(Ctx& c, uint32_t va, const char* name) {
   std::string line;
   char buf[96];
-  std::snprintf(buf, sizeof buf, "probe: %s (%08X) ecx %08X args", name, va, c.ecx);
+  std::snprintf(buf, sizeof buf, "probe: %s (%08X) from %08X ecx %08X args", name, va,
+                Rd32(c.esp), c.ecx);
   line = buf;
   for (int i = 1; i <= 4; i++) {
     uint32_t a = Rd32(c.esp + 4 * i);
