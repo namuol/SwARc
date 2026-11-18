@@ -30,6 +30,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <vector>
 
 #include "runtime/env.h"
@@ -167,6 +168,7 @@ struct WinSurface {
   int mid_w = 0, mid_h = 0;
 };
 std::map<uint32_t, WinSurface> g_windows;
+std::set<SDL_Window*> g_yielded;  // windows a 3D API presents to (GdiYieldWindow)
 
 // GameConfig::vsync, or <ID>_VSYNC.
 bool Vsync() {
@@ -197,7 +199,7 @@ WinSurface* WinFor(uint32_t hwnd) {
   WinSurface& s = g_windows[hwnd];
   if (!s.dev) {
     SDL_Window* sdl = SdlWindowFor(hwnd);
-    if (!sdl) return nullptr;
+    if (!sdl || g_yielded.count(sdl)) return nullptr;
     s.dev = gfx::CreateChosenDevice(sdl);
   }
   int w = 0, h = 0;
@@ -1281,6 +1283,17 @@ uint32_t GdiDcForMemory(uint32_t bits, int w, int h, int bpp, uint32_t pitch, ui
   d.brush = 0x00E00000;
   g_dcs[hdc] = d;
   return hdc;
+}
+
+void GdiYieldWindow(SDL_Window* w) {
+  if (!w) return;
+  std::lock_guard<std::recursive_mutex> l(g_mu);
+  g_yielded.insert(w);
+  for (auto it = g_windows.begin(); it != g_windows.end();)
+    if (SdlWindowFor(it->first) == w)
+      it = g_windows.erase(it);  // its device releases the window
+    else
+      ++it;
 }
 
 void GdiReleaseMemoryDc(uint32_t hdc) {

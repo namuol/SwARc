@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <string>
 
+struct SDL_Window;
+
 namespace recomp::hle {
 
 struct BitmapDesc {
@@ -25,6 +27,12 @@ void RememberBitmap(uint32_t handle, const BitmapDesc& d);
 uint32_t GdiDcForMemory(uint32_t bits, int w, int h, int bpp, uint32_t pitch, uint32_t rmask,
                         uint32_t gmask, uint32_t bmask);
 void GdiReleaseMemoryDc(uint32_t hdc);
+
+// A graphics API (Direct3D, DirectDraw, OpenGL) is about to create its
+// device for this host window: GDI drawing on the window (which keeps a
+// GPU device of its own once the game draws on a window DC) lets go of it
+// and stops drawing there, as only one device can present to a window.
+void GdiYieldWindow(SDL_Window* w);
 bool FindBitmap(uint32_t handle, BitmapDesc* out);
 
 }  // namespace recomp::hle

@@ -24,6 +24,7 @@
 #include "runtime/gfx/present.h"
 #include "runtime/gl/context.h"
 #include "runtime/log.h"
+#include "win32/gdi_state.h"
 #include "win32/hle.h"
 #include "win32/kernel32_state.h"
 #include "win32/opengl32.h"
@@ -243,6 +244,7 @@ HLE("opengl32.dll", wglMakeCurrent, 2) {
   if (!ctx->gl) {
     SDL_Window* w = SdlWindowFor(ctx->hwnd);
     if (!w) return 0;
+    GdiYieldWindow(w);
     ctx->dev = gfx::CreateChosenDevice(w);
     int pw, ph;
     FramebufferSize(ctx->hwnd, &pw, &ph);

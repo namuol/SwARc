@@ -22,6 +22,7 @@
 #include "runtime/log.h"
 #include "win32/com.h"
 #include "win32/d3d9_impl.h"
+#include "win32/gdi_state.h"
 #include "win32/hle.h"
 #include "win32/present_overlay.h"
 #include "win32/user32_window.h"
@@ -564,6 +565,7 @@ HLE_NAMED("d3d9.dll", "IDirect3D9::CreateDevice", D3D9_CreateDevice, 7) {
   d->hwnd = d->pp.hDeviceWindow ? d->pp.hDeviceWindow : focus;
   SDL_Window* w = SdlWindowFor(d->hwnd);
   if (!w) FatalF("d3d9: CreateDevice: no SDL window for hwnd %08X", d->hwnd);
+  GdiYieldWindow(w);
   d->gfx = gfx::CreateChosenDevice(w);
   uint32_t self = com::Publish(d, DeviceVtable());
   com::AddRef(d->d3d);
