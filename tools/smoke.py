@@ -17,7 +17,9 @@ first), then fails if:
   - fewer than `min_frames` frames were presented (counted every 50);
   - the input script's "shot <shot>" frame is missing, or differs from the
     reference smoke/ref/<name>.bmp by more than `threshold` (default 0.10:
-    the share of sampled pixels that differ clearly).
+    the share of sampled pixels that differ clearly), or is blank (one colour).
+    "region": [x0, y0, x1, y1] (fractions of the frame) compares only that
+    part: the sidebar of a match whose start position is random, say.
 A case with no reference saves its shot as the reference (NEW: look at it).
 --update replaces the references with this run's shots. References are the
 game's own pixels: keep smoke/ref/ out of git.
@@ -63,12 +65,23 @@ def read_bmp(path):
     return w, h, rows
 
 
-def compare(shot, ref):
+def crop(rows, region):
+    """`region` [x0, y0, x1, y1] as fractions of the frame (None: all of it)."""
+    if not region:
+        return rows
+    x0, y0, x1, y1 = region
+    n = len(rows)
+    m = len(rows[0]) if rows else 0
+    return [r[int(x0 * m):int(x1 * m)] for r in rows[int(y0 * n):int(y1 * n)]]
+
+
+def compare(shot, ref, region=None):
     """Share of sampled pixels that differ clearly (1.0 if the sizes differ)."""
     sw, sh, a = read_bmp(shot)
     rw, rh, b = read_bmp(ref)
     if (sw, sh) != (rw, rh):
         return 1.0, f"size {sw}x{sh}, reference {rw}x{rh}"
+    a, b = crop(a, region), crop(b, region)
     total = differ = 0
     for ra, rb in zip(a, b):
         for pa, pb in zip(ra, rb):
@@ -76,6 +89,17 @@ def compare(shot, ref):
             if max(abs(pa[0] - pb[0]), abs(pa[1] - pb[1]), abs(pa[2] - pb[2])) > CLEAR_DIFF:
                 differ += 1
     return differ / max(total, 1), ""
+
+
+def blank(path):
+    """True if the frame is (almost) one colour: a black loading screen, say."""
+    _, _, rows = read_bmp(path)
+    counts = {}
+    for row in rows:
+        for px in row:
+            counts[px] = counts.get(px, 0) + 1
+    total = sum(counts.values())
+    return max(counts.values()) / max(total, 1) > 0.97
 
 
 def shot_name(input_path):
@@ -135,6 +159,8 @@ def run_case(repo, defaults, case, update):
         ref_path = os.path.join(ref_dir, name + ".bmp")
         if not os.path.exists(shot_path):
             problems.append(f"no '{shot}' frame (the input script's shot never happened)")
+        elif blank(shot_path):
+            problems.append(f"the '{shot}' frame is blank (one colour): still loading, or nothing drawn")
         elif update or not os.path.exists(ref_path):
             os.makedirs(ref_dir, exist_ok=True)
             shutil.copy(shot_path, ref_path)
@@ -142,7 +168,7 @@ def run_case(repo, defaults, case, update):
                 status = "NEW"
             notes.append("reference saved: " + os.path.relpath(ref_path, repo))
         else:
-            share, why = compare(shot_path, ref_path)
+            share, why = compare(shot_path, ref_path, case.get("region"))
             limit = case.get("threshold", 0.10)
             notes.append(f"screen differs {share:.1%} (limit {limit:.0%})")
             if share > limit:
