@@ -1554,12 +1554,18 @@ HLE("user32.dll", CreateWindowExA, 12) {
 
 HLE("user32.dll", DestroyWindow, 1) {
   uint32_t hwnd = Arg(c, 0);
+  uint32_t exposed = 0;  // the parent a visible child uncovers
   {
     std::lock_guard<std::recursive_mutex> l(g_mu);
-    if (!Win(hwnd)) return 0;
+    Window* w = Win(hwnd);
+    if (!w) return 0;
+    if (w->visible && ((w->style & WS_CHILD) || w->is_dialog)) exposed = w->parent;
   }
   Send(hwnd, WM_DESTROY, 0, 0);
   Send(hwnd, WM_NCDESTROY, 0, 0);
+  // As on Windows, the parent repaints what the child covered (a game's own
+  // drop-down list, drawn over its dialog, goes away when it is destroyed).
+  if (exposed) Invalidate(exposed, false);
   std::lock_guard<std::recursive_mutex> l(g_mu);
   if (Window* w = Win(hwnd)) {
     if (g_clip.hwnd == hwnd) {
