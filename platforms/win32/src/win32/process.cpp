@@ -209,10 +209,19 @@ int RunProcess(const win32::GameConfig& game, const std::string& exe_path,
   for (const Module& m : w.modules) p.vm.MarkReserved(m.img.image_base, m.img.image_size);
 
   // PEB: only the fields Win32 code commonly peeks at. x64 guests see
-  // Windows 10 (22H2), 32-bit ones Windows XP.
+  // Windows 10 (22H2), 32-bit ones Windows XP. ProcessParameters points
+  // at an RTL_USER_PROCESS_PARAMETERS in the same page (its sizes, and
+  // Flags = RTL_USER_PROC_PARAMS_NORMALIZED as a running process has it):
+  // the C runtime's exit path reads Flags to choose how to end the process.
+  constexpr uint32_t kParamsOffset = 0x800;
   if (p.x64) {
     p.mem.Commit(kPebVa64, 0x1000, Prot::RW);
     Wr64(kPebVa64 + 0x10, w.img.image_base);
+    const gaddr params = kPebVa64 + kParamsOffset;
+    Wr32(params + 0, 0x440);  // MaximumLength
+    Wr32(params + 4, 0x440);  // Length
+    Wr32(params + 8, 1);      // Flags: NORMALIZED
+    Wr64(kPebVa64 + 0x20, params);  // ProcessParameters
     Wr32(kPebVa64 + 0xB8, GuestProcessorCount());  // NumberOfProcessors
     Wr32(kPebVa64 + 0x118, 10);     // OSMajorVersion
     Wr32(kPebVa64 + 0x11C, 0);      // OSMinorVersion
@@ -221,6 +230,11 @@ int RunProcess(const win32::GameConfig& game, const std::string& exe_path,
   } else {
     p.mem.Commit(kPebVa, 0x1000, Prot::RW);
     Wr32(kPebVa + 0x08, uint32_t(w.img.image_base));
+    const uint32_t params = kPebVa + kParamsOffset;
+    Wr32(params + 0, 0x290);  // MaximumLength
+    Wr32(params + 4, 0x290);  // Length
+    Wr32(params + 8, 1);      // Flags: NORMALIZED
+    Wr32(kPebVa + 0x10, params);  // ProcessParameters
     Wr32(kPebVa + 0x64, GuestProcessorCount());  // NumberOfProcessors
     Wr32(kPebVa + 0xA4, 5);      // OSMajorVersion (Windows XP)
     Wr32(kPebVa + 0xA8, 1);      // OSMinorVersion

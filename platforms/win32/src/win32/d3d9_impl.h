@@ -4,9 +4,11 @@
 // textures, buffers, vertex declarations, shaders, queries).
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "runtime/gfx/device.h"
@@ -80,7 +82,7 @@ T* G(uint32_t va) {
 
 struct Texture;
 
-struct Surface : com::Object {
+struct Surface final : com::Object {
   enum class Kind {
     BackBuffer,    // the swap chain's: gfx render target 0
     DepthStencil,  // gfx depth buffer
@@ -98,10 +100,11 @@ struct Surface : com::Object {
   int face = 0, level = 0;
   uint32_t mem = 0;  // Offscreen: its pixels
   uint32_t pitch = 0;
+  uint64_t vram = 0;  // charged to the device (ChargeVram)
   ~Surface() override;
 };
 
-struct Texture : com::Object {
+struct Texture final : com::Object {
   uint32_t device = 0;
   bool cube = false;  // IDirect3DCubeTexture9: six faces of levels each
   uint32_t width = 0, height = 0, levels = 0, usage = 0, format = 0, pool = 0;
@@ -119,25 +122,40 @@ struct Texture : com::Object {
   Level& At(uint32_t face, uint32_t level) { return lv[face * levels + level]; }
   uint32_t Faces() const { return cube ? 6 : 1; }
   uint32_t lod = 0, priority = 0, autogen_filter = 2;  // D3DTEXF_LINEAR
+  uint64_t vram = 0;  // charged to the device (ChargeVram)
   ~Texture() override;
 };
 
-struct Buffer : com::Object {
+struct Buffer final : com::Object {
   uint32_t device = 0;
   bool index = false;
   uint32_t length = 0, usage = 0, pool = 0;
   uint32_t fvf_or_format = 0;  // FVF (vertex) or D3DFORMAT (index)
   uint32_t mem = 0;            // the data, in guest memory
   uint32_t priority = 0;
+  // Changes (nonzero) whenever the data may have: at creation and at each
+  // Unlock. Draws pass it as their streams' gfx::FfStream::lock, so gfx
+  // copies a range of a buffer once per pass, not once per draw, and keeps
+  // a static buffer's ranges on the GPU across frames.
+  uint32_t ticket = 0;
   ~Buffer() override;
 };
 
-struct VertexDecl : com::Object {
+// A fresh buffer ticket (Buffer::ticket): never 0.
+inline uint32_t NextTicket() {
+  static std::atomic<uint32_t> next{0};
+  uint32_t t;
+  while (!(t = ++next)) {
+  }
+  return t;
+}
+
+struct VertexDecl final : com::Object {
   uint32_t device = 0;
   std::vector<guest::D3DVERTEXELEMENT9> elements;  // with the END marker
 };
 
-struct Shader : com::Object {
+struct Shader final : com::Object {
   uint32_t device = 0;
   bool pixel = false;
   std::vector<uint32_t> tokens;  // the function, END token included
@@ -148,7 +166,7 @@ struct Shader : com::Object {
   ~Shader() override;
 };
 
-struct Query : com::Object {
+struct Query final : com::Object {
   uint32_t device = 0;
   uint32_t type = 0;
 };
@@ -176,14 +194,34 @@ struct Device : com::Object {
   uint32_t fvf = 0;
   guest::BOOL software_vp = 0;
   std::map<uint32_t, std::array<float, 16>> transforms;
+  // The draws' starting state: D3D's defaults with the set transforms in
+  // place (SetTransform writes both), so DrawState looks none of them up.
+  gfx::FfState ff_base = gfx::DefaultFfState();
+  // Fixed-function lighting: D3DMATERIAL9 and D3DLIGHT9 have gfx's (D3D7's)
+  // layout. Lights by index, set and enabled independently.
+  gfx::Material material = gfx::DefaultFfState().material;
+  std::map<uint32_t, gfx::Light> lights;
+  std::map<uint32_t, bool> light_on;
   guest::D3DVIEWPORT9 viewport{};
   guest::D3DRECT scissor{};
   float vs_f[256][4] = {}, ps_f[224][4] = {};
   int32_t vs_i[16][4] = {}, ps_i[16][4] = {};
   guest::BOOL vs_b[16] = {}, ps_b[16] = {};
   int scene_depth = 0;
+  // Video memory held by D3DPOOL_DEFAULT textures and the render-target
+  // and depth-stencil surfaces made for the game (ChargeVram).
+  uint64_t vram_used = 0;
+  // Pixel shaders standing in for the fixed-function pixel stage behind a
+  // vertex shader (FfPixelShader in d3d9_draw.cpp), by their HLSL source.
+  std::map<std::string, gfx::ShaderId> ff_pixel_shaders;
   // The D3D cursor (SetCursorProperties / ShowCursor).
   bool cursor_shown = false, cursor_set = false;
+  // Its image (SetCursorProperties): A8R8G8B8 rows, and the hot spot.
+  std::vector<uint32_t> cursor_px;
+  uint32_t cursor_w = 0, cursor_h = 0, cursor_hot_x = 0, cursor_hot_y = 0;
+  // Where SetCursorPosition put it (desktop coordinates), once it has.
+  bool cursor_positioned = false;
+  int cursor_x = 0, cursor_y = 0;
 };
 
 // IUnknown::QueryInterface for an object with one interface `iid` (and
@@ -209,6 +247,15 @@ void Bind(uint32_t* slot, uint32_t obj);
 uint32_t NewSurface(Device& d, uint32_t device, Surface::Kind kind, uint32_t w,
                     uint32_t h, uint32_t fmt, uint32_t usage, uint32_t pool,
                     std::shared_ptr<Surface>* keep);
+
+// Video memory: a card has GameConfig::video_memory_mb of it (what
+// GetAvailableTextureMem reports), and D3DPOOL_DEFAULT resources that do
+// not fit fail with D3DERR_OUTOFVIDEOMEMORY. Games size themselves by
+// allocating until that happens; a host GPU with unified memory would
+// otherwise let them run until the host itself gives out. Charges
+// `bytes` and returns true, or false (nothing charged) if they do not fit.
+bool ChargeVram(Device& d, uint64_t bytes);
+void RefundVram(uint32_t device, uint64_t bytes);
 
 // The gfx render targets and depth buffer for the current bindings.
 void BindTargets(Device& d);

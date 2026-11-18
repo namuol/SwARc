@@ -31,9 +31,6 @@ namespace recomp::hle {
 
 inline constexpr int kCdecl = -1;
 
-// >0 while an HLE handler runs on this thread (0 again inside CallGuest).
-// A host fault then is a runtime bug, not a guest access violation.
-extern thread_local int t_hle_depth;
 
 using Fn = uint64_t (*)(Ctx& c);
 

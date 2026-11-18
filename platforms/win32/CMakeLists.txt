@@ -35,6 +35,7 @@ add_library(recomp_win32 SHARED
   src/win32/user32_input.cpp
   src/win32/user32_window.cpp
   src/win32/gdi32.cpp
+  src/win32/present_overlay.cpp
   src/win32/shell_net.cpp
   src/win32/ws2_32.cpp
   src/win32/com.cpp)
@@ -59,6 +60,11 @@ if(FFMPEG_FOUND)
   # Bink video (binkw32) on ffmpeg; audio through the Miles mixer.
   add_library(recomp_bink SHARED src/win32/binkw32.cpp)
   target_link_libraries(recomp_bink PUBLIC recomp_mss32)
+
+  # DirectShow's Filter Graph Manager (quartz): media files on ffmpeg,
+  # audio through the same software mixer.
+  add_library(recomp_quartz SHARED src/win32/quartz.cpp)
+  target_link_libraries(recomp_quartz PUBLIC recomp_win32 recomp_audio PRIVATE recomp_gfx)
 endif()
 
 

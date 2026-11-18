@@ -28,6 +28,7 @@
 #include "x86/hle.h"
 #include "x86/lifted.h"
 #include "x86/runtime.h"
+#include "x86/watchdog.h"
 
 namespace recomp {
 
@@ -226,7 +227,7 @@ void FaultHandler(int sig, siginfo_t* si, void* uc) {
   // A host that cannot tell a write from a read gets no guest exception:
   // the guest's handler would be told the wrong access type.
   if (guest32 && g_proc->guest_fault && CurrentThread() && fc.write_known &&
-      t_fault_depth < kMaxFaultDepth && hle::t_hle_depth == 0) {
+      t_fault_depth < kMaxFaultDepth && t_hle_state.depth == 0) {
     ++t_fault_depth;
     bool cont;
     try {

@@ -140,6 +140,21 @@ HLE("advapi32.dll", RegOpenKeyExA, 5) {
   return kErrorSuccess;
 }
 
+// RegOpenKeyA(hkey, subkey, HKEY* out): RegOpenKeyExA with full access; a
+// NULL or empty subkey opens `hkey` itself again.
+HLE("advapi32.dll", RegOpenKeyA, 3) {
+  std::lock_guard<std::mutex> l(g_reg_mu);
+  LoadOnce();
+  std::string base = RootName(Arg(c, 0));
+  if (base.empty()) return kErrorInvalidHandle;
+  std::string path = Join(base, Arg(c, 1) ? GStr(Arg(c, 1)) : std::string());
+  if (!g_reg.count(path)) return kErrorFileNotFound;
+  uint32_t h = g_next_hkey += 4;
+  g_open[h] = path;
+  Wr32(Arg(c, 2), h);
+  return kErrorSuccess;
+}
+
 HLE("advapi32.dll", RegCreateKeyExA, 9) {
   std::lock_guard<std::mutex> l(g_reg_mu);
   LoadOnce();
@@ -272,19 +287,32 @@ HLE("ole32.dll", StringFromGUID2, 3) {
   return uint32_t(n);
 }
 
-HLE("ole32.dll", IIDFromString, 2) {
-  std::string s = Narrow(GWStr(Arg(c, 0)));
+// Parses "{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}" into the GUID at `g`.
+bool ParseGuid(gaddr str, gaddr g) {
+  std::string s = Narrow(GWStr(str));
   unsigned int d1, d2, d3, b[8];
   if (std::sscanf(s.c_str(), "{%8x-%4x-%4x-%2x%2x-%2x%2x%2x%2x%2x%2x}", &d1,
                   &d2, &d3, &b[0], &b[1], &b[2], &b[3], &b[4], &b[5], &b[6],
                   &b[7]) != 11)
-    return kEInvalidArg;
-  uint32_t g = Arg(c, 1);
+    return false;
   Wr32(g, d1);
   Wr16(g + 4, uint16_t(d2));
   Wr16(g + 6, uint16_t(d3));
   for (int i = 0; i < 8; i++) Wr8(g + 8 + i, uint8_t(b[i]));
-  return 0;
+  return true;
+}
+
+HLE("ole32.dll", IIDFromString, 2) {
+  return ParseGuid(Arg(c, 0), Arg(c, 1)) ? 0 : kEInvalidArg;
+}
+
+// CLSIDFromString: the braced form only. A ProgID ("Lib.Class") would be
+// looked up in HKCR, where no COM class is registered here, so it fails
+// as an unknown one does: CO_E_CLASSSTRING.
+HLE("ole32.dll", CLSIDFromString, 2) {
+  if (ParseGuid(Arg(c, 0), Arg(c, 1))) return 0;
+  std::memset(GPtr(Arg(c, 1)), 0, 16);
+  return 0x800401F3u;  // CO_E_CLASSSTRING
 }
 
 // ---- oleaut32 (imported by ordinal) -----------------------------------------

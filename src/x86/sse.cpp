@@ -17,7 +17,10 @@ extern "C" {
 #include "runtime/log.h"
 
 namespace recomp::sse {
+
+
 namespace {
+
 
 // MXCSR fields.
 constexpr uint32_t kIE = 0x01, kDE = 0x02, kZE = 0x04, kOE = 0x08, kUE = 0x10,
@@ -441,29 +444,20 @@ void Rcp(Xmm& d, const Xmm& s) {
   d = r;
 }
 
-void CheckAligned(Ctx& c, uint64_t a, uint64_t va) {
-  (void)c;
-  if (a & 15)
-    FatalF("sse: misaligned 16-byte operand %08llX at %08llX (#GP)",
-           (unsigned long long)a, (unsigned long long)va);
+void Misaligned(uint64_t a, uint64_t va, unsigned align) {
+  FatalF("sse: misaligned %u-byte operand %08llX at %08llX (#GP)", align,
+         (unsigned long long)a, (unsigned long long)va);
 }
 
-void CheckAligned(Ctx& c, uint64_t a, uint64_t va, unsigned align) {
-  (void)c;
-  if (a & (align - 1))
-    FatalF("sse: misaligned %u-byte operand %08llX at %08llX (#GP)", align,
-           (unsigned long long)a, (unsigned long long)va);
-}
-
-void Arith(Ctx& c, Op op, bool dbl, int lanes, Xmm& d, const Xmm& s,
-           uint64_t va) {
+RECOMP_SSE_SLOW void ArithExact(Ctx& c, Op op, bool dbl, int lanes, Xmm& d, const Xmm& s,
+                uint64_t va) {
   if (dbl)
     ArithT<true>(c, op, lanes, d, s, va);
   else
     ArithT<false>(c, op, lanes, d, s, va);
 }
 
-void Cmp(Ctx& c, bool dbl, int lanes, Xmm& d, const Xmm& s, uint8_t pred,
+RECOMP_SSE_SLOW void Cmp(Ctx& c, bool dbl, int lanes, Xmm& d, const Xmm& s, uint8_t pred,
          uint64_t va) {
   if (dbl)
     CmpT<true>(c, lanes, d, s, pred, va);
@@ -471,12 +465,12 @@ void Cmp(Ctx& c, bool dbl, int lanes, Xmm& d, const Xmm& s, uint8_t pred,
     CmpT<false>(c, lanes, d, s, pred, va);
 }
 
-int Comi(Ctx& c, bool dbl, bool ordered, const Xmm& a, const Xmm& b,
+RECOMP_SSE_SLOW int ComiExact(Ctx& c, bool dbl, bool ordered, const Xmm& a, const Xmm& b,
          uint64_t va) {
   return dbl ? ComiT<true>(c, ordered, a, b, va) : ComiT<false>(c, ordered, a, b, va);
 }
 
-void Sqrt(Ctx& c, bool dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va) {
+RECOMP_SSE_SLOW void SqrtExact(Ctx& c, bool dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va) {
   if (dbl)
     SqrtT<true>(c, lanes, d, s, va);
   else
@@ -530,7 +524,7 @@ void Rsqrt(Xmm& d, const Xmm& s) {
 
 void Cvtsi2sd(Xmm& d, int32_t v) { SetLane<uint64_t>(d, 0, i32_to_f64(v).v); }
 
-uint32_t CvtToI32(Ctx& c, bool dbl, const Xmm& s, bool truncate, uint64_t va) {
+RECOMP_SSE_SLOW uint32_t CvtToI32Exact(Ctx& c, bool dbl, const Xmm& s, bool truncate, uint64_t va) {
   Scope sc(c, va);
   uint8_t mode = truncate ? uint8_t(softfloat_round_minMag) : RoundingMode(c.mxcsr);
   sc.Begin();
@@ -552,7 +546,7 @@ uint64_t CvtToI64(Ctx& c, bool dbl, const Xmm& s, bool truncate, uint64_t va) {
   return uint64_t(r);
 }
 
-void MinMax(Ctx& c, bool max, bool dbl, int lanes, Xmm& d, const Xmm& s,
+RECOMP_SSE_SLOW void MinMaxExact(Ctx& c, bool max, bool dbl, int lanes, Xmm& d, const Xmm& s,
             uint64_t va) {
   if (dbl)
     MinMaxT<true>(c, max, lanes, d, s, va);
@@ -560,7 +554,7 @@ void MinMax(Ctx& c, bool max, bool dbl, int lanes, Xmm& d, const Xmm& s,
     MinMaxT<false>(c, max, lanes, d, s, va);
 }
 
-void CvtFloat(Ctx& c, bool to_dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va) {
+RECOMP_SSE_SLOW void CvtFloatExact(Ctx& c, bool to_dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va) {
   Scope sc(c, va);
   Xmm r = d;
   if (to_dbl) {
@@ -575,7 +569,7 @@ void CvtFloat(Ctx& c, bool to_dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va)
   d = r;
 }
 
-void CvtIntToF(Ctx& c, bool dbl, bool src64, uint64_t v, Xmm& d, uint64_t va) {
+RECOMP_SSE_SLOW void CvtIntToFExact(Ctx& c, bool dbl, bool src64, uint64_t v, Xmm& d, uint64_t va) {
   Scope sc(c, va);
   sc.Begin();
   if (dbl)
@@ -586,7 +580,7 @@ void CvtIntToF(Ctx& c, bool dbl, bool src64, uint64_t v, Xmm& d, uint64_t va) {
   sc.Finish();
 }
 
-void CvtToDq(Ctx& c, bool dbl, bool truncate, Xmm& d, const Xmm& s, uint64_t va) {
+RECOMP_SSE_SLOW void CvtToDqExact(Ctx& c, bool dbl, bool truncate, Xmm& d, const Xmm& s, uint64_t va) {
   Scope sc(c, va);
   const uint8_t mode = truncate ? uint8_t(softfloat_round_minMag) : RoundingMode(c.mxcsr);
   Xmm r{};
@@ -601,7 +595,7 @@ void CvtToDq(Ctx& c, bool dbl, bool truncate, Xmm& d, const Xmm& s, uint64_t va)
   d = r;
 }
 
-void Cvtdq2ps(Ctx& c, Xmm& d, const Xmm& s, uint64_t va) {
+RECOMP_SSE_SLOW void Cvtdq2psExact(Ctx& c, Xmm& d, const Xmm& s, uint64_t va) {
   Scope sc(c, va);
   Xmm r;
   sc.Begin();

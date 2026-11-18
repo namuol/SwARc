@@ -7,12 +7,16 @@
 // registers and samplers are passed as they are. Draws without shaders
 // use gfx::Device's fixed-function pipeline (D3D7 semantics) with the
 // D3D9 state in its terms: sampler states at D3D7's texture-stage
-// positions, D3D9's transform numbers mapped. Mixing a shader with the
-// fixed-function pipeline and fixed-function draws with a vertex
+// positions, D3D9's transform numbers mapped. A vertex shader with the
+// fixed-function pixel stage gets a pixel shader generated from the
+// texture-stage state (FfPixelShader). A pixel shader with the
+// fixed-function vertex stage and fixed-function draws with a vertex
 // declaration (no FVF) are not supported yet (fatal, named).
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include "runtime/log.h"
@@ -87,9 +91,11 @@ uint32_t VerticesFor(uint32_t prim, uint32_t count) {
 // A draw's state in gfx::Device's (D3D7's) terms: the render states, the
 // viewport and the scissor, and for a fixed-function draw the texture
 // stages (sampler states at D3D7's texture-stage positions), their
-// textures and the transforms (D3D9's numbers mapped).
+// textures and the transforms (Device::ff_base, D3D9's numbers mapped).
 gfx::FfState DrawState(const Device& d, bool fixed) {
-  gfx::FfState f = gfx::DefaultFfState();
+  // Fixed-function draws start from the defaults with the transforms set;
+  // shader draws from the defaults alone.
+  gfx::FfState f = fixed ? d.ff_base : gfx::DefaultFfState();
   std::memcpy(f.rs, d.rs, sizeof f.rs);
   const guest::D3DVIEWPORT9& v = d.viewport;
   f.viewport = {v.X, v.Y, v.Width, v.Height, v.MinZ, v.MaxZ};
@@ -119,15 +125,14 @@ gfx::FfState DrawState(const Device& d, bool fixed) {
     if (t && t->cube) FatalF("d3d9: fixed-function stage %u with a cube texture", s);
     f.textures[s] = t ? t->tex : 0;
   }
-  // D3DTS_VIEW 2, PROJECTION 3 and TEXTURE0-7 16-23 are D3D7's numbers;
-  // WORLD-WORLD3 are 256-259 (D3D7: 1, 4-6).
-  static const std::pair<uint32_t, uint32_t> kTransforms[] = {
-      {2, 2}, {3, 3}, {256, 1}, {257, 4}, {258, 5}, {259, 6}, {16, 16}, {17, 17}, {18, 18},
-      {19, 19}, {20, 20}, {21, 21}, {22, 22}, {23, 23},
-  };
-  for (const auto& [d3d9, d3d7] : kTransforms) {
-    auto it = d.transforms.find(d3d9);
-    if (it != d.transforms.end()) std::memcpy(gfx::FfTransform(f, d3d7), it->second.data(), 64);
+  // The material and the first eight enabled lights (in index order: the
+  // pipeline does not see indices).
+  f.material = d.material;
+  f.light_count = 0;
+  for (const auto& [i, on] : d.light_on) {
+    if (!on) continue;
+    if (f.light_count == 8) break;
+    f.lights[f.light_count++] = d.lights.at(i);
   }
   return f;
 }
@@ -136,12 +141,14 @@ gfx::FfState DrawState(const Device& d, bool fixed) {
 void DrawFixed(Device& d, gfx::ShaderDraw& sd, const char* what) {
   if (com::As<VertexDecl>(d.decl) || !d.fvf)
     FatalF("d3d9: fixed-function %s with a vertex declaration (only FVFs are supported)", what);
+  uint32_t ticket = 0;  // the vertex buffer's (Buffer::ticket); UP draws none
   if (!sd.streams[0].data) {
     const Device::Stream& st = d.streams[0];
     auto* b = com::As<Buffer>(st.buffer);
     if (!b || st.offset >= b->length) return;
     sd.streams[0] = {static_cast<const uint8_t*>(GPtr(b->mem)) + st.offset, b->length - st.offset,
                      st.stride};
+    ticket = b->ticket;
   }
   const gfx::VertexStream& vs = sd.streams[0];
   // Vertex (indexed draws: index) v is the stream's base_vertex + v, which
@@ -152,6 +159,11 @@ void DrawFixed(Device& d, gfx::ShaderDraw& sd, const char* what) {
     FatalF("d3d9: fixed-function %s reads past its vertex buffer", what);
   gfx::FfDraw fd = gfx::FfInterleaved(
       sd.prim, d.fvf, vs.data + ptrdiff_t(sd.base_vertex) * ptrdiff_t(vs.stride), vs.stride);
+  // Unchanged data in this draw's buffer: gfx copies each range once per
+  // pass, or keeps it on the GPU across frames (FfStream::lock).
+  for (gfx::FfStream* st : {&fd.position, &fd.normal, &fd.psize, &fd.diffuse, &fd.specular})
+    st->lock = ticket;
+  for (gfx::FfStream& st : fd.tex) st.lock = ticket;
   fd.first_vertex = from;
   fd.vertex_count = sd.vertex_count;
   if (sd.indices) {
@@ -164,6 +176,164 @@ void DrawFixed(Device& d, gfx::ShaderDraw& sd, const char* what) {
   d.gfx->DrawFf(state, fd);
 }
 
+// ---- the fixed-function pixel stage behind a vertex shader -----------------
+// D3D9 lets a vertex shader feed the fixed-function pixel stage: its
+// outputs oD0, oD1, oTn and oFog take the place of the fixed-function
+// vertex stage's colours, texture coordinates and fog. That stage is
+// generated here as an HLSL pixel shader for the current texture-stage
+// and render state (unrolled: one function per state, cached by source),
+// with the operations of gfx's fixed-function fragment shader
+// (gfx/shaders/ff.frag), so both paths compute the same colours. The
+// texture factor and fog colour are its c0 and c1 (FfPixelConstants).
+// Outputs the vertex shader does not write read as D3D's defaults: white
+// diffuse, black specular, zero texture coordinates, no fog.
+
+constexpr uint32_t kRsFogEnable = 28, kRsSpecularEnable = 29, kRsTextureFactor = 60;
+constexpr uint32_t kTssColorOp = 1, kTssColorArg1 = 2, kTssColorArg2 = 3, kTssAlphaOp = 4,
+                   kTssAlphaArg1 = 5, kTssAlphaArg2 = 6, kTssTexCoordIndex = 11,
+                   kTssTransformFlags = 24, kTssColorArg0 = 26, kTssAlphaArg0 = 27,
+                   kTssResultArg = 28;
+
+std::string FfArg(uint32_t a) {
+  static const char* kNames[] = {"diff", "cur", "tex", "tf", "spec", "temp"};
+  std::string v = (a & 0xF) < 6 ? kNames[a & 0xF] : "float4(0, 0, 0, 0)";
+  if (a & 0x20) v = v + ".aaaa";            // D3DTA_ALPHAREPLICATE
+  if (a & 0x10) v = "(1 - " + v + ")";      // D3DTA_COMPLEMENT
+  return v;
+}
+
+std::string FfOp(uint32_t op, const std::string& a1, const std::string& a2,
+                 const std::string& a0) {
+  auto two = [&](const char* f) {
+    char b[512];
+    std::snprintf(b, sizeof b, f, a1.c_str(), a2.c_str());
+    return std::string(b);
+  };
+  switch (op) {
+    case 2: return a1;
+    case 3: return a2;
+    case 4: return two("(%s * %s)");
+    case 5: return two("(%s * %s * 2)");
+    case 6: return two("(%s * %s * 4)");
+    case 7: return two("(%s + %s)");
+    case 8: return two("(%s + %s - 0.5)");
+    case 9: return two("((%s + %s - 0.5) * 2)");
+    case 10: return two("(%s - %s)");
+    case 11: return "(" + a1 + " + " + a2 + " - " + a1 + " * " + a2 + ")";
+    case 12: return "lerp(" + a2 + ", " + a1 + ", diff.a)";
+    case 13: return "lerp(" + a2 + ", " + a1 + ", tex.a)";
+    case 14: return "lerp(" + a2 + ", " + a1 + ", tf.a)";
+    case 15: return "(" + a1 + " + " + a2 + " * (1 - tex.a))";
+    case 16: return "lerp(" + a2 + ", " + a1 + ", cur.a)";
+    case 17: return a1;  // PREMODULATE: approximated, as in ff.frag
+    case 18: return "float4(" + a1 + ".rgb + " + a1 + ".a * " + a2 + ".rgb, " + a1 + ".a)";
+    case 19: return "float4(" + a1 + ".rgb * " + a2 + ".rgb + " + a1 + ".a, " + a1 + ".a)";
+    case 20: return "float4((1 - " + a1 + ".a) * " + a2 + ".rgb + " + a1 + ".rgb, " + a1 + ".a)";
+    case 21: return "float4((1 - " + a1 + ".rgb) * " + a2 + ".rgb + " + a1 + ".a, " + a1 + ".a)";
+    case 24: return "saturate(4 * dot(" + a1 + ".rgb - 0.5, " + a2 + ".rgb - 0.5)).xxxx";
+    case 25: return "(" + a0 + " + " + a1 + " * " + a2 + ")";
+    case 26: return "lerp(" + a2 + ", " + a1 + ", " + a0 + ")";
+    default: return a1;  // bump mapping: not modelled, as in ff.frag
+  }
+}
+
+bool Writes(const hlsl::Program& vs, uint32_t usage, uint32_t index) {
+  for (const hlsl::Semantic& v : vs.varyings)
+    if (v.usage == usage && v.index == index) return true;
+  return false;
+}
+
+std::string FfPixelSource(const Device& d, const hlsl::Program& vs) {
+  std::string in, body;
+  in += Writes(vs, hlsl::kColor, 0) ? "float4 i_diff : COLOR0, " : "";
+  in += Writes(vs, hlsl::kColor, 1) ? "float4 i_spec : COLOR1, " : "";
+  body += Writes(vs, hlsl::kColor, 0) ? "  float4 diff = i_diff;\n" : "  float4 diff = 1;\n";
+  body += Writes(vs, hlsl::kColor, 1) ? "  float4 spec = i_spec;\n" : "  float4 spec = 0;\n";
+  body += "  float4 cur = diff, temp = 0, tex;\n";
+  std::string samplers;
+  bool tc_in[8] = {};
+  for (uint32_t s = 0; s < 8; s++) {
+    const uint32_t* t = d.tss[s];
+    uint32_t cop = t[kTssColorOp];
+    if (cop == 1) break;  // DISABLE ends the cascade
+    uint32_t set = t[kTssTexCoordIndex] & 0xFFFF;
+    bool bound = d.textures[s] != 0 && set < 8;
+    char b[256];
+    if (bound) {
+      std::snprintf(b, sizeof b, "sampler2D s%u : register(s%u);\n", s, s);
+      samplers += b;
+      std::string tc = "0";
+      if (Writes(vs, hlsl::kTexcoord, set)) {
+        tc_in[set] = true;
+        std::snprintf(b, sizeof b, "i_t%u", set);
+        tc = b;
+      }
+      uint32_t flags = t[kTssTransformFlags];
+      uint32_t count = flags & 0xFF;
+      if ((flags & 0x100) && count >= 2 && count <= 4 && tc != "0") {
+        // D3DTTFF_PROJECTED: divide by the last of `count` components.
+        static const char* kComp = "xyzw";
+        std::snprintf(b, sizeof b, "  tex = tex2D(s%u, %s.xy / %s.%c);\n", s, tc.c_str(),
+                      tc.c_str(), kComp[count - 1]);
+      } else {
+        std::snprintf(b, sizeof b, "  tex = tex2D(s%u, (%s).xy);\n", s,
+                      tc == "0" ? "float2(0, 0)" : tc.c_str());
+      }
+      body += b;
+    } else {
+      body += "  tex = 0;\n";  // no texture: what D3D's arguments read
+    }
+    std::string rgb = "saturate(" + FfOp(cop, FfArg(t[kTssColorArg1]), FfArg(t[kTssColorArg2]),
+                                         FfArg(t[kTssColorArg0])) + ").rgb";
+    std::string al = "cur.a";
+    if (t[kTssAlphaOp] != 1)
+      al = "saturate(" + FfOp(t[kTssAlphaOp], FfArg(t[kTssAlphaArg1]), FfArg(t[kTssAlphaArg2]),
+                              FfArg(t[kTssAlphaArg0])) + ").a";
+    body += "  { float3 rgb = " + rgb + ";\n";
+    body += "    float al = " + (cop == 24 ? std::string("rgb.r") : al) + ";\n";
+    body += t[kTssResultArg] == 5 ? "    temp = float4(rgb, al); }\n"
+                                  : "    cur = float4(rgb, al); }\n";
+  }
+  if (d.rs[kRsSpecularEnable]) body += "  cur.rgb = saturate(cur.rgb + spec.rgb);\n";
+  if (d.rs[kRsFogEnable] && Writes(vs, hlsl::kFog, 0)) {
+    in += "float i_fog : FOG, ";
+    body += "  cur.rgb = lerp(fogc.rgb, cur.rgb, saturate(i_fog));\n";
+  }
+  for (uint32_t i = 0; i < 8; i++)
+    if (tc_in[i]) {
+      char b[64];
+      std::snprintf(b, sizeof b, "float4 i_t%u : TEXCOORD%u, ", i, i);
+      in += b;
+    }
+  if (in.size() >= 2) in.resize(in.size() - 2);
+  return "float4 tf : register(c0);\nfloat4 fogc : register(c1);\n" + samplers +
+         "float4 main(" + in + ") : COLOR0 {\n" + body + "  return cur;\n}\n";
+}
+
+// The generated pixel shader for the current state behind `vs`, and its
+// constants (c0 texture factor, c1 fog colour) in *consts.
+gfx::ShaderId FfPixelShader(Device& d, const hlsl::Program& vs, float (*consts)[4]) {
+  std::string src = FfPixelSource(d, vs);
+  auto unpack = [](uint32_t argb, float* out) {
+    out[0] = float((argb >> 16) & 0xFF) / 255.0f;
+    out[1] = float((argb >> 8) & 0xFF) / 255.0f;
+    out[2] = float(argb & 0xFF) / 255.0f;
+    out[3] = float(argb >> 24) / 255.0f;
+  };
+  unpack(d.rs[kRsTextureFactor], consts[0]);
+  unpack(d.rs[34], consts[1]);  // D3DRS_FOGCOLOR
+  auto it = d.ff_pixel_shaders.find(src);
+  if (it != d.ff_pixel_shaders.end()) return it->second;
+  hlsl::Program p;
+  std::string errors;
+  if (!hlsl::Compile(src, {}, "main", "ps_2_0", 0, &p, &errors))
+    FatalF("d3d9: fixed-function pixel stage shader failed to compile: %s\n%s", errors.c_str(),
+           src.c_str());
+  gfx::ShaderId id = d.gfx->CreateShader(p);
+  d.ff_pixel_shaders.emplace(src, id);
+  return id;
+}
+
 // Completes `sd` (primitive, counts, and any streams already given) from
 // the device's bindings and draws it.
 void Draw(Device& d, gfx::ShaderDraw& sd, const char* what) {
@@ -173,9 +343,9 @@ void Draw(Device& d, gfx::ShaderDraw& sd, const char* what) {
     DrawFixed(d, sd, what);
     return;
   }
-  if (!vs || !ps)
-    FatalF("d3d9: %s with a %s shader and the fixed-function %s stage is not supported yet",
-           what, vs ? "vertex" : "pixel", vs ? "pixel" : "vertex");
+  if (!vs)
+    FatalF("d3d9: %s with a pixel shader and the fixed-function vertex stage is not supported yet",
+           what);
 
   std::vector<guest::D3DVERTEXELEMENT9> from_fvf;
   const std::vector<guest::D3DVERTEXELEMENT9>* elements = nullptr;
@@ -213,12 +383,15 @@ void Draw(Device& d, gfx::ShaderDraw& sd, const char* what) {
                      st.stride};
   }
 
+  // No pixel shader: the fixed-function pixel stage, generated (its own
+  // constants; the game's pixel constant registers are not read).
+  float ff_consts[224][4] = {};
   sd.vs = vs->id;
-  sd.ps = ps->id;
+  sd.ps = ps ? ps->id : FfPixelShader(d, *vs->program, ff_consts);
   sd.vs_float = d.vs_f;
   sd.vs_int = d.vs_i;
   sd.vs_bool = reinterpret_cast<const uint32_t*>(d.vs_b);
-  sd.ps_float = d.ps_f;
+  sd.ps_float = ps ? d.ps_f : ff_consts;
   sd.ps_int = d.ps_i;
   sd.ps_bool = reinterpret_cast<const uint32_t*>(d.ps_b);
   for (int i = 0; i < 20; i++) {

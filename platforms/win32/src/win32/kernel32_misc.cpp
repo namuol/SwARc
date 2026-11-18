@@ -257,6 +257,26 @@ HLE("kernel32.dll", SystemTimeToFileTime, 2) {
   return 1;
 }
 
+// SystemTimeToTzSpecificLocalTime(TIME_ZONE_INFORMATION* tz, utc, local).
+// tz NULL: the host's zone, with the daylight saving in force at that
+// moment (the host's rules for its date). A given tz: its Bias only; its
+// StandardDate/DaylightDate rules are not applied.
+HLE("kernel32.dll", SystemTimeToTzSpecificLocalTime, 3) {
+  uint32_t tz = Arg(c, 0), utc = Arg(c, 1), out = Arg(c, 2);
+  std::tm t = ReadSystemTime(utc);
+  int ms = Rd16(utc + 14);
+  time_t secs = timegm(&t);
+  std::tm lt{};
+  if (tz) {
+    time_t local = secs - time_t(int32_t(Rd32(tz))) * 60;  // Bias: UTC = local + bias
+    gmtime_r(&local, &lt);
+  } else {
+    localtime_r(&secs, &lt);
+  }
+  WriteSystemTime(out, lt, ms);
+  return 1;
+}
+
 // The SYSTEMTIME a Get*Format call formats; null means now (local).
 std::tm TmFromSystemTime(uint32_t st) {
   if (st) return ReadSystemTime(st);
@@ -331,6 +351,25 @@ HLE("kernel32.dll", FormatMessageA, 7) {
   }
   if (s.size() + 1 > cap) return 0;
   PutStr(buf, s);
+  return uint32_t(s.size());
+}
+
+// The same in WCHARs; `cap` counts WCHARs.
+HLE("kernel32.dll", FormatMessageW, 7) {
+  uint32_t flags = Arg(c, 0), id = Arg(c, 2), buf = Arg(c, 4), cap = Arg(c, 5);
+  if (!(flags & 0x1000)) {  // only FORMAT_MESSAGE_FROM_SYSTEM
+    WarnF("FormatMessageW(flags %X): only FROM_SYSTEM is supported\n", flags);
+    return 0;
+  }
+  std::string s = "Error " + std::to_string(id) + ".\r\n";
+  if (flags & 0x100) {  // FORMAT_MESSAGE_ALLOCATE_BUFFER
+    uint32_t p = HeapAllocProcess(uint32_t(2 * (s.size() + 1)), false);
+    PutWStr(p, s);
+    Wr32(buf, p);
+    return uint32_t(s.size());
+  }
+  if (s.size() + 1 > cap) return 0;
+  PutWStr(buf, s);
   return uint32_t(s.size());
 }
 

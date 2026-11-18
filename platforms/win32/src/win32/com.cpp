@@ -1,8 +1,10 @@
 #include "win32/com.h"
 
+#include <atomic>
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <unordered_map>
 
 #include "runtime/log.h"
 #include "win32/hle.h"
@@ -16,8 +18,25 @@ constexpr uint32_t kMagic = 0x4D4F4352;  // 'RCOM'
 
 std::recursive_mutex g_mu;
 std::map<std::string, uint32_t> g_vtables;
-std::map<uint32_t, std::shared_ptr<Object>> g_objects;  // by guest pointer
+// By guest pointer. Hashed: renderers look objects up several times per
+// draw (As), and a tree of thousands of textures and buffers costs a
+// dozen dependent loads each time.
+std::unordered_map<uint32_t, std::shared_ptr<Object>> g_objects;
 std::vector<std::pair<guest::GUID, CreateFn>> g_classes;
+// Bumped whenever an object is published or destroyed: LookupRaw's
+// per-thread cache holds while it is unchanged.
+std::atomic<uint32_t> g_generation{0};
+
+// This thread's recent lookups (LookupRaw), one slot per address bits
+// 4-11 (objects are 16-byte heap blocks): renderers ask for the same
+// objects (the device, its targets, textures, buffers) on every draw.
+struct LookupCache {
+  static constexpr unsigned kSlots = 256;
+  uint32_t generation = ~0u;
+  uint32_t guest[kSlots] = {};
+  Object* obj[kSlots] = {};
+};
+thread_local LookupCache t_lookup;
 
 }  // namespace
 
@@ -42,6 +61,7 @@ uint32_t Publish(std::shared_ptr<Object> obj, uint32_t vtable) {
   obj->guest = p;
   std::lock_guard<std::recursive_mutex> l(g_mu);
   g_objects[p] = std::move(obj);
+  g_generation.fetch_add(1, std::memory_order_release);
   return p;
 }
 
@@ -49,6 +69,27 @@ std::shared_ptr<Object> Lookup(uint32_t guest) {
   std::lock_guard<std::recursive_mutex> l(g_mu);
   auto it = g_objects.find(guest);
   return it == g_objects.end() ? nullptr : it->second;
+}
+
+Object* LookupRaw(uint32_t guest) {
+  LookupCache& c = t_lookup;
+  const uint32_t gen = g_generation.load(std::memory_order_acquire);
+  const unsigned i = (guest >> 4) % LookupCache::kSlots;
+  if (c.generation == gen) {
+    if (c.guest[i] == guest) return c.obj[i];
+  } else {
+    c = LookupCache{};
+    c.generation = gen;
+  }
+  Object* o;
+  {
+    std::lock_guard<std::recursive_mutex> l(g_mu);
+    auto it = g_objects.find(guest);
+    o = it == g_objects.end() ? nullptr : it->second.get();
+  }
+  c.guest[i] = guest;
+  c.obj[i] = o;
+  return o;
 }
 
 uint32_t AddRef(uint32_t guest) {
@@ -69,6 +110,7 @@ uint32_t Release(uint32_t guest) {
     if (!left) {
       dead = it->second;
       g_objects.erase(it);
+      g_generation.fetch_add(1, std::memory_order_release);
       // Poison the guest block so a use-after-release is caught.
       Wr32(guest, 0);
       Wr32(guest + 4, 0);

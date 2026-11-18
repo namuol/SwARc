@@ -209,25 +209,84 @@ gaddr ModuleHandleOf(gaddr name, bool wide) {
 HLE64("kernel32.dll", GetModuleHandleA, 1) { return ModuleHandleOf(Arg(c, 0), false); }
 HLE64("kernel32.dll", GetModuleHandleW, 1) { return ModuleHandleOf(Arg(c, 0), true); }
 
-HLE64("kernel32.dll", GetModuleFileNameA, 3) {
-  gaddr mod = Arg(c, 0), buf = Arg(c, 1);
-  uint32_t size = uint32_t(Arg(c, 2));
-  std::string path = GuestExePath();
+// The guest path of the module `mod` (0: the EXE); false (ERROR_MOD_NOT_FOUND
+// set) if no module is loaded there.
+bool ModulePath(gaddr mod, std::string* path) {
+  *path = GuestExePath();
   if (mod && mod != g_win32->img.image_base) {
     std::lock_guard<std::recursive_mutex> l(g_loader_mu);
     Module* m = LoadedDllAt(mod);
     if (!m) {
       SetLastError(kErrorModNotFound);
-      return 0;
+      return false;
     }
-    path = GuestGameDir() + "\\" +
-           Game().lifted_dlls[size_t(m - g_win32->modules.data())].name;
+    *path = GuestGameDir() + "\\" +
+            Game().lifted_dlls[size_t(m - g_win32->modules.data())].name;
   }
+  return true;
+}
+
+HLE64("kernel32.dll", GetModuleFileNameA, 3) {
+  gaddr buf = Arg(c, 1);
+  uint32_t size = uint32_t(Arg(c, 2));
+  std::string path;
+  if (!ModulePath(Arg(c, 0), &path)) return 0;
   if (!size) return 0;
   std::string s = path.substr(0, size - 1);
   PutStr(buf, s);
   return uint32_t(s.size());
 }
+
+// The same, in WCHARs: a path that does not fit is cut to size - 1
+// characters and NUL-terminated, like the A version.
+HLE64("kernel32.dll", GetModuleFileNameW, 3) {
+  gaddr buf = Arg(c, 1);
+  uint32_t size = uint32_t(Arg(c, 2));
+  std::string path;
+  if (!ModulePath(Arg(c, 0), &path)) return 0;
+  if (!size) return 0;
+  std::u16string w = Widen(path).substr(0, size - 1);
+  std::memcpy(GPtr(buf), w.data(), w.size() * 2);
+  Wr16(buf + gaddr(w.size()) * 2, 0);
+  return uint32_t(w.size());
+}
+
+// GetModuleHandleExW(flags, name or address, HMODULE* out). Flags:
+// GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS (4) looks the module up by an
+// address inside it; PIN (1) and UNCHANGED_REFCOUNT (2) only affect
+// reference counts, and modules here are never unloaded under a holder.
+HLE64("kernel32.dll", GetModuleHandleExW, 3) {
+  uint32_t flags = uint32_t(Arg(c, 0));
+  gaddr arg = Arg(c, 1), out = Arg(c, 2);
+  if (!out) {
+    SetLastError(kErrorInvalidParameter);
+    return 0;
+  }
+  gaddr h = 0;
+  if (flags & 4) {
+    const auto& img = g_win32->img;
+    if (arg >= img.image_base && arg < img.image_base + img.image_size) {
+      h = img.image_base;
+    } else {
+      std::lock_guard<std::recursive_mutex> l(g_loader_mu);
+      for (const Module& m : g_win32->modules)
+        if (m.refs && arg >= m.img.image_base &&
+            arg < m.img.image_base + m.img.image_size)
+          h = m.img.image_base;
+    }
+    if (!h) SetLastError(kErrorModNotFound);
+  } else {
+    h = ModuleHandleOf(arg, true);
+  }
+  WrPtr(out, h);
+  return h ? 1 : 0;
+}
+
+// Encoded pointers are opaque to their users: only DecodePointer(
+// EncodePointer(p)) == p is observable, so the identity is a faithful
+// encoding.
+HLE64("kernel32.dll", EncodePointer, 1) { return Arg(c, 0); }
+HLE64("kernel32.dll", DecodePointer, 1) { return Arg(c, 0); }
 
 // LoadLibrary(Ex)A/W: lifted DLLs, and the HLE modules.
 gaddr LoadModule(Ctx& c, const char* api, const std::string& n) {
@@ -1003,6 +1062,58 @@ HLE64("kernel32.dll", InitializeSListHead, 1) {
   return 0;
 }
 
+// 32-bit SLIST_HEADER: one 64-bit word, Next (the first entry, bits 0-31),
+// Depth (32-47) and Sequence (48-63), updated together by one
+// compare-exchange as Windows does with cmpxchg8b. An entry's first dword
+// is its Next link. Sequence counts every push and pop, so a pop that raced
+// a pop and push of the same entry fails its exchange (the ABA case).
+namespace {
+std::atomic_ref<uint64_t> SListWord(gaddr head) {
+  return std::atomic_ref<uint64_t>(*reinterpret_cast<uint64_t*>(GPtr(head)));
+}
+uint64_t SListPack(uint32_t next, uint64_t depth, uint64_t seq) {
+  return next | (depth & 0xFFFF) << 32 | (seq & 0xFFFF) << 48;
+}
+}  // namespace
+
+// Returns the previous first entry (0 if the list was empty).
+HLE("kernel32.dll", InterlockedPushEntrySList, 2) {
+  gaddr head = Arg(c, 0), entry = Arg(c, 1);
+  auto w = SListWord(head);
+  uint64_t old = w.load();
+  for (;;) {
+    uint32_t first = uint32_t(old);
+    Wr32(entry, first);
+    uint64_t neu = SListPack(entry, (old >> 32) + 1, (old >> 48) + 1);
+    if (w.compare_exchange_weak(old, neu)) return first;
+  }
+}
+
+// Returns the removed first entry, or 0 if the list was empty.
+HLE("kernel32.dll", InterlockedPopEntrySList, 1) {
+  auto w = SListWord(Arg(c, 0));
+  uint64_t old = w.load();
+  for (;;) {
+    uint32_t first = uint32_t(old);
+    if (!first) return 0;
+    uint64_t neu = SListPack(Rd32(first), (old >> 32) - 1, (old >> 48) + 1);
+    if (w.compare_exchange_weak(old, neu)) return first;
+  }
+}
+
+// Empties the list; returns the old first entry (the chain stays linked).
+HLE("kernel32.dll", InterlockedFlushSList, 1) {
+  auto w = SListWord(Arg(c, 0));
+  uint64_t old = w.load();
+  while (!w.compare_exchange_weak(old, SListPack(0, 0, old >> 48))) {
+  }
+  return uint32_t(old);
+}
+
+HLE("kernel32.dll", QueryDepthSList, 1) {
+  return uint32_t(SListWord(Arg(c, 0)).load() >> 32 & 0xFFFF);
+}
+
 // ---- interlocked ---------------------------------------------------------
 // seq_cst read-modify-writes, as lifted lock-prefixed instructions are.
 // C++ orders those only against other seq_cst atomics, not against the
@@ -1249,6 +1360,80 @@ HLE("kernel32.dll", EnumSystemLocalesA, 2) {
   CallGuest(c, Arg(c, 0), {buf});
   g_process_heap->Free(buf);
   return 1;
+}
+
+HLE("kernel32.dll", EnumSystemLocalesW, 2) {
+  uint32_t buf = HeapAllocProcess(32, true);
+  PutWStr(buf, "00000409");
+  CallGuest(c, Arg(c, 0), {buf});
+  g_process_heap->Free(buf);
+  return 1;
+}
+
+// ---- collation -----------------------------------------------------------
+// CompareString for the one locale here (0x0409), on UTF-16 code units:
+// letters compare without case first, then, between strings equal that
+// way, lower case sorts before upper case ("a" < "A" < "b"), as the en-US
+// table orders them. NORM_IGNORECASE (1) drops the second step. Not
+// modelled: the word sort's ignoring of '-' and '\'', and expansions
+// such as "ae" = U+00E6.
+namespace {
+constexpr uint32_t kNormIgnoreCase = 1;
+
+int CollateUnits(const std::u16string& a, const std::u16string& b, uint32_t flags) {
+  auto fold = [](uint16_t u) { return MapCase(u, kLcmapLowercase); };
+  size_t n = std::min(a.size(), b.size());
+  for (size_t i = 0; i < n; i++) {
+    uint16_t x = fold(a[i]), y = fold(b[i]);
+    if (x != y) return x < y ? -1 : 1;
+  }
+  if (a.size() != b.size()) return a.size() < b.size() ? -1 : 1;
+  if (flags & kNormIgnoreCase) return 0;
+  for (size_t i = 0; i < n; i++) {
+    if (a[i] == b[i]) continue;
+    bool la = CharType1(a[i]) & 2, lb = CharType1(b[i]) & 2;  // C1_LOWER
+    if (la != lb) return la ? -1 : 1;
+    return a[i] < b[i] ? -1 : 1;
+  }
+  return 0;
+}
+
+// cch < 0: NUL-terminated.
+std::u16string WideArg(gaddr s, int32_t cch) {
+  if (cch < 0) return GWStr(s);
+  std::u16string w(size_t(cch), u'\0');
+  std::memcpy(w.data(), GPtr(s), size_t(cch) * 2);
+  return w;
+}
+std::u16string AnsiArg(gaddr s, int32_t cch) {
+  std::string a = cch < 0 ? GStr(s) : std::string(reinterpret_cast<const char*>(GPtr(s)), size_t(cch));
+  std::u16string w;
+  for (char ch : a) w += char16_t(Cp1252ToUnicode(uint8_t(ch)));
+  return w;
+}
+}  // namespace
+
+// CompareStringW(lcid, flags, s1, cch1, s2, cch2): CSTR_LESS_THAN (1),
+// CSTR_EQUAL (2) or CSTR_GREATER_THAN (3).
+HLE("kernel32.dll", CompareStringW, 6) {
+  uint32_t flags = uint32_t(Arg(c, 1));
+  return uint32_t(2 + CollateUnits(WideArg(Arg(c, 2), int32_t(Arg(c, 3))),
+                                   WideArg(Arg(c, 4), int32_t(Arg(c, 5))), flags));
+}
+
+HLE("kernel32.dll", CompareStringA, 6) {
+  uint32_t flags = uint32_t(Arg(c, 1));
+  return uint32_t(2 + CollateUnits(AnsiArg(Arg(c, 2), int32_t(Arg(c, 3))),
+                                   AnsiArg(Arg(c, 4), int32_t(Arg(c, 5))), flags));
+}
+
+// lstrcmp(i)A: CompareStringA in the user's locale, as -1/0/1.
+HLE("kernel32.dll", lstrcmpA, 2) {
+  return uint32_t(CollateUnits(AnsiArg(Arg(c, 0), -1), AnsiArg(Arg(c, 1), -1), 0));
+}
+HLE("kernel32.dll", lstrcmpiA, 2) {
+  return uint32_t(
+      CollateUnits(AnsiArg(Arg(c, 0), -1), AnsiArg(Arg(c, 1), -1), kNormIgnoreCase));
 }
 
 std::string LocaleString(uint32_t type) {

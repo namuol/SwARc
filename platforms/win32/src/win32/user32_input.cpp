@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "runtime/log.h"
+#include "win32/gdi_state.h"
 #include "win32/hle.h"
 #include "win32/input_state.h"
 #include "win32/kernel32_state.h"
@@ -212,6 +213,68 @@ HLE("user32.dll", GetKeyNameTextA, 3) {
 
 HLE("user32.dll", GetKeyboardLayout, 1) { return 0x04090409; }
 
+// KL_NAMELENGTH (9) chars: the US layout's KLID.
+HLE("user32.dll", GetKeyboardLayoutNameA, 1) {
+  PutStr(Arg(c, 0), "00000409");
+  return 1;
+}
+
+// ToAscii(vk, scan code, BYTE keystate[256], WORD* out, flags): the
+// character the US layout gives `vk` under `keystate` (bit 7 down, bit 0
+// toggled): shift and caps lock for letters, shift for the rest, ctrl+
+// letter as the control character. Returns 1 with the character in
+// *out, 0 for keys without one. Bit 15 of the scan code is a key release,
+// which translates the same. No dead keys on this layout.
+HLE("user32.dll", ToAscii, 5) {
+  uint32_t vk = Arg(c, 0) & 0xFF, ks = Arg(c, 2), out = Arg(c, 3);
+  auto down = [&](uint32_t k) { return (Rd8(ks + k) & 0x80) != 0; };
+  bool shift = down(0x10), ctrl = down(0x11), alt = down(0x12);
+  bool caps = Rd8(ks + 0x14) & 1;
+  uint8_t ch = 0;
+  if (vk >= 'A' && vk <= 'Z') {
+    if (ctrl && !alt) ch = uint8_t(vk - 'A' + 1);
+    else ch = uint8_t(shift != caps ? vk : vk + 0x20);
+  } else if (ctrl || alt) {
+    ch = 0;
+  } else if (vk >= 0x60 && vk <= 0x69) {  // numpad digits (num lock on)
+    ch = uint8_t('0' + (vk - 0x60));
+  } else if (const KeyDef* k = ByVk(uint8_t(vk))) {
+    ch = uint8_t(shift && k->shifted ? k->shifted : k->ch);
+  }
+  if (!ch) return 0;
+  Wr16(out, ch);
+  return 1;
+}
+
+// ---- characters (Windows-1252) -------------------------------------------
+// The A forms work on the ANSI code page (1252) as Unicode characters, as
+// user32 does through its own tables.
+
+uint8_t MapAnsiCase(uint8_t ch, uint32_t flags) {
+  bool ok;
+  uint8_t r = UnicodeToCp1252(MapCase(Cp1252ToUnicode(ch), flags), &ok);
+  return ok ? r : ch;
+}
+
+// CharLowerBuffA / CharUpperBuffA(str, len): in place; returns len.
+HLE("user32.dll", CharLowerBuffA, 2) {
+  uint32_t s = Arg(c, 0), n = Arg(c, 1);
+  for (uint32_t i = 0; i < n; i++) Wr8(s + i, MapAnsiCase(Rd8(s + i), kLcmapLowercase));
+  return n;
+}
+HLE("user32.dll", CharUpperBuffA, 2) {
+  uint32_t s = Arg(c, 0), n = Arg(c, 1);
+  for (uint32_t i = 0; i < n; i++) Wr8(s + i, MapAnsiCase(Rd8(s + i), kLcmapUppercase));
+  return n;
+}
+
+HLE("user32.dll", IsCharAlphaA, 1) {
+  return CharType1(Cp1252ToUnicode(uint8_t(Arg(c, 0)))) & 0x100 ? 1 : 0;  // C1_ALPHA
+}
+HLE("user32.dll", IsCharAlphaNumericA, 1) {
+  return CharType1(Cp1252ToUnicode(uint8_t(Arg(c, 0)))) & (0x100 | 4) ? 1 : 0;  // C1_ALPHA, C1_DIGIT
+}
+
 // Key state: bit 15 = down; GetKeyState bit 0 = toggled. GetAsyncKeyState
 // bit 0 = "pressed since last call" (still honoured by Windows XP).
 HLE("user32.dll", GetKeyState, 1) {
@@ -343,7 +406,10 @@ HLE("user32.dll", LoadImageA, 6) {
       SetLastError(2);  // ERROR_FILE_NOT_FOUND
       return 0;
     }
-    return next += 0x10;
+    uint32_t h = next += 0x10;
+    BitmapDesc d;
+    if (type == 0 && ReadBmpHeader(path, &d)) RememberBitmap(h, d);  // IMAGE_BITMAP
+    return h;
   }
   if (type == 1) return 0x00020000u | (name & 0xFFFF);  // IMAGE_ICON
   if (type == 2) return 0x00010000u | (name & 0xFFFF);  // IMAGE_CURSOR

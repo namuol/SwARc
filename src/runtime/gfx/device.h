@@ -138,8 +138,9 @@ struct FfStream {
   const void* data = nullptr;  // vertex 0's attribute
   uint32_t stride = 0;
   // Nonzero: the bytes this stream reads are the same in every draw that
-  // passes the same lock until the next Present, so the device may keep
-  // what it took of them for one draw for the others.
+  // passes the same lock, so the device may keep what it took of them for
+  // one draw for the others, in later frames too. A front end changes the
+  // lock whenever the data may have changed (d3d9: at each Unlock).
   uint32_t lock = 0;
 };
 // A fixed-function draw from separate streams. The FVF says which

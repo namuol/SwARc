@@ -30,16 +30,40 @@ namespace recomp::platform {
 
 namespace {
 ucontext_t g_caller_ctx, g_stack_ctx;
+void (*g_stack_fn)() = nullptr;
+
+// Ends the frame-pointer chain at the first frame on a stack that
+// makecontext set up. Darwin's arm64 makecontext leaves that frame's
+// saved frame pointer and return address as whatever was on the new
+// stack, so backtrace() (a frame-pointer walk on macOS) follows them off
+// the stack and faults: in a fatal report, the report itself crashed.
+// `frame` is the caller's __builtin_frame_address(0); the caller never
+// returns through it.
+[[gnu::always_inline]] inline void EndFrameChain(void* frame) {
+  auto** record = static_cast<void**>(frame);
+  record[0] = nullptr;  // saved frame pointer: no caller
+  record[1] = nullptr;  // saved return address
 }
+}  // namespace
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
+namespace {
+[[gnu::noinline]] void StackStart() {
+  EndFrameChain(__builtin_frame_address(0));
+  g_stack_fn();
+  setcontext(&g_caller_ctx);  // back to RunOnStack's caller, never returns
+  abort();
+}
+}  // namespace
+
 void RunOnStack(void* stack, size_t size, void (*fn)()) {
   getcontext(&g_stack_ctx);
   g_stack_ctx.uc_stack.ss_sp = stack;
   g_stack_ctx.uc_stack.ss_size = size;
-  g_stack_ctx.uc_link = &g_caller_ctx;  // resume here on return
-  makecontext(&g_stack_ctx, fn, 0);
+  g_stack_ctx.uc_link = &g_caller_ctx;
+  g_stack_fn = fn;
+  makecontext(&g_stack_ctx, StackStart, 0);
   swapcontext(&g_caller_ctx, &g_stack_ctx);
 }
 
@@ -53,7 +77,8 @@ struct Coroutine {
 namespace {
 thread_local Coroutine* t_starting = nullptr;
 
-void CoroutineStart() {
+[[gnu::noinline]] void CoroutineStart() {
+  EndFrameChain(__builtin_frame_address(0));
   Coroutine* c = t_starting;
   c->fn(c->arg);
   abort();  // fn must not return

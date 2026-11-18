@@ -585,6 +585,36 @@ bool JoinThread(uint32_t h, uint32_t* exit_code) {
 
 namespace {
 
+constexpr uint32_t kStillActive = 259;  // STILL_ACTIVE
+
+// The exit code once the thread has finished, STILL_ACTIVE before. The
+// main thread has no ThreadObject; its pseudo-handle is always running.
+HLE("kernel32.dll", GetExitCodeThread, 2) {
+  uint32_t h = Arg(c, 0), out = Arg(c, 1);
+  auto to = std::dynamic_pointer_cast<ThreadObject>(GetHandle(h));
+  if (!to) {
+    if (h != 0xFFFFFFFE) {
+      SetLastError(kErrorInvalidHandle);
+      return 0;
+    }
+    Wr32(out, kStillActive);
+    return 1;
+  }
+  std::lock_guard<std::mutex> l(g_wait_mu);
+  Wr32(out, to->finished ? to->exit_code : kStillActive);
+  return 1;
+}
+
+// The only process handle is the current process's: it is still running.
+HLE("kernel32.dll", GetExitCodeProcess, 2) {
+  if (!std::dynamic_pointer_cast<ProcessObject>(GetHandle(Arg(c, 0)))) {
+    SetLastError(kErrorInvalidHandle);
+    return 0;
+  }
+  Wr32(Arg(c, 1), kStillActive);
+  return 1;
+}
+
 HLE("kernel32.dll", CreateThread, 6) {
   uint32_t tid;
   uint32_t h = NewThread(Arg(c, 1), Arg(c, 2), Arg(c, 3), Arg(c, 4) & 4, &tid);

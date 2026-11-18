@@ -1009,6 +1009,17 @@ void (*g_host_event_sink)(const SDL_Event&) = nullptr;
 
 void SetHostEventSink(void (*sink)(const SDL_Event&)) { g_host_event_sink = sink; }
 
+// The SDL window of a top-level `win`, hidden, sized to its client area.
+void CreateHostWindow(Window& win) {
+  EnsureSdlVideo();
+  int cw, ch;
+  ClientSize(win, &cw, &ch);
+  win.sdl = SDL_CreateWindow(win32::AnsiToUtf8(win.title).c_str(), ToPoints(nullptr, cw), ToPoints(nullptr, ch),
+                             SDL_WINDOW_HIDDEN | SDL_WINDOW_HIGH_PIXEL_DENSITY |
+                                 gfx::ChosenWindowFlags());
+  if (!win.sdl) FatalF("SDL_CreateWindow: %s", SDL_GetError());
+}
+
 uint32_t CreateSdl2Window(const std::string& title_utf8, int w, int h, SDL_WindowFlags flags,
                           SDL_Window** sdl) {
   EnsureSdlVideo();
@@ -1111,6 +1122,12 @@ void ShowWindowNoActivate(uint32_t hwnd) {
   }
   if (sdl) SDL_ShowWindow(sdl);
   UpdateFullscreen(hwnd);
+}
+
+std::vector<int> DisplayModeRates() {
+  const int hz = DesktopRefreshRate();
+  if (hz == 60 || hz <= 0) return {60};
+  return hz < 60 ? std::vector<int>{hz, 60} : std::vector<int>{60, hz};
 }
 
 std::vector<ModeSize> DisplayModeSizes() {
@@ -1249,15 +1266,11 @@ HLE("user32.dll", CreateWindowExA, 12) {
   win.h = h;
   win.title = title_va ? GStr(title_va) : "";
   win.tid = CurrentThread()->tid;
-  if (!(style & WS_CHILD)) {
-    EnsureSdlVideo();
-    int cw, ch;
-    ClientSize(win, &cw, &ch);
-    win.sdl = SDL_CreateWindow(AnsiToUtf8(win.title).c_str(), ToPoints(nullptr, cw), ToPoints(nullptr, ch),
-                               SDL_WINDOW_HIDDEN | SDL_WINDOW_HIGH_PIXEL_DENSITY |
-                                   gfx::ChosenWindowFlags());
-    if (!win.sdl) FatalF("SDL_CreateWindow: %s", SDL_GetError());
-  }
+  // A top-level window gets its host window here, on the main thread.
+  // Windows created by other threads (games keep hidden helper windows
+  // on worker threads, as message targets) get theirs when first shown:
+  // SDL, and Cocoa on macOS, create windows only on the main thread.
+  if (!(style & WS_CHILD) && OnMainThread()) CreateHostWindow(win);
   uint32_t hwnd = win.hwnd;
   {
     std::lock_guard<std::recursive_mutex> l(g_mu);
@@ -1355,6 +1368,15 @@ HLE("user32.dll", ShowWindow, 2) {
     w->visible = show;
     if (minimize) w->minimized = true;
     if (restore) w->minimized = false;
+    // A top-level window created off the main thread has no host window
+    // yet (CreateWindowExA): it gets one when it is first shown.
+    if (show && !w->sdl && !(w->style & WS_CHILD) && !w->destroyed) {
+      if (!OnMainThread())
+        FatalF("ShowWindow(%08X): a window created off the main thread is shown from "
+               "another thread; host windows can only be made on the main thread",
+               hwnd);
+      CreateHostWindow(*w);
+    }
     sdl = w->sdl;
     exclusive = w->mode_w != 0;
   }
@@ -1400,6 +1422,8 @@ HLE("user32.dll", CloseWindow, 1) {
 
 HLE("user32.dll", UpdateWindow, 1) { return 1; }
 HLE("user32.dll", InvalidateRect, 3) { return 1; }
+// Nothing is drawn through GDI, so there is nothing to repaint.
+HLE("user32.dll", RedrawWindow, 4) { return 1; }
 
 HLE("user32.dll", IsWindowVisible, 1) {
   std::lock_guard<std::recursive_mutex> l(g_mu);
@@ -1511,6 +1535,27 @@ HLE("user32.dll", GetClientRect, 2) {
   Wr32(rc + 4, 0);
   Wr32(rc + 8, uint32_t(cw));
   Wr32(rc + 12, uint32_t(ch));
+  return 1;
+}
+
+// GetWindowPlacement(hwnd, WINDOWPLACEMENT*): 44 bytes. showCmd is
+// SW_SHOWMINIMIZED (2) while minimized, else SW_SHOWNORMAL (1); no
+// minimized or maximized positions were ever set (-1, -1); the normal
+// rectangle is the window's own, there being no taskbar to offset
+// workspace coordinates.
+HLE("user32.dll", GetWindowPlacement, 2) {
+  uint32_t hwnd = Arg(c, 0), wp = Arg(c, 1);
+  std::lock_guard<std::recursive_mutex> l(g_mu);
+  Window* w = Win(hwnd);
+  if (!w) return 0;
+  Wr32(wp + 0, 44);
+  Wr32(wp + 4, 0);
+  Wr32(wp + 8, w->minimized ? 2 : 1);
+  for (int i = 0; i < 4; i++) Wr32(wp + 12 + 4 * i, 0xFFFFFFFF);
+  Wr32(wp + 28, uint32_t(w->x));
+  Wr32(wp + 32, uint32_t(w->y));
+  Wr32(wp + 36, uint32_t(w->x + w->w));
+  Wr32(wp + 40, uint32_t(w->y + w->h));
   return 1;
 }
 
@@ -1694,10 +1739,26 @@ HLE("user32.dll", GetForegroundWindow, 0) {
   std::lock_guard<std::recursive_mutex> l(g_mu);
   return g_active;
 }
+// Brings a window to the front and activates it: when it was not already
+// the active one, it gets WM_ACTIVATEAPP, WM_ACTIVATE and WM_SETFOCUS, as
+// from ShowWindow. Games that create a visible window and only call
+// SetForegroundWindow learn they are active this way.
 HLE("user32.dll", SetForegroundWindow, 1) {
-  if (SDL_Window* s = SdlWindowFor(Arg(c, 0))) SDL_RaiseWindow(s);
-  std::lock_guard<std::recursive_mutex> l(g_mu);
-  g_active = g_focus = Arg(c, 0);
+  uint32_t hwnd = Arg(c, 0);
+  if (SDL_Window* s = SdlWindowFor(hwnd)) SDL_RaiseWindow(s);
+  bool activate = false;
+  {
+    std::lock_guard<std::recursive_mutex> l(g_mu);
+    Window* w = Win(hwnd);
+    if (!w) return 0;
+    if (g_active != hwnd) activate = true;
+    g_active = g_focus = hwnd;
+  }
+  if (activate) {
+    Send(hwnd, WM_ACTIVATEAPP, 1, 0);
+    Send(hwnd, WM_ACTIVATE, 1, 0);
+    Send(hwnd, WM_SETFOCUS, 0, 0);
+  }
   return 1;
 }
 HLE("user32.dll", BringWindowToTop, 1) {
@@ -1732,6 +1793,15 @@ HLE("user32.dll", GetMessageA, 4) {
   }
   PutMsg(msg_va, m);
   return m.msg == WM_QUIT ? 0 : 1;
+}
+
+// PostThreadMessageA(tid, msg, wparam, lparam): a message with no window
+// in that thread's queue.
+HLE("user32.dll", PostThreadMessageA, 4) {
+  PostTo(uint32_t(Arg(c, 0)),
+         Msg{0, uint32_t(Arg(c, 1)), uint32_t(Arg(c, 2)), uint32_t(Arg(c, 3)), TickCount(),
+             g_mouse_x, g_mouse_y});
+  return 1;
 }
 
 HLE("user32.dll", PostMessageA, 4) {
@@ -2178,6 +2248,31 @@ HLE("user32.dll", GetCursorPos, 1) {
   return 1;
 }
 
+// mouse_event(flags, dx, dy, data, extra): synthesised input. Movement
+// (MOUSEEVENTF_MOVE 1) moves the cursor as a real mouse would: by dx/dy
+// mickeys (taken as pixels: no acceleration), or with MOUSEEVENTF_ABSOLUTE
+// (0x8000) to dx/dy in 0-65535 across the screen; DirectInput sees the
+// relative motion. Games nudge the mouse by +1 and -1 to keep the
+// screensaver away. Synthesised buttons and wheel are not provided yet.
+HLE("user32.dll", mouse_event, 5) {
+  uint32_t flags = Arg(c, 0);
+  int32_t dx = int32_t(Arg(c, 1)), dy = int32_t(Arg(c, 2));
+  if (flags & ~0x8001u)
+    FatalF("mouse_event(flags %X): synthesised buttons and wheel are not supported yet", flags);
+  if (!(flags & 1)) return 0;
+  int32_t ox = g_mouse_x, oy = g_mouse_y;
+  if (flags & 0x8000) {
+    g_mouse_x = int32_t(int64_t(dx) * g_display_w / 65536);
+    g_mouse_y = int32_t(int64_t(dy) * g_display_h / 65536);
+  } else {
+    g_mouse_x = std::clamp(g_mouse_x + dx, 0, g_display_w - 1);
+    g_mouse_y = std::clamp(g_mouse_y + dy, 0, g_display_h - 1);
+  }
+  if (g_mouse_x != ox) EmitRawInput(RawInput::MouseX, 0, g_mouse_x - ox);
+  if (g_mouse_y != oy) EmitRawInput(RawInput::MouseY, 0, g_mouse_y - oy);
+  return 0;
+}
+
 HLE("user32.dll", SetCursorPos, 2) {
   g_mouse_x = g_recentre_x = int32_t(Arg(c, 0));
   g_mouse_y = g_recentre_y = int32_t(Arg(c, 1));
@@ -2231,13 +2326,14 @@ HLE("user32.dll", ReleaseCapture, 0) {
 // ---- display modes -------------------------------------------------------------------
 
 struct Mode {
-  int w, h, bpp;
+  int w, h, bpp, hz;
 };
 
 std::vector<Mode> Modes() {
   std::vector<Mode> m;
   for (int bpp : {16, 32})
-    for (const ModeSize& s : DisplayModeSizes()) m.push_back({s.w, s.h, bpp});
+    for (const ModeSize& s : DisplayModeSizes())
+      for (int hz : DisplayModeRates()) m.push_back({s.w, s.h, bpp, hz});
   return m;
 }
 
@@ -2250,14 +2346,14 @@ void PutDevMode(uint32_t dm, const Mode& m) {
   Wr32(dm + 104, uint32_t(m.bpp));
   Wr32(dm + 108, uint32_t(m.w));
   Wr32(dm + 112, uint32_t(m.h));
-  Wr32(dm + 120, 60);
+  Wr32(dm + 120, uint32_t(m.hz));
 }
 
 HLE("user32.dll", EnumDisplaySettingsA, 3) {
   EnsureSdlVideo();
   uint32_t idx = Arg(c, 1), dm = Arg(c, 2);
   if (idx == 0xFFFFFFFF || idx == 0xFFFFFFFE) {  // ENUM_CURRENT/REGISTRY_SETTINGS
-    PutDevMode(dm, {g_display_w, g_display_h, 32});
+    PutDevMode(dm, {g_display_w, g_display_h, 32, DesktopRefreshRate()});
     return 1;
   }
   auto modes = Modes();
@@ -2321,4 +2417,30 @@ HLE("user32.dll", SetClipboardData, 2) { return 0; }
 
 }  // namespace
 }  // namespace hle
+
+bool PostWindowMessage(uint32_t hwnd, uint32_t msg, uint32_t wparam, uint32_t lparam) {
+  {
+    std::lock_guard<std::recursive_mutex> l(g_mu);
+    if (!Win(hwnd)) return false;
+  }
+  Post(hwnd, msg, wparam, lparam);
+  return true;
+}
+
+void ScreenPointToClient(uint32_t hwnd, int* x, int* y) {
+  int ox, oy;
+  WindowOrigin(hwnd, &ox, &oy);
+  *x -= ox;
+  *y -= oy;
+}
+
+void CursorInClient(uint32_t hwnd, int* x, int* y) {
+  int32_t sx = g_mouse_x, sy = g_mouse_y;
+  hle::SyncedCursorPos(&sx, &sy);
+  int ox, oy;
+  WindowOrigin(hwnd, &ox, &oy);
+  *x = sx - ox;
+  *y = sy - oy;
+}
+
 }  // namespace recomp

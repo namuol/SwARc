@@ -9,6 +9,7 @@
 // texture. The device holds a reference to everything bound to it.
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 
@@ -253,7 +254,20 @@ std::shared_ptr<const hlsl::Program> ReadTranslated(const std::vector<uint32_t>&
   return p;
 }
 
+bool ChargeVram(Device& d, uint64_t bytes) {
+  const uint64_t budget = uint64_t(Game().video_memory_mb) << 20;
+  if (d.vram_used + bytes > budget) return false;
+  d.vram_used += bytes;
+  return true;
+}
+
+void RefundVram(uint32_t device, uint64_t bytes) {
+  Device* d = com::As<Device>(device);
+  if (d && bytes) d->vram_used -= std::min(bytes, d->vram_used);
+}
+
 Surface::~Surface() {
+  RefundVram(device, vram);
   Device* d = com::As<Device>(device);
   if (d && depth) d->gfx->DestroyDepth(depth);
   if (d && tex) d->gfx->DestroyTexture(tex);
@@ -266,6 +280,7 @@ Shader::~Shader() {
 }
 
 Texture::~Texture() {
+  RefundVram(device, vram);
   Device* d = com::As<Device>(device);
   if (d && tex) d->gfx->DestroyTexture(tex);
   for (Level& l : lv) {
@@ -312,6 +327,12 @@ uint32_t NewTexture(Device& d, uint32_t device, bool cube, uint32_t w, uint32_t 
       l.size = l.pitch * gfx::RowCount(f, l.h);
       t->lv.push_back(l);
     }
+  if (pool == D3DPOOL_DEFAULT) {
+    uint64_t bytes = 0;
+    for (const Texture::Level& l : t->lv) bytes += l.size;
+    if (!ChargeVram(d, bytes)) return 0x8876017C;  // D3DERR_OUTOFVIDEOMEMORY
+    t->vram = bytes;
+  }
   if (pool != D3DPOOL_SYSTEMMEM && pool != D3DPOOL_SCRATCH) {
     t->tex = cube ? d.gfx->CreateCubeTexture(int(w), int(levels), f)
                   : d.gfx->CreateTexture(int(w), int(h), int(levels), f,
@@ -342,6 +363,13 @@ uint32_t NewSurface(Device& d, uint32_t device, Surface::Kind kind, uint32_t w,
   s->device = device;
   s->desc = {fmt, D3DRTYPE_SURFACE, usage, pool, 0, 0, w, h};
   gfx::Format f = FormatFromD3D(fmt);
+  // Surfaces made at the game's request take video memory (the device's
+  // own back buffer and automatic depth buffer are outside the budget).
+  if (!keep && (kind == Surface::Kind::DepthStencil || kind == Surface::Kind::RenderTarget)) {
+    uint64_t bytes = uint64_t(gfx::RowPitch(f, w)) * gfx::RowCount(f, h);
+    if (!ChargeVram(d, bytes)) return 0;
+    s->vram = bytes;
+  }
   switch (kind) {
     case Surface::Kind::DepthStencil:
       s->depth = d.gfx->CreateDepth(int(w), int(h), f);
@@ -429,6 +457,7 @@ uint32_t CreateBuffer(Ctx& c, bool index) {
   b->fvf_or_format = Arg(c, 3);
   b->pool = Arg(c, 4);
   b->mem = HeapAllocProcess(length, true);
+  b->ticket = NextTicket();
   Wr32(out, com::Publish(b, BufferVtable(index)));
   return D3D_OK;
 }
@@ -450,10 +479,11 @@ HLE_NAMED("d3d9.dll", "IDirect3DDevice9::CreateRenderTarget", D3DDev9_CreateRend
     Wr32(out, 0);
     return D3DERR_INVALIDCALL;
   }
-  Wr32(out, NewSurface(*d, Arg(c, 0), Surface::Kind::RenderTarget, Arg(c, 1),
+  uint32_t s = NewSurface(*d, Arg(c, 0), Surface::Kind::RenderTarget, Arg(c, 1),
                        Arg(c, 2), fmt, D3DUSAGE_RENDERTARGET, D3DPOOL_DEFAULT,
-                       nullptr));
-  return D3D_OK;
+                       nullptr);
+  Wr32(out, s);
+  return s ? D3D_OK : 0x8876017C;  // D3DERR_OUTOFVIDEOMEMORY
 }
 
 // (Width, Height, Format, MultiSample, MultisampleQuality, Discard,
@@ -465,10 +495,11 @@ HLE_NAMED("d3d9.dll", "IDirect3DDevice9::CreateDepthStencilSurface", D3DDev9_Cre
     Wr32(out, 0);
     return D3DERR_INVALIDCALL;
   }
-  Wr32(out, NewSurface(*d, Arg(c, 0), Surface::Kind::DepthStencil, Arg(c, 1),
+  uint32_t s = NewSurface(*d, Arg(c, 0), Surface::Kind::DepthStencil, Arg(c, 1),
                        Arg(c, 2), fmt, D3DUSAGE_DEPTHSTENCIL, D3DPOOL_DEFAULT,
-                       nullptr));
-  return D3D_OK;
+                       nullptr);
+  Wr32(out, s);
+  return s ? D3D_OK : 0x8876017C;  // D3DERR_OUTOFVIDEOMEMORY
 }
 
 // (Width, Height, Format, Pool, ppSurface, pSharedHandle)
@@ -959,7 +990,10 @@ uint32_t BufferLock(Ctx& c) {
   }                                                                                 \
   HLE_NAMED("d3d9.dll", Iface "::GetPriority", Prefix##_GetPriority, 1) { return Buf(c)->priority; } \
   HLE_NAMED("d3d9.dll", Iface "::Lock", Prefix##_Lock, 5) { return BufferLock(c); }  \
-  HLE_NAMED("d3d9.dll", Iface "::Unlock", Prefix##_Unlock, 1) { return D3D_OK; }
+  HLE_NAMED("d3d9.dll", Iface "::Unlock", Prefix##_Unlock, 1) {                    \
+    Buf(c)->ticket = NextTicket(); /* the data may have changed */                  \
+    return D3D_OK;                                                                  \
+  }
 
 D3D9_BUFFER_METHODS("IDirect3DVertexBuffer9", D3DVB9, false)
 D3D9_BUFFER_METHODS("IDirect3DIndexBuffer9", D3DIB9, true)

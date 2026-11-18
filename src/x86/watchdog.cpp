@@ -22,8 +22,7 @@
 
 namespace recomp {
 
-thread_local const char* t_wd_hle_name = nullptr;
-thread_local uint64_t t_wd_hle_ret = 0;
+thread_local HleThreadState t_hle_state;
 
 namespace {
 
@@ -94,10 +93,10 @@ void OnDumpSignal(int) {
   if (pthread_equal(g_dump_th.load(), pthread_self()) &&
       g_dump_state.compare_exchange_strong(requested, kWriting)) {
     const int fd = g_dump_fd.load();
-    if (const char* n = t_wd_hle_name) {
+    if (const char* n = t_hle_state.name) {
       char buf[160];
       std::snprintf(buf, sizeof buf, "in import (last entered): %s, called from guest %08llX\n",
-                    n, (unsigned long long)t_wd_hle_ret);
+                    n, (unsigned long long)t_hle_state.ret);
       WriteAll(fd, buf);
     }
     void* frames[512];

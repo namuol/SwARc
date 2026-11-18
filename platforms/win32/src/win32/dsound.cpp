@@ -338,6 +338,19 @@ void WriteFormat(uint32_t va, uint32_t size, const Format& f) {
 // ---- DirectSoundCreate8 and IDirectSound8
 
 // (lpcGuidDevice, ppDS8, pUnkOuter)
+// DirectSoundEnumerateA(LPDSENUMCALLBACKA cb, ctx) (ordinal 2): one
+// device, the primary sound driver (NULL GUID, as DirectSound reports it
+// first), which is what DirectSoundCreate8 opens. The callback is
+// BOOL CALLBACK (LPGUID, LPCSTR description, LPCSTR module, LPVOID ctx).
+HLE_NAMED("dsound.dll", "#2", DirectSoundEnumerateA, 2) {
+  gaddr desc = HeapAllocProcess(64, true);
+  PutStr(desc, "Primary Sound Driver");
+  gaddr module = desc + 32;  // "": the primary driver has no module name
+  CallGuest(c, Arg(c, 0), {0, desc, module, Arg(c, 1)});
+  HeapFreeProcess(desc);
+  return DS_OK;
+}
+
 HLE_NAMED("dsound.dll", "#11", DirectSoundCreate8, 3) {
   if (!Arg(c, 1)) return DSERR_INVALIDPARAM;
   Wr32(Arg(c, 1), 0);
@@ -398,7 +411,11 @@ HLE_NAMED("dsound.dll", "IDirectSound8::CreateSoundBuffer", DS8_CreateSoundBuffe
   if (flags & DSBCAPS_CTRLFX) FatalF("dsound: buffers with effects (DSBCAPS_CTRLFX) are not supported");
   if (flags & DSBCAPS_PRIMARYBUFFER) {
     if (bytes || fmt) return DSERR_INVALIDPARAM;
-    if (ds->primary) {  // one primary buffer per device
+    // One primary buffer per device while it is alive. The device does not
+    // hold a reference to it: once the game releases its last one it is
+    // gone, and the next request makes a new one.
+    if (ds->primary && !com::As<SoundBuffer>(ds->primary)) ds->primary = 0;
+    if (ds->primary) {
       com::AddRef(ds->primary);
       Wr32(out, ds->primary);
       return DS_OK;

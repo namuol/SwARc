@@ -31,6 +31,44 @@ foreach(_m RANGE 1 17)
   add_test(NAME x87_fast_mutation_${_m} COMMAND x87_fast_mutation_${_m} 200000)
 endforeach()
 
+# sse_fast_test checks the SSE model's host-arithmetic fast paths
+# against its exact SoftFloat paths; portable.
+add_executable(sse_fast_test sse_fast_test.cpp)
+target_link_libraries(sse_fast_test PRIVATE recomp_x87)
+target_compile_options(sse_fast_test PRIVATE -O2 ${RECOMP_X87_FP_FLAGS})
+add_test(NAME sse_fast COMMAND sse_fast_test)
+set_tests_properties(sse_fast PROPERTIES TIMEOUT 300)
+# The variant for games whose code never reads MXCSR's status flags
+# (RECOMP_SSE_FLAGS_UNOBSERVED, x86/sse.h), and its planted bug (111: no
+# NaN check).
+add_executable(sse_fast_noflags_test sse_fast_test.cpp "${RECOMP_ROOT}/src/x86/sse.cpp")
+target_include_directories(sse_fast_noflags_test PRIVATE "${RECOMP_ROOT}/src")
+target_compile_features(sse_fast_noflags_test PRIVATE cxx_std_20)
+target_compile_definitions(sse_fast_noflags_test PRIVATE RECOMP_SSE_FLAGS_UNOBSERVED=1)
+target_compile_options(sse_fast_noflags_test PRIVATE -O2 ${RECOMP_X87_FP_FLAGS})
+target_link_libraries(sse_fast_noflags_test PRIVATE softfloat recomp_base)
+add_test(NAME sse_fast_noflags COMMAND sse_fast_noflags_test)
+set_tests_properties(sse_fast_noflags PROPERTIES TIMEOUT 300)
+add_executable(sse_fast_noflags_mutation_111 sse_fast_test.cpp "${RECOMP_ROOT}/src/x86/sse.cpp")
+target_include_directories(sse_fast_noflags_mutation_111 PRIVATE "${RECOMP_ROOT}/src")
+target_compile_features(sse_fast_noflags_mutation_111 PRIVATE cxx_std_20)
+target_compile_definitions(sse_fast_noflags_mutation_111 PRIVATE RECOMP_SSE_FLAGS_UNOBSERVED=1
+                           RECOMP_X86_MUTATION=111)
+target_compile_options(sse_fast_noflags_mutation_111 PRIVATE -O2 ${RECOMP_X87_FP_FLAGS})
+target_link_libraries(sse_fast_noflags_mutation_111 PRIVATE softfloat recomp_base)
+add_test(NAME sse_fast_noflags_mutation_111 COMMAND sse_fast_noflags_mutation_111 400000)
+# The same built with each planted bug of those fast paths
+# (RECOMP_X86_MUTATION 101-110, x86/sse.h), which it must catch.
+foreach(_m RANGE 101 110)
+  add_executable(sse_fast_mutation_${_m} sse_fast_test.cpp "${RECOMP_ROOT}/src/x86/sse.cpp")
+  target_include_directories(sse_fast_mutation_${_m} PRIVATE "${RECOMP_ROOT}/src")
+  target_compile_features(sse_fast_mutation_${_m} PRIVATE cxx_std_20)
+  target_compile_definitions(sse_fast_mutation_${_m} PRIVATE RECOMP_X86_MUTATION=${_m})
+  target_compile_options(sse_fast_mutation_${_m} PRIVATE -O2 ${RECOMP_X87_FP_FLAGS})
+  target_link_libraries(sse_fast_mutation_${_m} PRIVATE softfloat recomp_base)
+  add_test(NAME sse_fast_mutation_${_m} COMMAND sse_fast_mutation_${_m} 400000)
+endforeach()
+
 # sse_rsqrt_test: RSQRTPS is the correctly rounded 1/sqrt(x), checked
 # exhaustively with exact arithmetic (the host oracle cannot: CPUs differ);
 # portable.

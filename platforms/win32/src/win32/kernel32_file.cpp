@@ -491,6 +491,40 @@ HLE("kernel32.dll", GetFileSize, 2) {
   return uint32_t(st.st_size);
 }
 
+// GetFileSizeEx(handle, LARGE_INTEGER* size).
+HLE("kernel32.dll", GetFileSizeEx, 2) {
+  int fd = FdOf(Arg(c, 0));
+  struct stat st;
+  if (fd < 0 || fstat(fd, &st) != 0) {
+    SetLastError(kErrorInvalidHandle);
+    return 0;
+  }
+  Wr64(Arg(c, 1), uint64_t(st.st_size));
+  return 1;
+}
+
+// ---- console -------------------------------------------------------------
+// A GUI process has no console: its standard handles, when it has any,
+// are files or pipes. GetConsoleMode is how a C runtime tells a console
+// from a file, and it fails for those with ERROR_INVALID_HANDLE, so the
+// console paths (WriteConsoleW, ReadConsoleW) are never taken; they fail
+// the same way if called.
+HLE("kernel32.dll", GetConsoleMode, 2) {
+  SetLastError(kErrorInvalidHandle);
+  return 0;
+}
+HLE("kernel32.dll", WriteConsoleW, 5) {
+  SetLastError(kErrorInvalidHandle);
+  return 0;
+}
+HLE("kernel32.dll", ReadConsoleW, 5) {
+  SetLastError(kErrorInvalidHandle);
+  return 0;
+}
+// Without a console the code pages are the system's OEM one.
+HLE("kernel32.dll", GetConsoleOutputCP, 0) { return 437; }
+HLE("kernel32.dll", GetConsoleCP, 0) { return 437; }
+
 HLE("kernel32.dll", GetFileTime, 4) {
   int fd = FdOf(Arg(c, 0));
   struct stat st;
@@ -725,22 +759,33 @@ HLE("kernel32.dll", GetTempFileNameA, 4) {
 
 // ---- find ------------------------------------------------------------------
 
-void FillFindData(uint32_t fd, const std::string& host_dir, const std::string& name) {
+// WIN32_FIND_DATAA (320 bytes) or WIN32_FIND_DATAW (592): the same
+// fields, then cFileName[260] and cAlternateFileName[14] in CHARs or WCHARs.
+void FillFindData(uint32_t fd, const std::string& host_dir, const std::string& name,
+                  bool wide = false) {
   struct stat st{};
   stat((host_dir + "/" + name).c_str(), &st);
-  std::memset(GPtr(fd), 0, 320);
+  std::memset(GPtr(fd), 0, wide ? 592 : 320);
   Wr32(fd + 0, AttributesOf(st, name));
   PutFileTime(fd + 4, platform::StatModifyTime(st));   // creation
   PutFileTime(fd + 12, platform::StatAccessTime(st));  // access
   PutFileTime(fd + 20, platform::StatModifyTime(st));  // write
   Wr32(fd + 28, uint32_t(uint64_t(st.st_size) >> 32));
   Wr32(fd + 32, uint32_t(st.st_size));
-  PutStr(fd + 44, name.substr(0, 259));  // cFileName
+  if (wide) {
+    std::u16string w = Widen(name.substr(0, 259));  // names are Windows-1252
+    std::memcpy(GPtr(fd + 44), w.data(), w.size() * 2);
+  } else {
+    PutStr(fd + 44, name.substr(0, 259));  // cFileName
+  }
   // cAlternateFileName (8.3) left empty.
 }
 
-HLE("kernel32.dll", FindFirstFileA, 2) {
-  std::string pattern = AbsGuest(GStr(Arg(c, 0)));
+// Opens a search for `pattern` (a guest path whose last component may hold
+// wildcards) and fills the first entry; INVALID_HANDLE_VALUE and
+// ERROR_FILE_NOT_FOUND if nothing matches.
+uint32_t FindFirst(const std::string& guest_pattern, uint32_t fd, bool wide) {
+  std::string pattern = AbsGuest(guest_pattern);
   size_t s = pattern.find_last_of('\\');
   std::string gdir = pattern.substr(0, s), mask = pattern.substr(s + 1);
   if (gdir.size() == 2) gdir += '\\';
@@ -760,13 +805,13 @@ HLE("kernel32.dll", FindFirstFileA, 2) {
     SetLastError(kErrorFileNotFound);
     return kInvalidHandle;
   }
-  FillFindData(Arg(c, 1), f->entries[0].first, f->entries[0].second);
+  FillFindData(fd, f->entries[0].first, f->entries[0].second, wide);
   f->next = 1;
   return NewHandle(f);
 }
 
-HLE("kernel32.dll", FindNextFileA, 2) {
-  auto o = GetHandle(Arg(c, 0));
+uint32_t FindNext(uint32_t h, uint32_t fd, bool wide) {
+  auto o = GetHandle(h);
   if (!o || o->type != KObject::Type::Find) {
     SetLastError(kErrorInvalidHandle);
     return 0;
@@ -777,9 +822,29 @@ HLE("kernel32.dll", FindNextFileA, 2) {
     return 0;
   }
   const auto& [hdir, name] = f->entries[f->next++];
-  FillFindData(Arg(c, 1), hdir, name);
+  FillFindData(fd, hdir, name, wide);
   return 1;
 }
+
+HLE("kernel32.dll", FindFirstFileA, 2) { return FindFirst(GStr(Arg(c, 0)), Arg(c, 1), false); }
+HLE("kernel32.dll", FindNextFileA, 2) { return FindNext(Arg(c, 0), Arg(c, 1), false); }
+
+// FindFirstFileExW(name, info level, data, search op, filter, flags). Both
+// info levels (FindExInfoStandard, FindExInfoBasic) fill the same fields
+// here, as cAlternateFileName stays empty anyway. The search ops only
+// narrow what a file system may return (FindExSearchLimitToDirectories is
+// advisory), and FIND_FIRST_EX_CASE_SENSITIVE does not apply to guest
+// paths, which are case-insensitive.
+HLE("kernel32.dll", FindFirstFileExW, 6) {
+  uint32_t level = Arg(c, 1);
+  if (level > 1 || Arg(c, 3) > 1) {  // FindExSearchLimitToDevices: not supported
+    SetLastError(kErrorInvalidParameter);
+    return kInvalidHandle;
+  }
+  return FindFirst(WidePath(Arg(c, 0)), Arg(c, 2), true);
+}
+HLE("kernel32.dll", FindFirstFileW, 2) { return FindFirst(WidePath(Arg(c, 0)), Arg(c, 1), true); }
+HLE("kernel32.dll", FindNextFileW, 2) { return FindNext(Arg(c, 0), Arg(c, 1), true); }
 
 HLE("kernel32.dll", FindClose, 1) {
   return CloseHandleValue(Arg(c, 0)) ? 1 : 0;

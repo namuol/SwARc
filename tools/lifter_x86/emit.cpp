@@ -3609,6 +3609,8 @@ void InsnEmitter::Emit() {
 
 std::string FnName(uint64_t va) { return Fmt("f_%08llX", U(va)); }
 
+void CacheXmm(std::string* out, size_t at);  // below
+
 void Emitter::EmitFunction(const Function& f, std::string* out,
                            std::set<uint64_t>* refs, EmitStats* stats) {
   std::string& o = *out;
@@ -3624,6 +3626,7 @@ void Emitter::EmitFunction(const Function& f, std::string* out,
     o += "void " + FnName(f.entry) + "(::recomp::Ctx& c) { " + host->second.symbol + "(c, " +
          Hex(host->second.module_base) + "); }\n";
   }
+  const size_t body_at = o.size();
   o += "void " + FnName(f.entry) + (p_.replaced.count(f.entry) ? "_lifted" : "") +
        "(::recomp::Ctx& c) {\n  LIFT_ENTER\n";
   // Functions that register an SEH frame (32-bit: write fs:[0]) can be
@@ -3735,7 +3738,56 @@ void Emitter::EmitFunction(const Function& f, std::string* out,
          "    ::recomp::Resume(c, r);\n"
          "    return;\n"
          "  }\n";
+  if (!resumable && !p_.x64) CacheXmm(&o, body_at);
   o += "}\n\n";
+}
+
+// XMM registers in locals (ARCHITECTURE.md, "SSE/SSE2"), like the general
+// registers: a function's body from `at` gets xN for each c.xmm[N] it
+// uses, loaded after LIFT_ENTER, written back at every LIFT_SPILL and
+// read again at every LIFT_RELOAD (calls, returns, tail calls, traps), so
+// what runs outside the function sees them in Ctx as before. Guest stores
+// go through uint8_t* and may alias any memory, Ctx included, so with the
+// registers in Ctx the compiler reloads them after each one. Not for
+// functions that FXSAVE/FXRSTOR (their helpers read Ctx) or that can be
+// resumed into (SEH, setjmp), nor (yet) x64 images.
+void CacheXmm(std::string* out, size_t at) {
+  std::string body = out->substr(at);
+  for (const char* k : {"Fxsave", "Fxrstor", "Xsave", "Xrstor"})
+    if (body.find(k) != std::string::npos) return;
+  bool used[8] = {};
+  std::string r;
+  r.reserve(body.size());
+  for (size_t i = 0; i < body.size();) {
+    if (body.compare(i, 6, "c.xmm[") == 0 && i + 7 < body.size() && body[i + 7] == ']' &&
+        body[i + 6] >= '0' && body[i + 6] <= '7') {
+      const int n = body[i + 6] - '0';
+      used[n] = true;
+      r += 'x';
+      r += char('0' + n);
+      i += 8;
+    } else {
+      r += body[i++];
+    }
+  }
+  std::string decl, spill, reload;
+  for (int n = 0; n < 8; n++) {
+    if (!used[n]) continue;
+    decl += Fmt(" ::recomp::Xmm x%d = c.xmm[%d];", n, n);
+    spill += Fmt(" c.xmm[%d] = x%d;", n, n);
+    reload += Fmt(" x%d = c.xmm[%d];", n, n);
+  }
+  if (decl.empty()) return;
+  auto replace_all = [](std::string& s, const std::string& from, const std::string& to) {
+    for (size_t p = s.find(from); p != std::string::npos; p = s.find(from, p + to.size()))
+      s.replace(p, from.size(), to);
+  };
+  replace_all(r, "LIFT_SPILL;", "LIFT_SPILL;" + spill);
+  replace_all(r, "LIFT_RELOAD;", "LIFT_RELOAD;" + reload);
+  const size_t e = r.find("  LIFT_ENTER\n");
+  if (e == std::string::npos) return;
+  r.insert(e + 13, " " + decl + "\n");
+  out->replace(at, std::string::npos, r);
 }
 
 // Polling loops (ARCHITECTURE.md, "Polling loops"): up to 8 instructions

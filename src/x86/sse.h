@@ -18,6 +18,8 @@
 // Only the forms the supported games use are implemented; the lifter
 // reports the rest as unimplemented.
 
+#include <bit>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -25,9 +27,29 @@
 
 #include "x86/ctx.h"
 
+// RECOMP_X86_MUTATION=<n> plants a known bug in a fast path (sse.cpp) so
+// tests/x86/sse_fast_test can show it catches it; never set it elsewhere.
+#ifndef RECOMP_X86_MUTATION
+#define RECOMP_X86_MUTATION 0
+#endif
+
 namespace recomp::sse {
 
 inline constexpr uint32_t kMxcsrDefault = 0x1F80;  // all masked, RN
+
+// Out-of-line slow paths (and CheckAligned's fatal check) keep the
+// caller's general registers (clang's preserve_most): hot lifted float
+// code, whose XMM lanes live in them, keeps its values in registers across
+// each possible call instead of saving them around it. Declarations and
+// definitions carry it alike. (preserve_all, which would keep the vector
+// registers too, broke sse_fast_test on arm64.)
+#if defined(__clang__)
+#define RECOMP_SSE_SLOW __attribute__((preserve_most))
+#else
+#define RECOMP_SSE_SLOW
+#endif
+
+
 
 template <typename T>
 inline T Lane(const Xmm& x, int i) {
@@ -51,34 +73,421 @@ inline void St(uint8_t* B, uint64_t a, const Xmm& x, int bytes) {
 }
 // Legacy-SSE m128 operands other than movups/movupd/movdqu must be 16-byte
 // aligned (#GP otherwise): fatal, naming the instruction.
-void CheckAligned(Ctx& c, uint64_t a, uint64_t va);
+// The check inline, the fatal error out of line.
+[[noreturn]] RECOMP_SSE_SLOW void Misaligned(uint64_t a, uint64_t va, unsigned align);
+inline void CheckAligned(Ctx& c, uint64_t a, uint64_t va) {
+  (void)c;
+  if (a & 15) [[unlikely]] Misaligned(a, va, 16);
+}
 // The same for VEX moves that require `align` (16 or 32) bytes.
-void CheckAligned(Ctx& c, uint64_t a, uint64_t va, unsigned align);
+inline void CheckAligned(Ctx& c, uint64_t a, uint64_t va, unsigned align) {
+  (void)c;
+  if (a & (align - 1)) [[unlikely]] Misaligned(a, va, align);
+}
 
 // ---- floating point ---------------------------------------------------
 enum Op : uint8_t { kAdd, kSub, kMul, kDiv };
 
+// RECOMP_SSE_FLAGS_UNOBSERVED=1: a game's build may set it for its lifted
+// code when it has shown that no guest code's behaviour depends on
+// MXCSR's status flags (bits 0-5): every STMXCSR, FXSAVE and XSAVE in the
+// binary either masks them off, only stores them to be loaded back
+// unchanged, or runs only while handling an unmasked float exception
+// (impossible under condition (1) below). The record of that check
+// belongs with the game. Then ADD/SUB/MUL/DIV take the fast path for
+// every operand under condition (1), but a NaN result: IEEE 754 defines
+// all of them as the correctly rounded result, and with the host in its
+// default environment (no flush to zero) and MXCSR the default (no FTZ,
+// no DAZ) the host's result has the same bits as SSE's, signed zeros,
+// infinities and denormals included. Only NaNs differ (x86's default NaN
+// is negative, ARM's positive; operand NaN propagation rules differ), so
+// a NaN result takes the exact model. The status flags are left as they
+// were (wrong, but unobserved by that check).
+#ifndef RECOMP_SSE_FLAGS_UNOBSERVED
+#define RECOMP_SSE_FLAGS_UNOBSERVED 0
+#endif
+
+namespace fast {
+
+constexpr bool Mutated(int n) { return RECOMP_X86_MUTATION == n; }
+
+// ---- host fast paths (inline in lifted code) ------------------------------
+//
+// ADD/SUB/MUL/DIV (PS/PD/SS/SD): the common case is computed with host float/double arithmetic, which
+// gives the same bits as x86 there, and everything else falls back to the
+// exact model (ArithExact, sse.cpp). Conditions (checked per instruction and per lane):
+//
+//   (1) MXCSR is the default but for its flags: every exception masked,
+//       round to nearest even, FTZ and DAZ off ((mxcsr & 0xFFC0) == 0x1F80).
+//       The host runs in its default environment too (round to nearest
+//       even, no flush to zero, no traps: platform::HostFpProblem, checked
+//       on every guest thread), and this file is built with
+//       RECOMP_X87_FP_FLAGS (no contraction into FMA, no fast-math).
+//   (2) Each operand is a zero or "in range": 2^(emin+2p) <= |x| < 2^emax,
+//       i.e. 2^-78 <= |x| < 2^127 (float), 2^-916 <= |x| < 2^1023 (double).
+//       Excluded: NaN, infinity, denormal and tiny or huge operands.
+//   (3) The host result r is in range, or a zero that is exact: any zero of
+//       ADD/SUB (x + y rounds to zero only when it is exactly zero: a
+//       nonzero exact sum of in-range operands is a multiple of the smaller
+//       one's ulp, at least 2^(emin+p+1), far above the denormals), a zero
+//       of MUL with a zero operand, of DIV with a zero dividend.
+//
+// Then the result: IEEE 754 defines +, -, *, / as the correctly rounded
+// exact result, and SSE's are IEEE's in round to nearest even; signed
+// zeros follow the same rules (x - x = +0, (-0) + (-0) = -0, the sign of a
+// product or quotient is the XOR). The host computes the same.
+//
+// And the flags: no invalid (operands are finite, and 0/0 and inf-inf
+// cannot arise: 0/0 gives a NaN result, rejected by (3)); no denormal
+// operand (2); no divide-by-zero (x/0 gives inf or NaN, rejected); no
+// overflow (r is finite: a rounded result beyond the largest finite value
+// is inf in round to nearest); no underflow (r is normal, and x86 detects
+// tininess after rounding; the zeros in (3) are exact). Only inexact
+// remains, set iff the rounding changed the value, which is computed
+// exactly with error-free transformations:
+//
+//   ADD/SUB: TwoSum (Knuth) gives e = (x + y) - r exactly in round to
+//     nearest for any finite operands without overflow; |x|, |y| < 2^emax
+//     keeps every intermediate finite. Inexact iff e != 0.
+//   MUL: e = fma(x, y, -r) = xy - r exactly when that is representable.
+//     xy is a multiple of q = ulp(x) ulp(y) = 2^(Ex+Ey-2p+2); r has
+//     exponent Er <= Ex+Ey+1 and |e| <= ulp(r)/2 = 2^(Er-p), so e needs at
+//     most p bits; and Er >= emin+2p (3) gives Ex+Ey >= emin+2p-1, so q >=
+//     2^(emin+1) is normal and e is representable. Inexact iff e != 0.
+//   DIV: e = fma(-r, y, x) = x - ry exactly when representable. x and ry
+//     are multiples of 2^(Er+Ey-2p+2) (Ex >= Er+Ey); |e| = |y||x/y - r| <
+//     2^(Ey+1) 2^(Er-p) needs at most p-1 bits; |x| >= 2^(emin+2p) (2)
+//     gives Er+Ey >= emin+2p-1, so the quantum is normal. Inexact iff e !=
+//     0 (e = 0 is x = ry, an exact quotient).
+//
+// PE is sticky: once set, only LDMXCSR (or XRSTOR/FXRSTOR) clears it, and
+// no arithmetic does. So when it is already set the instruction leaves it
+// set whatever it computes, and the error term is not computed at all.
+//
+// tests/x86/sse_fast_test runs random and edge-case operands through both
+// paths and compares results and MXCSR bit for bit; each planted bug
+// (RECOMP_X86_MUTATION 101-106) must make it fail. Inline here, so each
+// call site (its op, format and lane count constants) compiles to a few
+// host instructions; lifted code is built with RECOMP_X87_FP_FLAGS.
+
+template <bool D>
+struct Host;
+template <>
+struct Host<false> {
+  using F = float;
+  static constexpr int kShift = 23;
+  // Biased exponents: 2^-78 = emin + 2p (-126 + 48), and below 2^127.
+  static constexpr uint32_t kMinExp = 127 - 78, kMaxExp = 127 + 126;
+};
+template <>
+struct Host<true> {
+  using F = double;
+  static constexpr int kShift = 52;
+  // 2^-916 = emin + 2p (-1022 + 106), and below 2^1023.
+  static constexpr uint64_t kMinExp = 1023 - 916, kMaxExp = 1023 + 1022;
+};
+
+template <bool D>
+using Bits = std::conditional_t<D, uint64_t, uint32_t>;
+
+template <bool D>
+inline bool IsZeroBits(Bits<D> v) {
+  return !(v & ~(Bits<D>(1) << (sizeof(Bits<D>) * 8 - 1)));
+}
+
+// Zero, or 2^(emin+2p) <= |v| < 2^emax (condition (2)).
+template <bool D>
+inline bool InRange(Bits<D> v) {
+  using U = Bits<D>;
+  if (IsZeroBits<D>(v)) return true;
+  U e = (v >> Host<D>::kShift) & (D ? 0x7FF : 0xFF);
+  U lo = Mutated(102) ? 1 : Host<D>::kMinExp;
+  return e >= lo && e <= Host<D>::kMaxExp;
+}
+
+// One lane on the host: false (nothing written) outside the conditions.
+// `inexact` null: PE is already set, so the error term is not needed.
+template <bool D>
+inline bool FastLane(Op op, Bits<D> a, Bits<D> b, Bits<D>* out, bool* inexact) {
+  using U = Bits<D>;
+  using F = typename Host<D>::F;
+  if constexpr (RECOMP_SSE_FLAGS_UNOBSERVED) {
+    const F x = std::bit_cast<F>(a), y = std::bit_cast<F>(b);
+    // x - y is x + (-y) in IEEE 754, signed zeros included.
+    const F r = op == kAdd ? x + y : op == kSub ? x - y : op == kMul ? x * y : x / y;
+    if (r != r && !Mutated(111)) return false;  // NaN: the exact model's bits
+    *out = std::bit_cast<U>(r);
+    (void)inexact;  // flags unobserved: PE is not maintained
+    return true;
+  }
+  if (!InRange<D>(a) || !InRange<D>(b)) return false;
+  const F x = std::bit_cast<F>(a);
+  F y = std::bit_cast<F>(b), r, e;
+  const bool want_e = inexact != nullptr;
+  e = 0;
+  switch (op) {
+    case kAdd:
+    case kSub: {
+      if (op == kSub) y = -y;  // x - y is x + (-y), signed zeros included
+      r = x + y;
+      if (want_e) {
+        const F yv = r - x, xv = r - yv;
+        e = Mutated(104) ? r - x - y : (x - xv) + (y - yv);
+      }
+      break;
+    }
+    case kMul:
+      r = x * y;
+      if (want_e) e = std::fma(x, y, -r);
+      break;
+    default:
+      r = x / y;
+      if (want_e) e = std::fma(-r, y, x);
+      break;
+  }
+  const U rb = std::bit_cast<U>(r);
+  if (IsZeroBits<D>(rb)) {
+    // An exact zero only (3).
+    if (op == kMul && !Mutated(103) && !IsZeroBits<D>(a) && !IsZeroBits<D>(b)) return false;
+    if (op == kDiv && !IsZeroBits<D>(a)) return false;
+  } else if (!InRange<D>(rb)) {
+    return false;
+  }
+  *out = rb;
+  if (inexact) *inexact = Mutated(101) ? false : e != 0;
+  return true;
+}
+
+// The whole instruction on the host, or false (nothing changed) if any
+// lane is outside the conditions.
+template <bool D>
+inline bool FastArith(Ctx& c, Op op, int lanes, Xmm& d, const Xmm& s) {
+  using U = Bits<D>;
+  if ((c.mxcsr & 0xFFC0) != kMxcsrDefault) return false;
+  U r[16 / sizeof(U)];
+  bool inexact = false;
+  const bool pe_set = Mutated(106) || (c.mxcsr & 0x20) != 0;  // 106: always skipped
+  for (int i = 0; i < lanes; i++) {
+    bool ix = false;
+    if (!FastLane<D>(op, Lane<U>(d, i), Lane<U>(s, i), &r[i], pe_set ? nullptr : &ix)) return false;
+    inexact |= ix;
+  }
+  for (int i = 0; i < lanes; i++) SetLane<U>(d, i, r[i]);
+  if (inexact) c.mxcsr |= 0x20;  // PE
+  return true;
+}
+
+// COMISS/COMISD: neither operand a NaN nor a denormal, so the comparison
+// raises no flag and DAZ changes nothing: the result alone, with no MXCSR
+// bookkeeping. Exact by construction (integer ordering of the bits, no
+// host floats): 0 greater, 1 less, 2 equal; -1 outside the condition.
+template <bool D>
+inline int FastComi(const Xmm& x, const Xmm& y) {
+  using U = Bits<D>;
+  constexpr U kSign = U(1) << (sizeof(U) * 8 - 1);
+  constexpr U kExp = D ? 0x7FF0000000000000ull : 0x7F800000u;
+  const U a = Lane<U>(x, 0), b = Lane<U>(y, 0);
+  auto special = [&](U v) {  // NaN, or (unless planted bug 105) denormal
+    const U e = v & kExp, f = v & ~(kSign | kExp);
+    return (e == kExp && f) || (!Mutated(105) && !e && f);
+  };
+  if (special(a) || special(b)) return -1;
+  if (!((a | b) & ~kSign)) return 2;  // zeros of either sign are equal
+  const bool na = a & kSign, nb = b & kSign;
+  if (na != nb) return na ? 1 : 0;
+  if (a == b) return 2;
+  return ((a < b) != na) ? 1 : 0;  // magnitude order flips for negatives
+}
+
+
+// ---- conversions (inline in lifted code) -----------------------------------
+//
+// Under condition (1) above (MXCSR the default but for its flags; the host
+// in its default environment), checked per instruction, and per lane the
+// conditions below; otherwise the exact model (the ...Exact functions).
+//
+//   int32 -> float (CVTDQ2PS, CVTSI2SS) and int32 -> double (CVTSI2SD): IEEE
+//     754's conversion is the correctly rounded value in round to nearest
+//     even, as SSE's is; the host's int -> float gives it. To double it is
+//     exact. Inexact iff the float is not v: int64_t(r) != v, where r is an
+//     integer with |r| <= 2^31, exactly convertible to int64. Nothing else
+//     can arise (the result is a normal number or zero).
+//   float/double -> int32 (CVT(T)SS2SI, CVT(T)SD2SI, CVT(T)PS2DQ,
+//     CVT(T)PD2DQ): when |x| < 2^30 (no NaN or infinity: their exponent is
+//     the largest), truncating or rounding to nearest even stays within
+//     int32, so there is no invalid operation, and std::trunc and
+//     std::nearbyint (the default environment rounds to nearest even) give
+//     the result exactly. Inexact iff it differs from x (compared as
+//     double: both exact there). Denormal operands give 0 and inexact here
+//     too; these conversions raise no DE in the model (DAZ only, off by (1)).
+//   float -> double (CVTSS2SD, CVTPS2PD): exact for any operand but NaNs
+//     (quieting, IE for an SNaN) and denormals (DE), which are left out.
+//   double -> float (CVTSD2SS, CVTPD2PS): for an operand that is a zero (an
+//     exact zero of the same sign) or has 2^-126 <= |d| (normal as a float,
+//     so not tiny before or after rounding: no underflow) and is finite and
+//     not NaN, the host's correctly rounded conversion; taken when the
+//     result is finite (in round to nearest a finite result means no
+//     overflow). Inexact iff double(r) != d.
+//
+// tests/x86/sse_fast_test compares them with the exact paths bit for bit
+// (results and MXCSR); planted bugs 107-110 must make it fail.
+
+inline bool DefaultMxcsr(const Ctx& c) {
+  return (c.mxcsr & 0xFFC0) == kMxcsrDefault;
+}
+
+inline bool FastIntToF(Ctx& c, bool dbl, int32_t v, Xmm& d) {
+  if (!DefaultMxcsr(c)) return false;
+  if (dbl) {
+    SetLane<uint64_t>(d, 0, std::bit_cast<uint64_t>(double(v)));
+    return true;
+  }
+  const float r = float(v);
+  SetLane<uint32_t>(d, 0, std::bit_cast<uint32_t>(r));
+  if (int64_t(r) != v && !Mutated(107)) c.mxcsr |= 0x20;  // PE
+  return true;
+}
+
+inline bool FastCvtdq2ps(Ctx& c, Xmm& d, const Xmm& s) {
+  if (!DefaultMxcsr(c)) return false;
+  Xmm r;
+  bool inexact = false;
+  for (int i = 0; i < 4; i++) {
+    const int32_t v = Lane<int32_t>(s, i);
+    const float f = float(v);
+    inexact |= int64_t(f) != v;
+    SetLane<uint32_t>(r, i, std::bit_cast<uint32_t>(f));
+  }
+  d = r;
+  if (inexact && !Mutated(107)) c.mxcsr |= 0x20;
+  return true;
+}
+
+// One lane to int32 without touching MXCSR: false outside the conditions.
+template <bool D>
+inline bool ToI32Lane(Bits<D> v, bool truncate, int32_t* out, bool* inexact) {
+  using F = typename Host<D>::F;
+  // |x| < 2^30: biased exponent below bias + 30 (Mutated(108): 2^31, where
+  // rounding can leave int32).
+  const Bits<D> e = (v >> Host<D>::kShift) & (D ? 0x7FF : 0xFF);
+  const Bits<D> limit = (D ? 1023 : 127) + (Mutated(108) ? 32 : 30);
+  if (e >= limit) return false;
+  const F x = std::bit_cast<F>(v);
+  const F r = truncate ? std::trunc(x) : std::nearbyint(x);
+  *out = int32_t(r);
+  *inexact = double(r) != double(x);
+  return true;
+}
+
+template <bool D>
+inline bool FastToI32(Ctx& c, Bits<D> v, bool truncate, int32_t* out) {
+  if (!DefaultMxcsr(c)) return false;
+  bool inexact;
+  if (!ToI32Lane<D>(v, truncate, out, &inexact)) return false;
+  if (inexact) c.mxcsr |= 0x20;
+  return true;
+}
+
+inline bool FastToDq(Ctx& c, bool dbl, bool truncate, Xmm& d, const Xmm& s) {
+  if (!DefaultMxcsr(c)) return false;
+  Xmm r{};
+  bool inexact = false;
+  for (int i = 0; i < (dbl ? 2 : 4); i++) {
+    int32_t v;
+    bool ix;
+    if (!(dbl ? ToI32Lane<true>(Lane<uint64_t>(s, i), truncate, &v, &ix)
+              : ToI32Lane<false>(Lane<uint32_t>(s, i), truncate, &v, &ix)))
+      return false;
+    SetLane<int32_t>(r, i, v);
+    inexact |= ix;
+  }
+  d = r;
+  if (inexact) c.mxcsr |= 0x20;
+  return true;
+}
+
+inline bool FastCvtFloat(Ctx& c, bool to_dbl, int lanes, Xmm& d, const Xmm& s) {
+  if (!DefaultMxcsr(c)) return false;
+  Xmm r = d;
+  bool inexact = false;
+  if (to_dbl) {
+    for (int i = 0; i < lanes; i++) {
+      const uint32_t a = Lane<uint32_t>(s, i);
+      const uint32_t e = (a >> 23) & 0xFF, f = a & 0x7FFFFF;
+      if (e == 0xFF && f) return false;                    // NaN
+      if (e == 0 && f && !Mutated(110)) return false;      // denormal: DE
+      SetLane<uint64_t>(r, i, std::bit_cast<uint64_t>(double(std::bit_cast<float>(a))));
+    }
+  } else {
+    for (int i = 0; i < lanes; i++) {
+      const uint64_t a = Lane<uint64_t>(s, i);
+      const uint64_t e = (a >> 52) & 0x7FF;
+      float out;
+      if (!(a & ~(uint64_t(1) << 63))) {
+        out = (a >> 63) ? -0.0f : 0.0f;  // a zero: the zero of its sign, exact
+      } else {
+        // 2^-126 <= |d| (Mutated(109): any normal double, tiny ones too),
+        // finite, not NaN.
+        if (e == 0x7FF || e < (Mutated(109) ? 1 : 1023 - 126)) return false;
+        const double x = std::bit_cast<double>(a);
+        out = float(x);
+        if (!std::isfinite(out)) return false;  // overflow
+        inexact |= double(out) != x;
+      }
+      SetLane<uint32_t>(r, i, std::bit_cast<uint32_t>(out));
+    }
+    if (lanes == 2) SetLane<uint64_t>(r, 1, 0);  // CVTPD2PS zeroes the top
+  }
+  d = r;
+  if (inexact) c.mxcsr |= 0x20;
+  return true;
+}
+
+}  // namespace fast
+
 // d = d op s, lane-wise: `lanes` lanes of double (dbl) or float. Scalar
-// forms pass lanes = 1 and keep the upper lanes of d.
-void Arith(Ctx& c, Op op, bool dbl, int lanes, Xmm& d, const Xmm& s,
-           uint64_t va);
+// forms pass lanes = 1 and keep the upper lanes of d. The fast path
+// (above) inline; ArithExact the exact model for everything else.
+RECOMP_SSE_SLOW void ArithExact(Ctx& c, Op op, bool dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va);
+inline void Arith(Ctx& c, Op op, bool dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va) {
+  if (dbl ? fast::FastArith<true>(c, op, lanes, d, s) : fast::FastArith<false>(c, op, lanes, d, s))
+    return;
+  // Copies, here and in the wrappers below: lifted code keeps XMM
+  // registers in locals, and an address passed out of line would make the
+  // compiler keep them in memory.
+  Xmm t = d;
+  const Xmm u = s;
+  ArithExact(c, op, dbl, lanes, t, u, va);
+  d = t;
+}
 
 // CMPPS/PD/SS/SD: each lane of d becomes all ones if `d pred s` holds,
 // else zero. pred is AVX's 5-bit predicate (0 EQ_OQ, 1 LT_OS, 2 LE_OS,
 // 3 UNORD_Q, 4 NEQ_UQ, 5 NLT_US, 6 NLE_US, 7 ORD_Q, 8 EQ_UQ, ...
 // 15 TRUE_UQ; 16-31 the same with signalling flipped); legacy SSE passes
 // imm8 & 7.
-void Cmp(Ctx& c, bool dbl, int lanes, Xmm& d, const Xmm& s, uint8_t pred,
+RECOMP_SSE_SLOW void Cmp(Ctx& c, bool dbl, int lanes, Xmm& d, const Xmm& s, uint8_t pred,
          uint64_t va);
 
 // (U)COMISS/SD of the low lanes: 0 greater, 1 less, 2 equal, 3 unordered
 // (the caller sets ZF/PF/CF). `ordered` = COMIS (invalid on QNaN too).
-int Comi(Ctx& c, bool dbl, bool ordered, const Xmm& a, const Xmm& b,
-         uint64_t va);
+RECOMP_SSE_SLOW int ComiExact(Ctx& c, bool dbl, bool ordered, const Xmm& a, const Xmm& b, uint64_t va);
+inline int Comi(Ctx& c, bool dbl, bool ordered, const Xmm& a, const Xmm& b, uint64_t va) {
+  int r = dbl ? fast::FastComi<true>(a, b) : fast::FastComi<false>(a, b);
+  if (r >= 0) return r;
+  const Xmm x = a, y = b;
+  return ComiExact(c, dbl, ordered, x, y, va);
+}
 
 // SQRTSD/SQRTSS/SQRTPD/SQRTPS: d = sqrt(s), lane-wise; scalar forms keep
 // the upper lanes of d.
-void Sqrt(Ctx& c, bool dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va);
+RECOMP_SSE_SLOW void SqrtExact(Ctx& c, bool dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va);
+inline void Sqrt(Ctx& c, bool dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va) {
+  Xmm t = d;
+  const Xmm u = s;
+  SqrtExact(c, dbl, lanes, t, u, va);
+  d = t;
+}
 
 // RSQRTPS: d = 1/sqrt(s) in all four float lanes (see above). No flags:
 // ±0 and denormals give ±inf, negative values the default NaN, +inf +0,
@@ -90,7 +499,14 @@ uint32_t RsqrtLane(uint32_t x);
 void Cvtsi2sd(Xmm& d, int32_t v);
 
 // CVT(T)SS2SI / CVT(T)SD2SI of the low lane of s.
-uint32_t CvtToI32(Ctx& c, bool dbl, const Xmm& s, bool truncate, uint64_t va);
+RECOMP_SSE_SLOW uint32_t CvtToI32Exact(Ctx& c, bool dbl, const Xmm& s, bool truncate, uint64_t va);
+inline uint32_t CvtToI32(Ctx& c, bool dbl, const Xmm& s, bool truncate, uint64_t va) {
+  int32_t r;
+  if (dbl ? fast::FastToI32<true>(c, Lane<uint64_t>(s, 0), truncate, &r)
+          : fast::FastToI32<false>(c, Lane<uint32_t>(s, 0), truncate, &r))
+    return uint32_t(r);
+  return CvtToI32Exact(c, dbl, s, truncate, va);
+}
 
 // CVT(T)SS2SI / CVT(T)SD2SI to a 64-bit register.
 uint64_t CvtToI64(Ctx& c, bool dbl, const Xmm& s, bool truncate, uint64_t va);
@@ -98,22 +514,42 @@ uint64_t CvtToI64(Ctx& c, bool dbl, const Xmm& s, bool truncate, uint64_t va);
 // MINSS/SD/PS/PD (max = false) and MAXSS/SD/PS/PD, lane-wise: d op s ? d : s.
 // A NaN in either operand (invalid, quiet ones too) or equal values,
 // zeros of either sign included, give s. Scalar forms keep d's upper lanes.
-void MinMax(Ctx& c, bool max, bool dbl, int lanes, Xmm& d, const Xmm& s,
-            uint64_t va);
+RECOMP_SSE_SLOW void MinMaxExact(Ctx& c, bool max, bool dbl, int lanes, Xmm& d, const Xmm& s,
+                 uint64_t va);
+inline void MinMax(Ctx& c, bool max, bool dbl, int lanes, Xmm& d, const Xmm& s,
+                   uint64_t va) {
+  Xmm t = d;
+  const Xmm u = s;
+  MinMaxExact(c, max, dbl, lanes, t, u, va);
+  d = t;
+}
 
 // CVTSS2SD / CVTPS2PD (to_dbl, 1 or 2 lanes) and CVTSD2SS / CVTPD2PS.
 // Scalar forms keep d's other lanes; CVTPD2PS zeroes its upper half.
-void CvtFloat(Ctx& c, bool to_dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va);
+RECOMP_SSE_SLOW void CvtFloatExact(Ctx& c, bool to_dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va);
+inline void CvtFloat(Ctx& c, bool to_dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va) {
+  if (fast::FastCvtFloat(c, to_dbl, lanes, d, s)) return;
+  Xmm t = d;
+  const Xmm u = s;
+  CvtFloatExact(c, to_dbl, lanes, t, u, va);
+  d = t;
+}
 
 // CVTSI2SS / CVTSI2SD of a 32-bit or 64-bit (src64) integer into the low
 // lane, rounded by MXCSR (only int64 -> double and int -> float can be
 // inexact).
-void CvtIntToF(Ctx& c, bool dbl, bool src64, uint64_t v, Xmm& d, uint64_t va);
+RECOMP_SSE_SLOW void CvtIntToFExact(Ctx& c, bool dbl, bool src64, uint64_t v, Xmm& d, uint64_t va);
+inline void CvtIntToF(Ctx& c, bool dbl, bool src64, uint64_t v, Xmm& d, uint64_t va) {
+  if (src64 || !fast::FastIntToF(c, dbl, int32_t(v), d)) CvtIntToFExact(c, dbl, src64, v, d, va);
+}
 
 // CVTTPS2DQ / CVTPS2DQ (truncate false) and CVTTPD2DQ / CVTPD2DQ (dbl,
 // two lanes into the low half, the upper one zeroed): float lanes to
 // int32, 0x80000000 for NaN and out of range (invalid).
-void CvtToDq(Ctx& c, bool dbl, bool truncate, Xmm& d, const Xmm& s, uint64_t va);
+RECOMP_SSE_SLOW void CvtToDqExact(Ctx& c, bool dbl, bool truncate, Xmm& d, const Xmm& s, uint64_t va);
+inline void CvtToDq(Ctx& c, bool dbl, bool truncate, Xmm& d, const Xmm& s, uint64_t va) {
+  if (!fast::FastToDq(c, dbl, truncate, d, s)) CvtToDqExact(c, dbl, truncate, d, s, va);
+}
 
 // F16C: VCVTPH2PS, four half lanes of s from 16-bit lane `from` (0 or 4)
 // into d's four floats; VCVTPS2PH, s's four floats into d's 16-bit lanes
@@ -152,7 +588,10 @@ inline void RsqrtSs(Xmm& d, const Xmm& s) {
 }
 
 // CVTDQ2PS: four int32 lanes to float, rounded by MXCSR.
-void Cvtdq2ps(Ctx& c, Xmm& d, const Xmm& s, uint64_t va);
+RECOMP_SSE_SLOW void Cvtdq2psExact(Ctx& c, Xmm& d, const Xmm& s, uint64_t va);
+inline void Cvtdq2ps(Ctx& c, Xmm& d, const Xmm& s, uint64_t va) {
+  if (!fast::FastCvtdq2ps(c, d, s)) Cvtdq2psExact(c, d, s, va);
+}
 
 // CVTDQ2PD: the two low int32 lanes of s as doubles (always exact).
 inline Xmm Cvtdq2pd(const Xmm& s) {
@@ -177,17 +616,20 @@ void Fxrstor(Ctx& c, const uint8_t* p, uint64_t va, int xmm_regs = 16);
 void Ldmxcsr(Ctx& c, uint32_t v, uint64_t va);
 
 // ---- bitwise and integer ----------------------------------------------
+// Bitwise operations in two 64-bit halves: the same bits as byte by byte,
+// and a register kept in a local stays two host registers (byte loops make
+// the compiler split it into 16).
 inline void And(Xmm& d, const Xmm& s) {
-  for (int i = 0; i < 16; i++) d.b[i] &= s.b[i];
+  for (int i = 0; i < 2; i++) SetLane<uint64_t>(d, i, Lane<uint64_t>(d, i) & Lane<uint64_t>(s, i));
 }
 inline void AndNot(Xmm& d, const Xmm& s) {
-  for (int i = 0; i < 16; i++) d.b[i] = uint8_t(~d.b[i] & s.b[i]);
+  for (int i = 0; i < 2; i++) SetLane<uint64_t>(d, i, ~Lane<uint64_t>(d, i) & Lane<uint64_t>(s, i));
 }
 inline void Or(Xmm& d, const Xmm& s) {
-  for (int i = 0; i < 16; i++) d.b[i] |= s.b[i];
+  for (int i = 0; i < 2; i++) SetLane<uint64_t>(d, i, Lane<uint64_t>(d, i) | Lane<uint64_t>(s, i));
 }
 inline void Xor(Xmm& d, const Xmm& s) {
-  for (int i = 0; i < 16; i++) d.b[i] ^= s.b[i];
+  for (int i = 0; i < 2; i++) SetLane<uint64_t>(d, i, Lane<uint64_t>(d, i) ^ Lane<uint64_t>(s, i));
 }
 
 // PCMPEQB/W/D: lanes of type T equal -> all ones.
