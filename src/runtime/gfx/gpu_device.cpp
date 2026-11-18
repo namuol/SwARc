@@ -23,23 +23,29 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <condition_variable>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <deque>
 #include <map>
 #include <mutex>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <vector>
 
 #include "runtime/gfx/device.h"
+#include "runtime/env.h"
 #include "runtime/gfx/shader_compile.h"
 #include "runtime/log.h"
 
 // kFfVert and kFfFrag, built from shaders/ff.*: MSL source on macOS,
 // SPIR-V words elsewhere.
 #include "ff_frag.h"
+#include "ff_frag_at.h"
+#include "ff_frag_glsl.h"
 #include "ff_vert.h"
 
 namespace recomp::gfx {
@@ -92,6 +98,20 @@ struct FsUniforms {
   int32_t mode[4];
   int32_t mode2[4];
 };
+
+// The integer state of FsUniforms that a specialised ff.frag compiles in
+// (k_color, k_alpha, k_stage, k_mode, k_mode2), plus whether it has the
+// alpha test: the stages up to the one that ends the cascade, the alpha
+// function (when tested), fog mode and table mode, flat shading and
+// specular. Stages after the end and unused fields stay zero, so states
+// that draw alike share a variant.
+struct FsVariantKey {
+  int8_t color[8][4], alpha[8][4], stage[8][3];
+  int8_t func, fog, table, flat, specular, discard;
+
+  bool operator==(const FsVariantKey& o) const { return std::memcmp(this, &o, sizeof *this) == 0; }
+};
+static_assert(sizeof(FsVariantKey) == 94, "no padding: compared and hashed as bytes");
 
 // ---- small maths on D3D row-major matrices (row vectors: v * M)
 
@@ -429,7 +449,22 @@ class GpuDevice final : public Device {
     fs.num_storage_buffers = 0;
     fs.num_samplers = 8;
     fs_ = SDL_CreateGPUShader(dev_, &fs);
-    if (!vs_ || !fs_) FatalF("gfx: compiling the fixed-function shaders: %s", SDL_GetError());
+    fs.code = reinterpret_cast<const Uint8*>(kFfFragAlphaTest);
+#if defined(__APPLE__)
+    fs.code_size = sizeof kFfFragAlphaTest - 1;
+#else
+    fs.code_size = sizeof kFfFragAlphaTest;
+#endif
+    fs_alpha_test_ = SDL_CreateGPUShader(dev_, &fs);
+    if (const char* e = Env("FF_VCACHE")) {
+      if (!std::strcmp(e, "off")) pv_mode_ = PvMode::Off;
+      if (!std::strcmp(e, "check")) pv_mode_ = PvMode::Check;
+    }
+    if (const char* e = Env("FF_VARIANTS")) {
+      if (!std::strcmp(e, "off")) variant_mode_ = VariantMode::Off;
+      if (!std::strcmp(e, "sync")) variant_mode_ = VariantMode::Sync;
+    }
+    if (!vs_ || !fs_ || !fs_alpha_test_) FatalF("gfx: compiling the fixed-function shaders: %s", SDL_GetError());
 
     for (auto [d3d, sdl] : {std::pair{Format::DXT1, SDL_GPU_TEXTUREFORMAT_BC1_RGBA_UNORM},
                             {Format::DXT3, SDL_GPU_TEXTUREFORMAT_BC2_RGBA_UNORM},
@@ -472,6 +507,12 @@ class GpuDevice final : public Device {
   }
 
   ~GpuDevice() override {
+    {
+      std::lock_guard<std::mutex> l(variant_mu_);
+      variant_quit_ = true;
+    }
+    variant_cv_.notify_all();
+    if (variant_worker_.joinable()) variant_worker_.join();
     if (!dev_) return;
     if (open_) SDL_SubmitGPUCommandBuffer(open_);
     SDL_WaitForGPUIdle(dev_);
@@ -480,6 +521,11 @@ class GpuDevice final : public Device {
     for (const Landing& w : download_pool_) SDL_ReleaseGPUTransferBuffer(dev_, w.tb);
     for (auto& [t, rd] : reads_) FinishRead(rd, nullptr, 0, Format::Unknown);
     for (auto& [k, p] : pipelines_) SDL_ReleaseGPUGraphicsPipeline(dev_, p);
+    for (auto& [k, p] : pipelines_alpha_test_) SDL_ReleaseGPUGraphicsPipeline(dev_, p);
+    for (auto& [k, v] : variants_) {
+      for (auto& [pk, p] : v.pipelines) SDL_ReleaseGPUGraphicsPipeline(dev_, p);
+      if (SDL_GPUShader* sh = v.shader.load()) SDL_ReleaseGPUShader(dev_, sh);
+    }
     for (auto& [k, p] : shader_pipelines_) SDL_ReleaseGPUGraphicsPipeline(dev_, p);
     for (auto& [k, p] : program_pipelines_) SDL_ReleaseGPUGraphicsPipeline(dev_, p);
     for (auto& [id, pr] : programs_) ReleaseProgram(pr);
@@ -493,12 +539,13 @@ class GpuDevice final : public Device {
                               dummy_array_})
       if (t) SDL_ReleaseGPUTexture(dev_, t);
     for (auto& b : blit_pool_) SDL_ReleaseGPUTexture(dev_, b.tex);
-    for (SDL_GPUBuffer* b : {vbuf_, ibuf_, pbuf_, cro_, crw_, heap_})
+    for (SDL_GPUBuffer* b : {vbuf_, ibuf_, pbuf_, cro_, crw_, heap_, pvbuf_})
       if (b) SDL_ReleaseGPUBuffer(dev_, b);
     for (SDL_GPUTransferBuffer* b : {upload_tb_, download_tb_})
       if (b) SDL_ReleaseGPUTransferBuffer(dev_, b);
     if (vs_) SDL_ReleaseGPUShader(dev_, vs_);
     if (fs_) SDL_ReleaseGPUShader(dev_, fs_);
+    if (fs_alpha_test_) SDL_ReleaseGPUShader(dev_, fs_alpha_test_);
     if (window_) SDL_ReleaseWindowFromGPUDevice(dev_, window_);
     SDL_DestroyGPUDevice(dev_);
   }
@@ -561,6 +608,7 @@ class GpuDevice final : public Device {
     t.levels = levels;
     t.fmt = fmt;
     t.rt = rt;
+    t.alpha_tracked = !rt && !IsFloat(fmt) && levels <= 32;
     SDL_GPUTextureCreateInfo ti{};
     ti.type = SDL_GPU_TEXTURETYPE_2D;
     ti.format = GpuFormat(fmt);
@@ -612,6 +660,7 @@ class GpuDevice final : public Device {
     int w = c.right - c.left, h = c.bottom - c.top;
     if (w <= 0 || h <= 0) return;
     if (Pending(it->second.tex)) Flush();
+    NoteAlpha(it->second, 0, c, uint8_t(argb >> 24));
     std::vector<uint32_t> px(size_t(w) * h, argb);
     QueueUpload(it->second.tex, 0, c.left, c.top, w, h, px.data(), uint32_t(w) * 4,
                 uint32_t(h), uint32_t(w) * 4);
@@ -633,6 +682,8 @@ class GpuDevice final : public Device {
     const uint8_t* s = static_cast<const uint8_t*>(src);
     if (IsCompressed(t.fmt)) {
       uint32_t row = RowPitch(t.fmt, uint32_t(w)), rows = RowCount(t.fmt, uint32_t(h));
+      if (layer == 0 && t.alpha_tracked)
+        NoteAlpha(it->second, level, c, BlockMinAlpha(t.fmt, s, pitch, row, rows));
       QueueUpload(t.tex, level, c.left, c.top, w, h, s, pitch, rows, row, false, true, layer);
       return;
     }
@@ -643,8 +694,66 @@ class GpuDevice final : public Device {
     }
     std::vector<uint32_t> px(size_t(w) * h);
     ConvertToArgb(s, pitch, t.fmt, w, h, px.data());
+    if (layer == 0 && t.alpha_tracked) {
+      uint32_t lo = 0xFF000000u;
+      for (uint32_t v : px) lo = std::min(lo, v & 0xFF000000u);
+      NoteAlpha(it->second, level, c, uint8_t(lo >> 24));
+    }
     QueueUpload(t.tex, level, c.left, c.top, w, h, px.data(), uint32_t(w) * 4, uint32_t(h),
                 uint32_t(w) * 4, false, false, layer);
+  }
+
+  // Texel alpha `lo` written to `r` of `level` (Tex::alpha_min).
+  void NoteAlpha(auto& t, int level, const Rect& r, uint8_t lo) {  // t: a Tex
+    if (!t.alpha_tracked) return;
+    if (lo < t.alpha_min) {
+      t.alpha_min = lo;
+      fs_dirty_ = true;
+    }
+    const uint32_t bit = 1u << level;
+    if (!(t.alpha_levels & bit) && r.left == 0 && r.top == 0 &&
+        r.right == LevelSize(t.w, level) && r.bottom == LevelSize(t.h, level)) {
+      t.alpha_levels |= bit;
+      fs_dirty_ = true;
+    }
+  }
+
+  // The lowest alpha a block-compressed rectangle can decode to: `rows`
+  // rows of `row` bytes of blocks. DXT1: 0 if a block in three-colour
+  // mode uses index 3 (transparent). DXT2/3: the lowest 4-bit alpha.
+  // DXT4/5: the lower endpoint, or 0 if a block in six-alpha mode uses
+  // index 6 (alpha 0); interpolated values lie between the endpoints.
+  static uint8_t BlockMinAlpha(Format f, const uint8_t* src, uint32_t pitch, uint32_t row,
+                               uint32_t rows) {
+    uint8_t lo = 255;
+    const bool bc1 = f == Format::DXT1;
+    const bool bc2 = f == Format::DXT2 || f == Format::DXT3;
+    const bool bc3 = f == Format::DXT4 || f == Format::DXT5;
+    if (!bc1 && !bc2 && !bc3) return 0;
+    for (uint32_t y = 0; y < rows && lo; y++) {
+      const uint8_t* b = src + size_t(y) * pitch;
+      for (uint32_t x = 0; x + (bc1 ? 8 : 16) <= row && lo; x += bc1 ? 8 : 16, b += bc1 ? 8 : 16) {
+        if (bc1) {
+          const uint16_t c0 = uint16_t(b[0] | b[1] << 8), c1 = uint16_t(b[2] | b[3] << 8);
+          if (c0 > c1) continue;
+          const uint32_t idx = uint32_t(b[4] | b[5] << 8 | b[6] << 16 | uint32_t(b[7]) << 24);
+          for (int i = 0; i < 16; i++)
+            if (((idx >> (2 * i)) & 3) == 3) lo = 0;
+        } else if (bc2) {
+          for (int i = 0; i < 8; i++)
+            lo = std::min<uint8_t>(lo, uint8_t(std::min(b[i] & 0xF, b[i] >> 4) * 17));
+        } else {
+          const uint8_t a0 = b[0], a1 = b[1];
+          lo = std::min(lo, std::min(a0, a1));
+          if (a0 > a1) continue;
+          uint64_t idx = 0;
+          for (int i = 0; i < 6; i++) idx |= uint64_t(b[2 + i]) << (8 * i);
+          for (int i = 0; i < 16; i++)
+            if (((idx >> (3 * i)) & 7) == 6) lo = 0;
+        }
+      }
+    }
+    return lo;
   }
   void UpdateTexture(TextureId id, int level, const Rect& r, const void* src,
                      uint32_t pitch) override {
@@ -905,6 +1014,7 @@ class GpuDevice final : public Device {
     SDL_GPUCommandBuffer* cmd = Begin();
     Show(cmd);
     SubmitOpen();
+    PersistentFrame();
   }
 
   // ---- drawing
@@ -1028,7 +1138,9 @@ class GpuDevice final : public Device {
     VsUniforms vu = vs_cur_;
     vu.mode[0] = pos_kind;
     VsLayout vl;
+    placed_pv_ = false;
     const uint32_t first_vertex = place(vl);
+    c.pv = placed_pv_;
     c.vs = PushVs(vu);
     c.vl = PushVl(vl);
     c.fs = PushFs(fs_cur_);
@@ -1934,14 +2046,19 @@ void r_color0(inout vec4 c) {
     std::lock_guard<std::recursive_mutex> l(mu_);
     Flush();
     SDL_GPUCommandBuffer* cmd = Begin();
+    if (Labels()) SDL_PushGPUDebugGroup(cmd, "pass present-copy");
     SDL_GPUCopyPass* cp = SDL_BeginGPUCopyPass(cmd);
     SDL_GPUTextureLocation s{}, d{};
     s.texture = backbuffer_;
     d.texture = front_;
     SDL_CopyGPUTextureToTexture(cp, &s, &d, Uint32(bb_w_), Uint32(bb_h_), 1, false);
     SDL_EndGPUCopyPass(cp);
+    if (Labels()) SDL_PopGPUDebugGroup(cmd);
+    if (Labels()) SDL_PushGPUDebugGroup(cmd, "pass show");
     Show(cmd);
+    if (Labels()) SDL_PopGPUDebugGroup(cmd);
     SubmitOpen();
+    PersistentFrame();
   }
 
  private:
@@ -1953,6 +2070,12 @@ void r_color0(inout vec4 c) {
     bool cube = false;
     TextureKind kind = TextureKind::Tex2D;
     bool storage = false;  // a compute stage's read-write image
+    // The lowest texel alpha written to it (AlphaLowerBound): tracked
+    // for 2D textures written only from the CPU (Update, FillTexture),
+    // and known once every level has been written whole.
+    bool alpha_tracked = false;
+    uint8_t alpha_min = 255;
+    uint32_t alpha_levels = 0;  // bit per level written whole
   };
   struct Depth {
     SDL_GPUTexture* tex = nullptr;
@@ -1988,6 +2111,7 @@ void r_color0(inout vec4 c) {
     bool short_indices = false;         // its indices are 16-bit
     int shader = -1;   // shader_cmds_ index for a DrawShader
     int program = -1;  // program_cmds_ index for a DrawProgram
+    bool pv = false;   // a fixed-function draw whose vertices are all in pvbuf_
   };
   // What a DrawShader adds to its Cmd: samplers (vertex 0-3, pixel 0-15)
   // and the uniform blocks in ubytes_ (vertex then pixel: float
@@ -2328,22 +2452,30 @@ void r_color0(inout vec4 c) {
       Retire();
   }
 
+  static bool Labels() {
+    static const bool on = [] { const char* e = Env("GFX_LABELS"); return e && *e && *e != '0'; }();
+    return on;
+  }
+
   void Flush() {
     bool draw = !cmds_.empty() || pass_clear_color_ || pass_clear_depth_ || pass_clear_stencil_;
     if (!draw && uploads_.empty()) return;
     SDL_GPUCommandBuffer* cmd = nullptr;
     size_t vbytes = verts_.size(), ibytes = indices_.size() * 4, pbytes = pmem_.size();
     size_t ubytes = (upload_bytes_.size() + 15) & ~size_t(15);
-    size_t total = ubytes + vbytes + ibytes + pbytes;
+    size_t pvbytes = pv_staging_.size();
+    size_t total = ubytes + vbytes + ibytes + pbytes + pvbytes;
     if (total) {
       auto* p = MapUpload(total);
       if (!upload_bytes_.empty()) std::memcpy(p, upload_bytes_.data(), upload_bytes_.size());
       if (vbytes) std::memcpy(p + ubytes, verts_.data(), vbytes);
       if (ibytes) std::memcpy(p + ubytes + vbytes, indices_.data(), ibytes);
       if (pbytes) std::memcpy(p + ubytes + vbytes + ibytes, pmem_.data(), pbytes);
+      if (pvbytes) std::memcpy(p + ubytes + vbytes + ibytes + pbytes, pv_staging_.data(), pvbytes);
       SDL_UnmapGPUTransferBuffer(dev_, upload_tb_);
 
       cmd = Begin();  // after MapUpload, which may submit it
+      if (Labels()) SDL_PushGPUDebugGroup(cmd, "pass uploads");
       SDL_GPUCopyPass* cp = SDL_BeginGPUCopyPass(cmd);
       for (const Upload& u : uploads_) {
         SDL_GPUTextureTransferInfo src{};
@@ -2381,7 +2513,22 @@ void r_color0(inout vec4 c) {
         SDL_GPUBufferRegion dst{pbuf_, 0, Uint32(pbytes)};
         SDL_UploadToGPUBuffer(cp, &src, &dst, true);
       }
+      if (pvbytes) {
+        if (!pvbuf_) {
+          uint32_t cap = 0;
+          EnsureBuffer(pvbuf_, cap, kPvCap, SDL_GPU_BUFFERUSAGE_GRAPHICS_STORAGE_READ);
+        }
+        const size_t base = upload_at_ + ubytes + vbytes + ibytes + pbytes;
+        for (const PvUpload& u : pv_uploads_) {
+          SDL_GPUTransferBufferLocation src{upload_tb_, Uint32(base + u.from)};
+          SDL_GPUBufferRegion dst{pvbuf_, u.at, u.size};
+          SDL_UploadToGPUBuffer(cp, &src, &dst, false);
+        }
+        pv_staging_.clear();
+        pv_uploads_.clear();
+      }
       SDL_EndGPUCopyPass(cp);
+      if (Labels()) SDL_PopGPUDebugGroup(cmd);
     }
 
     if (!cmd) cmd = Begin();
@@ -2407,6 +2554,16 @@ void r_color0(inout vec4 c) {
         dt.clear_stencil = clear_stencil_;
         dt.layer = Uint8(pass_depth_layer_);
       }
+      // GFX_LABELS=1: each pass in a debug group named after its target and
+      // draws, which GPU traces show (tools/gpu_passes.py joins them to the
+      // GPU's intervals).
+      if (Labels()) {
+        char pass_name[96];
+        std::snprintf(pass_name, sizeof pass_name, "pass %dx%d %s%s draws %zu", pass_w_, pass_h_,
+                      pass_color_ == backbuffer_ ? "backbuffer" : pass_color_ ? "rt" : "depth-only",
+                      pass_depth_ ? "+depth" : "", cmds_.size());
+        SDL_PushGPUDebugGroup(cmd, pass_name);
+      }
       SDL_GPURenderPass* rp =
           SDL_BeginGPURenderPass(cmd, cts, Uint32(pass_targets_), pass_depth_ ? &dt : nullptr);
       if (vbuf_) SDL_BindGPUVertexStorageBuffers(rp, 0, &vbuf_, 1);
@@ -2424,16 +2581,42 @@ void r_color0(inout vec4 c) {
       };
       if (ibuf_ && ibytes) bind_indices(ibuf_);
       SDL_GPUGraphicsPipeline* bound = nullptr;
-      bool vertex_storage = vbuf_ != nullptr;  // vbuf_ at slot 0 for the other draws
+      bool vertex_storage = vbuf_ != nullptr;  // vertex_bound at slot 0 for the other draws
+      SDL_GPUBuffer* vertex_bound = vbuf_;
       int vs = -1, fs = -1, vl = -1;
       uint32_t pushed[6];  // ubytes_ offsets pushed per shader uniform slot
       std::fill(std::begin(pushed), std::end(pushed), ~0u);
       bool have_constant = false;
       SDL_FColor constant{};
+      // Viewport, scissor, stencil reference and the fixed-function
+      // draws' samplers are set only when they change: SDL encodes every
+      // call, and consecutive draws mostly share them.
+      bool have_rect = false;
+      SDL_GPUViewport viewport{};
+      SDL_Rect scissor{};
+      uint8_t stencil_ref = 0;
+      auto set_rects = [&](const Cmd& c) {
+        if (have_rect && !std::memcmp(&viewport, &c.viewport, sizeof viewport) &&
+            !std::memcmp(&scissor, &c.scissor, sizeof scissor) && stencil_ref == c.stencil_ref)
+          return;
+        SDL_SetGPUViewport(rp, &c.viewport);
+        SDL_SetGPUScissor(rp, &c.scissor);
+        SDL_SetGPUStencilReference(rp, c.stencil_ref);
+        viewport = c.viewport;
+        scissor = c.scissor;
+        stencil_ref = c.stencil_ref;
+        have_rect = true;
+      };
+      SDL_GPUTextureSamplerBinding ff_samplers[8];
+      bool have_ff_samplers = false;  // ff_samplers are bound (no other draw's since)
       for (const Cmd& c : cmds_) {
-        if (c.program < 0 && !vertex_storage && vbuf_) {
-          SDL_BindGPUVertexStorageBuffers(rp, 0, &vbuf_, 1);
-          vertex_storage = true;
+        if (c.program < 0) {
+          SDL_GPUBuffer* want = c.pv ? pvbuf_ : vbuf_;
+          if (want && (!vertex_storage || vertex_bound != want)) {
+            SDL_BindGPUVertexStorageBuffers(rp, 0, &want, 1);
+            vertex_storage = true;
+            vertex_bound = want;
+          }
         }
         if (c.program >= 0) {
           const ProgramCmd& pc = program_cmds_[size_t(c.program)];
@@ -2455,6 +2638,7 @@ void r_color0(inout vec4 c) {
             if (sc.ntex) {
               if (st) SDL_BindGPUFragmentSamplers(rp, 0, tb, sc.ntex);
               else SDL_BindGPUVertexSamplers(rp, 0, tb, sc.ntex);
+              have_ff_samplers = false;
             }
             if (sc.storage) {
               SDL_GPUBuffer* bufs[2] = {pbuf_, heap_};
@@ -2468,9 +2652,7 @@ void r_color0(inout vec4 c) {
             constant = pc.blend_constant;
             have_constant = true;
           }
-          SDL_SetGPUViewport(rp, &c.viewport);
-          SDL_SetGPUScissor(rp, &c.scissor);
-          SDL_SetGPUStencilReference(rp, c.stencil_ref);
+          set_rects(c);
           if (c.indirect) {
             bind_indices(c.indirect, c.buffer_at);
             SDL_DrawGPUIndexedPrimitivesIndirect(rp, c.indirect, c.buffer_at, 1);
@@ -2502,13 +2684,14 @@ void r_color0(inout vec4 c) {
           for (uint32_t i = 0; i < 20; i++) tb[i] = {sc.tex[i], sc.smp[i]};
           if (sc.nvs) SDL_BindGPUVertexSamplers(rp, 0, tb + 16, sc.nvs);
           if (sc.nps) SDL_BindGPUFragmentSamplers(rp, 0, tb, sc.nps);
+          have_ff_samplers = false;
           if (!have_constant || std::memcmp(&constant, &sc.blend_constant, sizeof constant)) {
             SDL_SetGPUBlendConstants(rp, sc.blend_constant);
             constant = sc.blend_constant;
             have_constant = true;
           }
         } else {
-          SDL_GPUGraphicsPipeline* p = Pipeline(c.key);
+          SDL_GPUGraphicsPipeline* p = FfPipeline(c.key, c.fs);
           if (p != bound) {
             SDL_BindGPUGraphicsPipeline(rp, p);
             bound = p;
@@ -2528,11 +2711,13 @@ void r_color0(inout vec4 c) {
           }
           SDL_GPUTextureSamplerBinding tb[8];
           for (int i = 0; i < 8; i++) tb[i] = {c.tex[i] ? c.tex[i] : dummy_, c.smp[i]};
-          SDL_BindGPUFragmentSamplers(rp, 0, tb, 8);
+          if (!have_ff_samplers || std::memcmp(tb, ff_samplers, sizeof tb)) {
+            SDL_BindGPUFragmentSamplers(rp, 0, tb, 8);
+            std::memcpy(ff_samplers, tb, sizeof tb);
+            have_ff_samplers = true;
+          }
         }
-        SDL_SetGPUViewport(rp, &c.viewport);
-        SDL_SetGPUScissor(rp, &c.scissor);
-        SDL_SetGPUStencilReference(rp, c.stencil_ref);
+        set_rects(c);
         if (c.indexed) {
           bind_indices(ibuf_);
           SDL_DrawGPUIndexedPrimitives(rp, c.count, 1, c.first, c.base, 0);
@@ -2541,6 +2726,7 @@ void r_color0(inout vec4 c) {
         }
       }
       SDL_EndGPURenderPass(rp);
+      if (Labels()) SDL_PopGPUDebugGroup(cmd);
     }
     Submit(cmd);
 
@@ -2559,6 +2745,7 @@ void r_color0(inout vec4 c) {
     vs_list_.clear();
     vl_list_.clear();
     fs_list_.clear();
+    variant_fs_ = -1;
     blit_used_ = 0;
     pass_clear_color_ = pass_clear_depth_ = pass_clear_stencil_ = false;
   }
@@ -2731,10 +2918,36 @@ void r_color0(inout vec4 c) {
       } else if (f == Format::X8R8G8B8) {
         const auto* p = reinterpret_cast<const uint32_t*>(s);
         for (int x = 0; x < w; x++) d[x] = p[x] | 0xFF000000u;
+      } else if (const uint32_t* lut = Lut16(f)) {
+        // 16-bit formats: a table of DecodePixel's results, so the same
+        // values at a fraction of the cost (full-screen 2D blits).
+        const auto* p = reinterpret_cast<const uint16_t*>(s);
+        for (int x = 0; x < w; x++) d[x] = lut[p[x]];
       } else {
         for (int x = 0; x < w; x++) d[x] = DecodePixel(s + size_t(x) * bpp, f);
       }
     }
+  }
+
+  // DecodePixel of every value of a 16-bit format, built on first use;
+  // null for other formats.
+  static const uint32_t* Lut16(Format f) {
+    static const Format kFormats[] = {Format::R5G6B5, Format::X1R5G5B5, Format::A1R5G5B5,
+                                      Format::A4R4G4B4, Format::X4R4G4B4};
+    static std::once_flag once[std::size(kFormats)];
+    static std::vector<uint32_t> tables[std::size(kFormats)];
+    for (size_t i = 0; i < std::size(kFormats); i++) {
+      if (kFormats[i] != f) continue;
+      std::call_once(once[i], [&] {
+        tables[i].resize(65536);
+        for (uint32_t v = 0; v < 65536; v++) {
+          uint16_t raw = uint16_t(v);
+          tables[i][v] = DecodePixel(reinterpret_cast<const uint8_t*>(&raw), f);
+        }
+      });
+      return tables[i].data();
+    }
+    return nullptr;
   }
 
   // ---- DirectDraw blits: a textured screen quad with private state
@@ -2926,11 +3139,194 @@ void r_color0(inout vec4 c) {
     return k;
   }
 
-  SDL_GPUGraphicsPipeline* Pipeline(const PipelineKey& k) {
-    if (last_pipeline_ && k == last_key_) return last_pipeline_;
-    auto it = pipelines_.find(k);
-    if (it == pipelines_.end()) it = pipelines_.emplace(k, CreatePipeline(k, vs_, fs_, nullptr)).first;
+  // ---- fixed-function fragment shader variants
+  //
+  // ff.frag interprets the texture-stage state from uniforms: a loop over
+  // eight stages with switches, for every fragment. Each state's draws
+  // get a variant with that state compiled in (FsVariantKey), compiled on
+  // a worker thread; until it is ready they use the general shader, which
+  // computes the same. <ID>_FF_VARIANTS=off keeps the general shader;
+  // =sync compiles each variant when first needed, on the device's thread
+  // (tests: a variant that fails to compile is then fatal).
+
+  struct FsVariant {
+    std::atomic<SDL_GPUShader*> shader{nullptr};
+    std::atomic<bool> failed{false};
+    std::unordered_map<PipelineKey, SDL_GPUGraphicsPipeline*, BytesHash<PipelineKey>> pipelines;
+  };
+
+  // The pipeline for a fixed-function draw with fs_list_[fs].
+  SDL_GPUGraphicsPipeline* FfPipeline(const PipelineKey& k, int fs) {
+    const FsUniforms& f = fs_list_[size_t(fs)];
+    const bool discard = NeedsDiscard(k, f);
+    // Draws in a row mostly share their uniforms (fs_list_ entry).
+    if (fs != variant_fs_ || discard != variant_discard_) {
+      variant_fs_ = fs;
+      variant_discard_ = discard;
+      variant_last_ = Variant(f, discard);
+    }
+    if (FsVariant* v = variant_last_) {
+      if (SDL_GPUShader* sh = v->shader.load(std::memory_order_acquire)) {
+        auto it = v->pipelines.find(k);
+        if (it == v->pipelines.end()) it = v->pipelines.emplace(k, CreatePipeline(k, vs_, sh, nullptr)).first;
+        return it->second;
+      }
+    }
+    return Pipeline(k, discard);
+  }
+
+  // The variant for `f` (requested on first use), or null when variants
+  // are off.
+  FsVariant* Variant(const FsUniforms& f, bool discard) {
+    if (variant_mode_ == VariantMode::Off) return nullptr;
+    FsVariantKey key{};
+    for (int s = 0; s < 8; s++) {
+      if (f.color[s][0] == 1) {  // DISABLE ends the cascade (ff.frag)
+        key.color[s][0] = 1;
+        break;
+      }
+      for (int i = 0; i < 4; i++) {
+        key.color[s][i] = int8_t(f.color[s][i]);
+        key.alpha[s][i] = int8_t(f.alpha[s][i]);
+      }
+      for (int i = 0; i < 3; i++) key.stage[s][i] = int8_t(f.stage[s][i]);
+    }
+    key.func = discard ? int8_t(f.mode[0]) : 0;
+    key.fog = int8_t(f.mode[2]);
+    key.table = f.mode[2] == 2 ? int8_t(f.mode[3]) : 0;
+    key.flat = int8_t(f.mode2[0] != 0);
+    key.specular = int8_t(f.mode2[1] != 0);
+    key.discard = discard;
+    auto [it, fresh] = variants_.try_emplace(key);
+    FsVariant* v = &it->second;
+    if (fresh && variant_mode_ == VariantMode::Sync) {
+      VariantJob job{VariantSource(key), v};
+      if (!CompileVariant(job)) FatalF("gfx: fixed-function shader variant failed (FF_VARIANTS=sync)");
+    } else if (fresh) {
+      std::lock_guard<std::mutex> l(variant_mu_);
+      variant_jobs_.push_back({VariantSource(key), v});
+      if (!variant_worker_.joinable()) variant_worker_ = std::thread([this] { VariantWorker(); });
+      variant_cv_.notify_one();
+    }
+    return v->failed.load(std::memory_order_relaxed) ? nullptr : v;
+  }
+
+  static std::string VariantSource(const FsVariantKey& k) {
+    std::string src = kFfFragGlsl;
+    std::string defs = "#define SPECIALIZED\n";
+#if defined(__APPLE__)
+    // As the general shaders are built (ff.frag, HALF); FF_HALF=0 keeps
+    // 32-bit arithmetic in the variants (comparisons).
+    const char* he = Env("FF_HALF");
+    if (!(he && *he == '0')) defs = "#define HALF\n" + defs;
+#endif
+    if (k.discard) defs += "#define ALPHA_TEST\n";
+    auto ivec4s = [&](const char* name, auto&& at) {
+      defs += std::string("const ivec4 ") + name + "[8] = ivec4[8](";
+      for (int s = 0; s < 8; s++) {
+        const auto v = at(s);
+        defs += (s ? ", " : "") + std::string("ivec4(") + std::to_string(v[0]) + ", " +
+                std::to_string(v[1]) + ", " + std::to_string(v[2]) + ", " + std::to_string(v[3]) + ")";
+      }
+      defs += ");\n";
+    };
+    ivec4s("k_color", [&](int s) { return std::array<int, 4>{k.color[s][0], k.color[s][1], k.color[s][2], k.color[s][3]}; });
+    ivec4s("k_alpha", [&](int s) { return std::array<int, 4>{k.alpha[s][0], k.alpha[s][1], k.alpha[s][2], k.alpha[s][3]}; });
+    ivec4s("k_stage", [&](int s) { return std::array<int, 4>{k.stage[s][0], k.stage[s][1], k.stage[s][2], 0}; });
+    defs += "const ivec4 k_mode = ivec4(" + std::to_string(k.func) + ", 0, " + std::to_string(k.fog) +
+            ", " + std::to_string(k.table) + ");\n";
+    defs += "const ivec4 k_mode2 = ivec4(" + std::to_string(k.flat) + ", " +
+            std::to_string(k.specular) + ", 0, 0);\n";
+    const size_t eol = src.find('\n');  // after #version
+    return src.insert(eol + 1, defs);
+  }
+
+  struct VariantJob {
+    std::string glsl;
+    FsVariant* variant;
+  };
+
+  // Compiles requested variants. SDL_CreateGPUShader only uses the
+  // device here (Metal: MTLDevice; Vulkan: vkCreateShaderModule), which is
+  // safe from any thread.
+  void VariantWorker() {
+    for (;;) {
+      VariantJob job;
+      {
+        std::unique_lock<std::mutex> l(variant_mu_);
+        variant_cv_.wait(l, [&] { return variant_quit_ || !variant_jobs_.empty(); });
+        if (variant_quit_) return;
+        job = std::move(variant_jobs_.front());
+        variant_jobs_.pop_front();
+      }
+      CompileVariant(job);
+    }
+  }
+
+  // Compiles a variant into job.variant; false (marked failed) on error.
+  bool CompileVariant(VariantJob& job) {
+    std::vector<uint32_t> spirv;
+    std::string log, code;
+    bool ok = GlslToSpirv(job.glsl, ShaderStage::Fragment, &spirv, &log);
+#if defined(__APPLE__)
+    ok = ok && SpirvToMsl(spirv, &code, &log);
+    const SDL_GPUShaderFormat format = SDL_GPU_SHADERFORMAT_MSL;
+    const char* entry = "main0";
+#else
+    code.assign(reinterpret_cast<const char*>(spirv.data()), spirv.size() * 4);
+    const SDL_GPUShaderFormat format = SDL_GPU_SHADERFORMAT_SPIRV;
+    const char* entry = "main";
+#endif
+    SDL_GPUShader* sh = nullptr;
+    if (ok) {
+      SDL_GPUShaderCreateInfo fs{};
+      fs.code = reinterpret_cast<const Uint8*>(code.data());
+      fs.code_size = code.size();
+      fs.entrypoint = entry;
+      fs.format = format;
+      fs.stage = SDL_GPU_SHADERSTAGE_FRAGMENT;
+      fs.num_uniform_buffers = 1;
+      fs.num_samplers = 8;
+      sh = SDL_CreateGPUShader(dev_, &fs);
+      if (!sh) log = SDL_GetError();
+    }
+    if (sh) {
+      job.variant->shader.store(sh, std::memory_order_release);
+      return true;
+    }
+    WarnF("gfx: fixed-function shader variant: %s\n", log.c_str());
+    job.variant->failed.store(true, std::memory_order_relaxed);
+    return false;
+  }
+
+  // Whether a draw needs ff.frag's alpha test (the shader that can
+  // discard). Not when the test is off (BuildUniforms also turns off one
+  // no fragment can fail), nor for "alpha > 0" under SRCALPHA blending
+  // (INVSRCALPHA or ONE) that writes no depth or stencil: a fragment the
+  // test would reject has alpha below half a step (1/510) and moves the
+  // target by less than half a step, which rounds away. Blending in half
+  // precision can leave such a pixel one step off, which no one can see;
+  // in exchange the GPU keeps hidden surface removal for those draws.
+  static bool NeedsDiscard(const PipelineKey& k, const FsUniforms& f) {
+    if (f.mode[0] == 0) return false;
+    const bool fades = k.blend && k.src == SDL_GPU_BLENDFACTOR_SRC_ALPHA &&
+                       (k.dst == SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA ||
+                        k.dst == SDL_GPU_BLENDFACTOR_ONE) &&
+                       k.op == SDL_GPU_BLENDOP_ADD && !k.depth_write && !k.stencil &&
+                       k.targets <= 1;
+    return !(fades && f.mode[0] == 5 && f.mode[1] == 0);
+  }
+
+  // `alpha_test`: the draw needs the fragment shader that can discard
+  // (NeedsDiscard).
+  SDL_GPUGraphicsPipeline* Pipeline(const PipelineKey& k, bool alpha_test) {
+    if (last_pipeline_ && alpha_test == last_alpha_test_ && k == last_key_) return last_pipeline_;
+    auto& cache = alpha_test ? pipelines_alpha_test_ : pipelines_;
+    auto it = cache.find(k);
+    if (it == cache.end())
+      it = cache.emplace(k, CreatePipeline(k, vs_, alpha_test ? fs_alpha_test_ : fs_, nullptr)).first;
     last_key_ = k;
+    last_alpha_test_ = alpha_test;
     return last_pipeline_ = it->second;
   }
 
@@ -3148,6 +3544,31 @@ void r_color0(inout vec4 c) {
       if (run_of[a] >= 0 &&
           ((uintptr_t(at[a].s->data) + uintptr_t(first) * at[a].s->stride - runs[run_of[a]].lo) & 3))
         return false;
+    // Every attribute in a run of a locked stream: the runs may come from
+    // the persistent vertices (PlacePersistent).
+    bool persistent = pv_mode_ != PvMode::Off && nruns > 0;
+    uint32_t run_lock[13] = {};
+    for (int a = 0; a < n && persistent; a++) {
+      if (run_of[a] < 0) {
+        persistent = false;
+        break;
+      }
+      uint32_t lk = at[a].s->lock;
+      uint32_t& rl = run_lock[run_of[a]];
+      if (!lk || (rl && rl != lk)) persistent = false;
+      rl = lk;
+    }
+    if (persistent && PlacePersistent(runs, nruns, run_lock, count)) {
+      placed_pv_ = true;
+      for (int a = 0; a < n; a++) {
+        const FfStream& st = *at[a].s;
+        const Run& run = runs[run_of[a]];
+        uintptr_t lo = uintptr_t(st.data) + uintptr_t(first) * st.stride;
+        *at[a].addr = run.at + int32_t(lo - run.lo);
+        *at[a].stride = int32_t(st.stride);
+      }
+      return true;
+    }
     for (int r = 0; r < nruns; r++) {
       Run& run = runs[r];
       size_t bytes = size_t(run.stride) * (count - 1) + (run.hi - run.lo);
@@ -3169,6 +3590,74 @@ void r_color0(inout vec4 c) {
     return true;
   }
 
+  // Persistent vertices: a locked stream's range that an earlier frame drew
+  // too (a static vertex buffer's) is uploaded once to pvbuf_, and draws
+  // read it there for as long as the lock stays the same, instead of a copy
+  // in each pass's arena. The lock is the buffer's ticket, which d3d9
+  // changes at every Unlock, so a range is the same bytes while its lock
+  // is. Ranges seen first in this frame are not kept: a buffer refilled
+  // every frame gets a new lock each time. Sets each run's place in
+  // pvbuf_, or returns false (nothing placed) when one cannot have it.
+  // FF_VCACHE=off turns it off; =check keeps a copy of each range and
+  // compares it at every use (fatal if they differ: the game wrote to a
+  // vertex buffer without Lock/Unlock).
+  template <class Run>
+  bool PlacePersistent(Run* runs, int nruns, const uint32_t* run_lock, uint32_t count) {
+    uint32_t got[13];
+    bool all = true;  // every run in pvbuf_ (each one is noted or placed either way)
+    for (int r = 0; r < nruns; r++) {
+      const Run& run = runs[r];
+      const uint32_t bytes = uint32_t(size_t(run.stride) * (count - 1) + (run.hi - run.lo));
+      const PvKey k{run_lock[r], run.stride, bytes, run.lo};
+      auto it = pv_at_.find(k);
+      if (it != pv_at_.end()) {
+        if (pv_mode_ == PvMode::Check &&
+            std::memcmp(pv_shadow_[k].data(), reinterpret_cast<const void*>(run.lo), bytes))
+          FatalF("gfx: a vertex buffer changed without Lock/Unlock (FF_VCACHE=check): %u bytes at %p",
+                 bytes, reinterpret_cast<const void*>(run.lo));
+        got[r] = it->second;
+        continue;
+      }
+      auto [seen, fresh] = pv_seen_.try_emplace(k, pv_frame_);
+      const uint32_t need = (bytes + 15) & ~15u;
+      if (fresh || seen->second == pv_frame_ || bytes > kPvCap / 8) {
+        all = false;
+        continue;
+      }
+      if (pv_head_ + need > kPvCap) {
+        pv_full_ = true;  // emptied at the next Present
+        all = false;
+        continue;
+      }
+      const uint32_t from = uint32_t(pv_staging_.size());
+      pv_staging_.resize(from + need);
+      std::memcpy(pv_staging_.data() + from, reinterpret_cast<const void*>(run.lo), bytes);
+      pv_uploads_.push_back({pv_head_, from, need});
+      if (pv_mode_ == PvMode::Check)
+        pv_shadow_[k].assign(reinterpret_cast<const uint8_t*>(run.lo),
+                             reinterpret_cast<const uint8_t*>(run.lo) + bytes);
+      pv_at_.emplace(k, pv_head_);
+      got[r] = pv_head_;
+      pv_head_ += need;
+    }
+    if (!all) return false;
+    for (int r = 0; r < nruns; r++) runs[r].at = int32_t(got[r]);
+    return true;
+  }
+
+  // At Present: a new frame for PlacePersistent; when pvbuf_ filled up,
+  // it starts over once the GPU is done with it.
+  void PersistentFrame() {
+    pv_frame_++;
+    if (pv_seen_.size() > (1u << 20)) pv_seen_.clear();
+    if (!pv_full_) return;
+    Drain();
+    pv_at_.clear();
+    pv_shadow_.clear();
+    pv_head_ = 0;
+    pv_full_ = false;
+  }
+
   void BuildUniforms(const FfState& st) {
     if (std::memcmp(&st, &built_, sizeof st) != 0) {
       built_ = st;
@@ -3180,13 +3669,27 @@ void r_color0(inout vec4 c) {
       std::memcpy(proj.data(), st.proj, 64);
       VsUniforms& u = vs_cur_;
       std::memset(&u, 0, sizeof u);
+      // The view and world matrices mostly repeat from draw to draw: their
+      // products, normal matrices and the view's inverse are kept with
+      // the bytes they were computed from (the same inputs give the same
+      // results).
+      if (!xf_.valid || std::memcmp(xf_.view, st.view, 64) != 0) {
+        std::memcpy(xf_.view, st.view, 64);
+        xf_.vinv = Inverse(view);
+        xf_.valid = true;
+        for (bool& w : xf_.world_valid) w = false;
+      }
       for (int i = 0; i < 4; i++) {
-        Mat world;
-        std::memcpy(world.data(), st.world[i], 64);
-        Mat wv = Mul(world, view);
-        std::memcpy(u.world_view[i], wv.data(), 64);
-        Mat nm = NormalMatrix(wv);
-        std::memcpy(u.normal[i], nm.data(), 64);
+        if (!xf_.world_valid[i] || std::memcmp(xf_.world[i], st.world[i], 64) != 0) {
+          Mat world;
+          std::memcpy(world.data(), st.world[i], 64);
+          std::memcpy(xf_.world[i], st.world[i], 64);
+          xf_.wv[i] = Mul(world, view);
+          xf_.nm[i] = NormalMatrix(xf_.wv[i]);
+          xf_.world_valid[i] = true;
+        }
+        std::memcpy(u.world_view[i], xf_.wv[i].data(), 64);
+        std::memcpy(u.normal[i], xf_.nm[i].data(), 64);
       }
       std::memcpy(u.proj, st.proj, 64);
       std::memcpy(u.tex, st.tex, sizeof u.tex);
@@ -3207,7 +3710,7 @@ void r_color0(inout vec4 c) {
       u.fog[1] = AsFloat(st.rs[37]);
       u.fog[2] = AsFloat(st.rs[38]);
       // Clip planes are in world space; the shader has view space.
-      Mat vinv = Inverse(view);
+      const Mat& vinv = xf_.vinv;
       for (int i = 0; i < 8; i++)
         for (int j = 0; j < 4; j++) {
           float s = 0;
@@ -3305,6 +3808,16 @@ void r_color0(inout vec4 c) {
       u.fog[2] = AsFloat(st.rs[38]);
       u.mode[0] = st.rs[15] ? int(st.rs[25]) : 0;
       u.mode[1] = int(st.rs[24] & 0xFF);
+      // An alpha test no fragment can fail is turned off, so the draw
+      // gets the fragment shader without discard (Pipeline): AlphaPass
+      // (ff.frag) would pass anyway. Margins of half a step cover float
+      // rounding in sampling and the cascade.
+      if (u.mode[0] == 8) {
+        u.mode[0] = 0;  // ALWAYS
+      } else if (u.mode[0] == 5 || u.mode[0] == 7) {
+        const float lo = AlphaLowerBound(u, st) * 255.0f;
+        if (lo >= float(u.mode[1]) + (u.mode[0] == 5 ? 1.0f : 0.5f)) u.mode[0] = 0;
+      }
       u.mode[2] = st.rs[28] ? (st.rs[35] ? 2 : 1) : 0;
       u.mode[3] = int(st.rs[35]);
       u.mode2[0] = st.rs[9] == 1 ? 1 : 0;
@@ -3314,6 +3827,67 @@ void r_color0(inout vec4 c) {
     // The render target size feeds the vertex shader too.
     vs_cur_.target[0] = float(pass_w_);
     vs_cur_.target[1] = float(pass_h_);
+  }
+
+  // A lower bound on the alpha ff.frag's texture-stage cascade can
+  // produce (cur.a at the alpha test) for the uniforms `u` of state `st`:
+  // 0 where unknown. Diffuse and specular are unknown; TFACTOR is exact; a
+  // texture contributes its lowest texel alpha (Tex::alpha_min; filtering
+  // blends texels, so it never goes lower), and the border colour's with
+  // BORDER addressing. Operations with all arguments non-negative are
+  // monotonic, so bounds of the arguments bound the result.
+  float AlphaLowerBound(const FsUniforms& u, const FfState& st) const {
+    const float tf = float(st.rs[60] >> 24) / 255.0f;
+    float cur = 0.0f, temp = 0.0f;
+    for (int s = 0; s < 8; s++) {
+      const int cop = u.color[s][0];
+      if (cop == 1) break;
+      float tex = 0.0f;
+      if (u.stage[s][1]) tex = TextureMinAlpha(st.textures[s], st.tss[s]);
+      auto arg = [&](int a) -> float {
+        float v;
+        switch (a & 0xF) {
+          case 1: v = cur; break;
+          case 2: v = tex; break;
+          case 3: v = tf; break;
+          case 5: v = temp; break;
+          default: v = 0.0f; break;  // DIFFUSE, SPECULAR: unknown; others read zero
+        }
+        if (a & 0x10) v = (a & 0xF) == 3 ? 1.0f - tf : 0.0f;  // COMPLEMENT: TFACTOR's is exact
+        return v;
+      };
+      float al = cur;
+      const int aop = u.alpha[s][0];
+      if (aop != 1) {
+        const float a1 = arg(u.alpha[s][1]), a2 = arg(u.alpha[s][2]);
+        switch (aop) {
+          case 2: al = a1; break;
+          case 3: al = a2; break;
+          case 4: al = a1 * a2; break;
+          case 5: al = std::min(1.0f, a1 * a2 * 2.0f); break;
+          case 6: al = std::min(1.0f, a1 * a2 * 4.0f); break;
+          case 7: al = std::min(1.0f, a1 + a2); break;
+          default: al = 0.0f; break;
+        }
+      }
+      if (cop == 24) al = 0.0f;  // DOTPRODUCT3 puts a colour into alpha
+      if (u.stage[s][0] == 5) temp = al;
+      else cur = al;
+    }
+    return cur;
+  }
+
+  // The lowest alpha sampling texture `id` with stage states `tss` can
+  // return: 0 unless every level's alpha is known (Tex::alpha_min).
+  float TextureMinAlpha(TextureId id, const uint32_t* tss) const {
+    auto it = textures_.find(id);
+    if (it == textures_.end()) return 0.0f;
+    const Tex& t = it->second;
+    const uint32_t all = t.levels >= 32 ? ~0u : (1u << t.levels) - 1;
+    if (!t.alpha_tracked || (t.alpha_levels & all) != all) return 0.0f;
+    uint32_t lo = t.alpha_min;
+    if (tss[13] == 4 || tss[14] == 4) lo = std::min(lo, tss[15] >> 24);  // BORDER: BORDERCOLOR
+    return float(lo) / 255.0f;
   }
 
   int PushVs(const VsUniforms& u) {
@@ -3936,6 +4510,19 @@ void r_color0(inout vec4 c) {
   SDL_GPUDevice* dev_ = nullptr;
   SDL_GPUShader* vs_ = nullptr;
   SDL_GPUShader* fs_ = nullptr;
+  SDL_GPUShader* fs_alpha_test_ = nullptr;  // ff.frag with ALPHA_TEST
+  // Fixed-function fragment variants (FfPipeline): created and looked up
+  // on the device's thread; the worker fills in their shaders.
+  std::unordered_map<FsVariantKey, FsVariant, BytesHash<FsVariantKey>> variants_;
+  std::mutex variant_mu_;
+  std::condition_variable variant_cv_;
+  std::deque<VariantJob> variant_jobs_;
+  bool variant_quit_ = false;
+  std::thread variant_worker_;
+  enum class VariantMode { Async, Sync, Off } variant_mode_ = VariantMode::Async;
+  int variant_fs_ = -1;  // FfPipeline's last lookup: fs_list_ index, ...
+  bool variant_discard_ = false;
+  FsVariant* variant_last_ = nullptr;
   SDL_GPUTextureFormat depth24_ = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
   SDL_GPUTextureFormat depth24s8_ = SDL_GPU_TEXTUREFORMAT_D32_FLOAT_S8_UINT;
   SDL_GPUTexture* backbuffer_ = nullptr;  // the game's back buffer
@@ -3975,6 +4562,33 @@ void r_color0(inout vec4 c) {
   std::vector<FsUniforms> fs_list_;
   std::vector<uint8_t, NoZero<uint8_t>> verts_;
   int32_t zeros_at_ = -1;  // 64 zero bytes in verts_ (PlaceStreams), -1 if none yet
+  // Persistent vertices (PlacePersistent).
+  struct PvKey {
+    uint32_t lock, stride, bytes;
+    uintptr_t lo;
+    bool operator==(const PvKey&) const = default;
+  };
+  struct PvHash {
+    size_t operator()(const PvKey& k) const {
+      return size_t(uint64_t(k.lo) * 0x9E3779B97F4A7C15ull ^ (uint64_t(k.lock) << 32 | k.bytes) ^
+                    (uint64_t(k.stride) << 20));
+    }
+  };
+  struct PvUpload {
+    uint32_t at, from, size;  // pvbuf_ offset, pv_staging_ offset, bytes
+  };
+  static constexpr uint32_t kPvCap = 256u << 20;
+  enum class PvMode { Off, On, Check } pv_mode_ = PvMode::On;
+  SDL_GPUBuffer* pvbuf_ = nullptr;
+  uint32_t pv_head_ = 0;
+  uint64_t pv_frame_ = 0;
+  bool pv_full_ = false;
+  bool placed_pv_ = false;  // PlaceStreams' draw is in pvbuf_
+  std::unordered_map<PvKey, uint32_t, PvHash> pv_at_;     // place in pvbuf_
+  std::unordered_map<PvKey, uint64_t, PvHash> pv_seen_;   // frame first drawn
+  std::unordered_map<PvKey, std::vector<uint8_t>, PvHash> pv_shadow_;  // FF_VCACHE=check
+  std::vector<uint8_t> pv_staging_;
+  std::vector<PvUpload> pv_uploads_;
   // Locked streams placed since the last flush (PlaceStreams), the last
   // few: a lock's stages reuse the vertices they share.
   struct Locked {
@@ -3983,7 +4597,10 @@ void r_color0(inout vec4 c) {
     uint32_t stride = 0, first = 0, count = 0, size = 0;
     int32_t at = 0;
   };
-  std::array<Locked, 4> locked_{};
+  // Stream ranges copied this pass, by lock ticket (FfStream::lock): a
+  // frame's draws often reuse a few vertex buffers, each draw a range of
+  // one, so this holds enough to catch the repeats across them.
+  std::array<Locked, 64> locked_{};
   size_t locked_next_ = 0;
   std::vector<uint32_t, NoZero<uint32_t>> indices_;
   std::vector<Upload> uploads_;
@@ -4029,7 +4646,10 @@ void r_color0(inout vec4 c) {
   uint32_t next_read_ = 1;
   uint32_t upload_tb_cap_ = 0, download_tb_cap_ = 0;
   std::unordered_map<PipelineKey, SDL_GPUGraphicsPipeline*, BytesHash<PipelineKey>> pipelines_;
+  std::unordered_map<PipelineKey, SDL_GPUGraphicsPipeline*, BytesHash<PipelineKey>>
+      pipelines_alpha_test_;
   PipelineKey last_key_{};  // Pipeline's last lookup
+  bool last_alpha_test_ = false;
   SDL_GPUGraphicsPipeline* last_pipeline_ = nullptr;
   uint64_t tex_gen_ = 0;  // changes when textures_ does
   struct StageBinding {  // BindStageTextures' per stage
@@ -4079,6 +4699,15 @@ void r_color0(inout vec4 c) {
   // The state the current uniforms were built from.
   FfState built_{};
   bool vs_dirty_ = true, fs_dirty_ = true;
+  // BuildUniforms' matrices, by the bytes of their inputs.
+  struct {
+    bool valid = false;
+    float view[16];
+    Mat vinv;
+    bool world_valid[4] = {};
+    float world[4][16];
+    Mat wv[4], nm[4];
+  } xf_;
   VsUniforms vs_cur_{};
   FsUniforms fs_cur_{};
 };

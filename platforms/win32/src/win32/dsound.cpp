@@ -338,12 +338,46 @@ void WriteFormat(uint32_t va, uint32_t size, const Format& f) {
 // ---- DirectSoundCreate8 and IDirectSound8
 
 // (lpcGuidDevice, ppDS8, pUnkOuter)
+// DirectSoundEnumerateA(LPDSENUMCALLBACKA cb, ctx) (ordinal 2): one
+// device, the primary sound driver (NULL GUID, as DirectSound reports it
+// first), which is what DirectSoundCreate8 opens. The callback is
+// BOOL CALLBACK (LPGUID, LPCSTR description, LPCSTR module, LPVOID ctx).
+HLE_NAMED("dsound.dll", "#2", DirectSoundEnumerateA, 2) {
+  gaddr desc = HeapAllocProcess(64, true);
+  PutStr(desc, "Primary Sound Driver");
+  gaddr module = desc + 32;  // "": the primary driver has no module name
+  CallGuest(c, Arg(c, 0), {0, desc, module, Arg(c, 1)});
+  HeapFreeProcess(desc);
+  return DS_OK;
+}
+
 HLE_NAMED("dsound.dll", "#11", DirectSoundCreate8, 3) {
   if (!Arg(c, 1)) return DSERR_INVALIDPARAM;
   Wr32(Arg(c, 1), 0);
   if (Arg(c, 2)) return DSERR_NOAGGREGATION;
   if (!M().Open(48000)) return DSERR_NODRIVER;
   Wr32(Arg(c, 1), com::Publish(std::make_shared<DirectSound>(), DirectSoundVtable()));
+  return DS_OK;
+}
+
+// CoCreateInstance of CLSID_DirectSound or CLSID_DirectSound8: an object
+// not yet initialised; the creator calls IDirectSound::Initialize(guid)
+// before using it, as DirectSoundCreate would.
+uint32_t CreateDirectSoundCo(uint32_t iid, uint32_t* out) {
+  *out = 0;
+  if (!com::GuidEq(iid, kIID_IDirectSound8) && !com::GuidEq(iid, kIID_IDirectSound))
+    return com::kE_NOINTERFACE;
+  *out = com::Publish(std::make_shared<DirectSound>(), DirectSoundVtable());
+  return DS_OK;
+}
+constexpr guest::GUID kCLSID_DirectSound = {0x47D4D946, 0x62E8, 0x11CF, {0x93, 0xBC, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00}};
+constexpr guest::GUID kCLSID_DirectSound8 = {0x3901CC3F, 0x84B5, 0x4FA4, {0xBA, 0x35, 0xAA, 0x81, 0x72, 0xB8, 0xA0, 0x9B}};
+com::CoClassRegistrar reg_dsound{kCLSID_DirectSound, &CreateDirectSoundCo};
+com::CoClassRegistrar reg_dsound8{kCLSID_DirectSound8, &CreateDirectSoundCo};
+
+// (lpcGuid): opens the primary device, as DirectSoundCreate8 does.
+HLE_NAMED("dsound.dll", "IDirectSound8::Initialize", DS8_Initialize, 2) {
+  if (!M().Open(48000)) return DSERR_NODRIVER;
   return DS_OK;
 }
 
@@ -398,7 +432,11 @@ HLE_NAMED("dsound.dll", "IDirectSound8::CreateSoundBuffer", DS8_CreateSoundBuffe
   if (flags & DSBCAPS_CTRLFX) FatalF("dsound: buffers with effects (DSBCAPS_CTRLFX) are not supported");
   if (flags & DSBCAPS_PRIMARYBUFFER) {
     if (bytes || fmt) return DSERR_INVALIDPARAM;
-    if (ds->primary) {  // one primary buffer per device
+    // One primary buffer per device while it is alive. The device does not
+    // hold a reference to it: once the game releases its last one it is
+    // gone, and the next request makes a new one.
+    if (ds->primary && !com::As<SoundBuffer>(ds->primary)) ds->primary = 0;
+    if (ds->primary) {
       com::AddRef(ds->primary);
       Wr32(out, ds->primary);
       return DS_OK;

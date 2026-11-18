@@ -6,15 +6,25 @@
 // (D3DCOLORs, 16-bit indices) and a stream off a word boundary; an absent
 // stream reads as zeros; a locked stream is taken once per lock; a stage
 // whose colour takes an unbound texture is disabled, and an alpha taken
-// from one reads zero. Needs a Vulkan device (lavapipe will do); exits 77
-// (skipped) without one.
+// from one reads zero. The fragment shader variants compiled per state
+// (FF_VARIANTS=sync) give the same pixels as the general shader
+// (FF_VARIANTS=off) for a range of states (within one step on Metal, where
+// the arithmetic is 16-bit). An alpha test the device
+// leaves out because the texture's alpha cannot fail it comes back when
+// the texture gets a texel that fails. A draw from locked streams repeated
+// over frames, drawn from the device's persistent vertices, gives the
+// same pixels in every frame. Needs a Vulkan device
+// (lavapipe will do); exits 77 (skipped) without one.
 
 #include <SDL3/SDL.h>
 
+#include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
+#include "runtime/env.h"
 #include "runtime/gfx/device.h"
 
 namespace {
@@ -298,6 +308,50 @@ int main() {
   Check(twice(7, 7) == first_only, "the same lock keeps its stream");
   Check(twice(8, 9) == both, "another lock takes the stream again");
 
+  // ---- 12. Persistent vertices: a draw whose streams are all locked,
+  // repeated over frames, is noted in the first, uploaded to the device's
+  // persistent buffer in the second and drawn from it after that, with the
+  // same pixels every time; under another lock other data draws as itself.
+  {
+    std::vector<float> p12 = sc.pos;
+    auto locked = [&](uint32_t lock) {
+      FfDraw pd = fd;
+      pd.position = {p12.data(), 16, lock};
+      for (FfStream* s : {&pd.normal, &pd.diffuse, &pd.tex[0]}) s->lock = lock;
+      return pd;
+    };
+    // First in each frame, a draw of other vertices (all at one point, so
+    // no pixels) that the device copies to its per-pass arena: a draw read
+    // from there instead of the persistent buffer draws nothing.
+    std::vector<float> point(sc.pos.size(), 0.0f);
+    FfDraw other = fd;
+    other.position = {point.data(), 16};
+    auto frames = [&](uint32_t lock) {
+      bool same = true;
+      std::vector<uint32_t> first;
+      for (int f = 0; f < 4; f++) {
+        Clear(*dev);
+        dev->DrawFf(opaque, other);
+        dev->DrawFf(opaque, locked(lock));
+        std::vector<uint32_t> px = Read(*dev);
+        if (f == 0) first = px;
+        same = same && px == first;
+        dev->Present();
+      }
+      return same ? first : std::vector<uint32_t>{};
+    };
+    Clear(*dev);
+    dev->DrawFf(opaque, locked(0));
+    const std::vector<uint32_t> still = Read(*dev);
+    Check(frames(100) == still, "a persistent stream draws the same in every frame");
+    for (size_t i = 0; i < p12.size(); i += 4) p12[i] = p12[i] * 0.5f - 0.4f;
+    Clear(*dev);
+    dev->DrawFf(opaque, locked(0));
+    const std::vector<uint32_t> moved = Read(*dev);
+    Check(moved != still, "the moved positions draw elsewhere (12)");
+    Check(frames(101) == moved, "another lock's data draws as itself");
+  }
+
   // ---- 9. No texture on stage 0. Its colour MODULATEs TEXTURE: the
   // stage is disabled, so the draw is the diffuse colour and alpha. Only
   // its alpha taking TEXTURE: that alpha is zero, which the alpha test
@@ -323,6 +377,131 @@ int main() {
   int kept = 0;
   for (uint32_t p : Read(*dev)) kept += p != 0xFF102030;
   Check(kept == 0, "an alpha taken from an unbound texture is zero");
+
+  // ---- 11 (before 10, on this device). The alpha test of a draw whose
+  // alpha is an opaque texture's: no fragment fails it, until a texel's
+  // alpha drops to 0, after which the draw keeps fewer pixels.
+  {
+    const TextureId op = dev->CreateTexture(2, 2, 1, Format::A8R8G8B8, false);
+    const uint32_t opaque[4] = {0xFF808080, 0xFF20C040, 0xFFFFFFFF, 0xFF4060A0};
+    dev->UpdateTexture(op, 0, {0, 0, 2, 2}, opaque, 8);
+    FfState a = st;
+    a.textures[0] = op;
+    a.tss[0][4] = 2;  // ALPHAOP SELECTARG1
+    a.tss[0][5] = 2;  // TEXTURE
+    a.rs[27] = 0;     // no blending: the alpha test alone decides
+    auto kept = [&] {
+      Clear(*dev);
+      dev->DrawFf(a, fd);
+      int n = 0;
+      for (uint32_t p : Read(*dev)) n += p != 0xFF102030;
+      return n;
+    };
+    const int all = kept();
+    const uint32_t clear_texel = 0x00808080;
+    dev->UpdateTexture(op, 0, {0, 0, 1, 1}, &clear_texel, 4);
+    const int after = kept();
+    Check(all > kSize * kSize / 4 && after < all, "an alpha test comes back with a clear texel");
+    dev->DestroyTexture(op);
+  }
+
+  // ---- 10. Fragment shader variants: each state compiled into its own
+  // shader (sync: compiled before the draw) against the general shader,
+  // on a device of each kind, pixel for pixel.
+  {
+    recomp::SetEnvId("gfxtest");
+    setenv("GFXTEST_FF_VARIANTS", "off", 1);
+    std::unique_ptr<Device> general = CreateGpuDevice(nullptr);
+    setenv("GFXTEST_FF_VARIANTS", "sync", 1);
+    std::unique_ptr<Device> special = CreateGpuDevice(nullptr);
+    unsetenv("GFXTEST_FF_VARIANTS");
+    Check(general && special, "devices for the variant comparison");
+    if (general && special) {
+      TextureId t[2][2];
+      Device* devs[2] = {general.get(), special.get()};
+      for (int d = 0; d < 2; d++) {
+        devs[d]->ResetSwapChain(kSize, kSize, false);
+        devs[d]->SetRenderTarget(0, 0);
+        t[d][0] = devs[d]->CreateTexture(2, 2, 1, Format::A8R8G8B8, false);
+        devs[d]->UpdateTexture(t[d][0], 0, {0, 0, 2, 2}, texels, 8);
+        const uint32_t opaque[4] = {0xFF808080, 0xFF20C040, 0xFFFFFFFF, 0xFF4060A0};
+        t[d][1] = devs[d]->CreateTexture(2, 2, 1, Format::A8R8G8B8, false);
+        devs[d]->UpdateTexture(t[d][1], 0, {0, 0, 2, 2}, opaque, 8);
+      }
+      FfDraw two_uv = fd;  // stage 1 reads the same coordinates
+      two_uv.fvf = (fvf & ~0xF00u) | 0x200;  // TEX2
+      two_uv.tex[1] = fd.tex[0];
+      std::vector<std::pair<const char*, FfState>> states;
+      states.push_back({"the scene's state", st});
+      FfState s1 = st;
+      s1.rs[15] = 0;  // no alpha test
+      states.push_back({"no alpha test", s1});
+      s1 = st;
+      s1.rs[24] = 0;  // GREATER 0 with SRCALPHA blending and no depth write
+      s1.rs[14] = 0;
+      states.push_back({"alpha > 0 under blending", s1});
+      states.push_back({"a disabled stage", disabled});
+      states.push_back({"an unbound texture's alpha", alpha_only});
+      const uint32_t ops[][7] = {
+          // COLOROP, ARG1, ARG2, ALPHAOP, ARG1, ARG2, TFACTOR
+          {7, 2, 0, 2, 0, 0, 0},                // ADD; alpha SELECTARG1 DIFFUSE
+          {10, 2, 0x10, 4, 2, 3, 0x80402010},   // SUBTRACT, COMPLEMENT; MODULATE TFACTOR
+          {13, 0, 3, 3, 0, 2, 0xC0C0C0C0},      // BLENDTEXTUREALPHA; SELECTARG2
+          {5, 0x22, 0, 7, 2, 0, 0},             // MODULATE2X, ALPHAREPLICATE; ADD
+          {11, 2, 0, 6, 2, 0, 0},               // ADDSMOOTH; MODULATE4X
+          {24, 2, 0, 2, 2, 0, 0},               // DOTPRODUCT3
+      };
+      for (const auto& o : ops) {
+        s1 = st;
+        s1.tss[0][1] = o[0], s1.tss[0][2] = o[1], s1.tss[0][3] = o[2];
+        s1.tss[0][4] = o[3], s1.tss[0][5] = o[4], s1.tss[0][6] = o[5];
+        s1.rs[60] = o[6];
+        states.push_back({"stage 0 operations", s1});
+      }
+      s1 = st;  // stage 0 into TEMP, stage 1 modulates the second texture by it
+      s1.tss[0][28] = 5;
+      s1.tss[1][1] = 4, s1.tss[1][2] = 2, s1.tss[1][3] = 5;
+      s1.tss[1][4] = 2, s1.tss[1][5] = 5;
+      s1.tss[1][11] = 1;
+      s1.textures[1] = 2;  // the second texture, by slot (fixed below)
+      states.push_back({"two stages through TEMP", s1});
+      s1 = st;
+      s1.rs[35] = 3;  // table fog, linear
+      s1.rs[38] = Bits(0.5f);
+      states.push_back({"table fog", s1});
+      s1 = st;
+      s1.rs[9] = 1;  // flat shading
+      states.push_back({"flat shading", s1});
+      for (const auto& [what, base] : states) {
+        std::vector<uint32_t> img[2];
+        for (int d = 0; d < 2; d++) {
+          FfState s2 = base;
+          s2.textures[0] = base.textures[0] ? t[d][0] : 0;
+          s2.textures[1] = base.textures[1] ? t[d][1] : 0;
+          devs[d]->Clear(0, nullptr, 1, 0xFF102030, 1, 0);
+          devs[d]->DrawFf(s2, base.textures[1] ? two_uv : fd);
+          img[d] = Read(*devs[d]);
+        }
+        // Pixel for pixel; on Metal the colour arithmetic is 16-bit (ff.frag,
+        // HALF), where the compiler may fold a variant's constants in another
+        // order than the general shader computes them: within one step.
+        int maxd = 0;
+        for (size_t i = 0; i < img[0].size() && img[0].size() == img[1].size(); i++)
+          for (int ch = 0; ch < 4; ch++)
+            maxd = std::max(maxd, std::abs(int((img[0][i] >> (8 * ch)) & 0xFF) -
+                                           int((img[1][i] >> (8 * ch)) & 0xFF)));
+#if defined(__APPLE__)
+        constexpr int kTolerance = 1;
+#else
+        constexpr int kTolerance = 0;
+#endif
+        if (maxd > kTolerance) std::printf("%s: off by %d\n", what, maxd);
+        Check(img[0].size() == img[1].size() && maxd <= kTolerance, what);
+      }
+      for (int d = 0; d < 2; d++)
+        for (TextureId id : t[d]) devs[d]->DestroyTexture(id);
+    }
+  }
 
   dev->DestroyTexture(tex2);
   dev->DestroyTexture(tex);

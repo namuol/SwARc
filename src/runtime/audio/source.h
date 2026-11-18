@@ -50,6 +50,22 @@ bool ParseWav(const uint8_t* p, size_t len, WavInfo* out);
 std::unique_ptr<Source> MakeWavSource(Bytes data, std::string* err);
 // MPEG audio (MP3) through libavcodec.
 std::unique_ptr<Source> MakeMp3Source(Bytes data, std::string* err);
+// What a media file on the host holds (libavformat): whether it has audio
+// and video streams, the video's size, and the file's duration. False if
+// libavformat cannot read it.
+struct MediaInfo {
+  bool audio = false, video = false;
+  int width = 0, height = 0;
+  double fps = 0;             // video frame rate, 0 if unknown
+  double seconds = -1;        // -1 if unknown
+};
+bool ProbeMediaFile(const std::string& host_path, MediaInfo* out);
+
+// The first audio stream of a media file on the host (any container and
+// codec libavformat/libavcodec read: WMA in ASF, MP3, Ogg...), decoded as
+// it plays, at most two channels. Seeks to any frame. Null and *err if
+// the file has no decodable audio.
+std::unique_ptr<Source> MakeMediaFileSource(const std::string& host_path, std::string* err);
 // WAV if the data is RIFF, else MP3.
 std::unique_ptr<Source> MakeSource(Bytes data, std::string* err);
 

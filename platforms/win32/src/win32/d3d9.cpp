@@ -23,6 +23,7 @@
 #include "win32/com.h"
 #include "win32/d3d9_impl.h"
 #include "win32/hle.h"
+#include "win32/present_overlay.h"
 #include "win32/user32_window.h"
 #include "x86/present.h"
 #include "x86/x87.h"
@@ -410,6 +411,7 @@ int SamplerIndex(uint32_t s) {
 }
 
 void Bind(uint32_t* slot, uint32_t obj) {
+  if (obj == *slot) return;  // AddRef then Release of the same object: no change
   if (obj) com::AddRef(RefTarget(obj));
   if (*slot) com::Release(RefTarget(*slot));
   *slot = obj;
@@ -462,24 +464,27 @@ HLE_NAMED("d3d9.dll", "IDirect3D9::GetAdapterIdentifier", D3D9_GetAdapterIdentif
   return D3D_OK;
 }
 
-void FillMode(D3DDISPLAYMODE* m, int w, int h, uint32_t fmt) {
+void FillMode(D3DDISPLAYMODE* m, int w, int h, uint32_t fmt, int hz = DesktopRefreshRate()) {
   m->Width = UINT(w);
   m->Height = UINT(h);
-  m->RefreshRate = 60;
+  m->RefreshRate = UINT(hz);
   m->Format = fmt;
 }
 
 HLE_NAMED("d3d9.dll", "IDirect3D9::GetAdapterModeCount", D3D9_GetAdapterModeCount, 3) {
   if (Arg(c, 1) != 0 || !IsDisplayFormat(Arg(c, 2))) return 0;
-  return uint32_t(DisplayModeSizes().size());
+  return uint32_t(DisplayModeSizes().size() * DisplayModeRates().size());
 }
 
 HLE_NAMED("d3d9.dll", "IDirect3D9::EnumAdapterModes", D3D9_EnumAdapterModes, 5) {
   uint32_t fmt = Arg(c, 2), i = Arg(c, 3);
+  // Each size at each rate, rate varying fastest (sorted as drivers do).
   std::vector<ModeSize> modes = DisplayModeSizes();
-  if (Arg(c, 1) != 0 || !IsDisplayFormat(fmt) || i >= modes.size())
+  std::vector<int> rates = DisplayModeRates();
+  if (Arg(c, 1) != 0 || !IsDisplayFormat(fmt) || i >= modes.size() * rates.size())
     return D3DERR_INVALIDCALL;
-  FillMode(G<D3DDISPLAYMODE>(Arg(c, 4)), modes[i].w, modes[i].h, fmt);
+  const ModeSize& m = modes[i / rates.size()];
+  FillMode(G<D3DDISPLAYMODE>(Arg(c, 4)), m.w, m.h, fmt, rates[i % rates.size()]);
   return D3D_OK;
 }
 
@@ -616,6 +621,16 @@ HLE_NAMED("d3d9.dll", "IDirect3DDevice9::TestCooperativeLevel", D3DDev9_TestCoop
   return D3D_OK;
 }
 
+// ValidateDevice(DWORD* passes): whether the current texture stage and
+// blend state renders in one pass. The fixed-function device translates
+// every stage setup the D3D9 state model can express (gfx::Device), so it
+// always does: D3D_OK, one pass. A state it cannot draw is reported where
+// it is drawn, not here.
+HLE_NAMED("d3d9.dll", "IDirect3DDevice9::ValidateDevice", D3DDev9_ValidateDevice, 2) {
+  if (Arg(c, 1)) Wr32(Arg(c, 1), 1);
+  return D3D_OK;
+}
+
 HLE_NAMED("d3d9.dll", "IDirect3DDevice9::GetAvailableTextureMem", D3DDev9_GetAvailableTextureMem, 1) {
   return Game().video_memory_mb << 20;
 }
@@ -650,36 +665,78 @@ HLE_NAMED("d3d9.dll", "IDirect3DDevice9::GetCreationParameters", D3DDev9_GetCrea
   return D3D_OK;
 }
 
-// The D3D cursor is not drawn yet; games that draw their own keep it
-// hidden. A visible one with an image is reported once.
-void NoteCursor(Device& d) {
-  static bool warned = false;
-  if (d.cursor_shown && d.cursor_set && !warned) {
-    warned = true;
-    WarnF("d3d9: the D3D cursor is shown but not drawn yet\n");
-  }
-}
+// The D3D cursor: the image SetCursorProperties gave, drawn over each
+// presented frame while ShowCursor has it on, mapped to back-buffer
+// pixels: where SetCursorPosition last put it (games that track the mouse
+// through DirectInput move it themselves), or else at the pointer as
+// GetCursorPos reports it. Games that draw their own keep it hidden.
 
 // (bShow): returns the previous visibility.
 HLE_NAMED("d3d9.dll", "IDirect3DDevice9::ShowCursor", D3DDev9_ShowCursor, 2) {
   Device* d = Dev(c);
   bool was = d->cursor_shown;
   d->cursor_shown = Arg(c, 1) != 0;
-  NoteCursor(*d);
   return was ? 1 : 0;
 }
 
-// (XHotSpot, YHotSpot, pCursorBitmap)
+// (XHotSpot, YHotSpot, pCursorBitmap): the bitmap is an A8R8G8B8 surface,
+// read now (later changes to it need another SetCursorProperties, as on
+// Windows). Its pixels are where the game wrote them: an offscreen plain
+// surface's memory or a texture level's lock shadow.
 HLE_NAMED("d3d9.dll", "IDirect3DDevice9::SetCursorProperties", D3DDev9_SetCursorProperties, 4) {
   Device* d = Dev(c);
-  if (!Arg(c, 3)) return D3DERR_INVALIDCALL;
+  Surface* s = com::As<Surface>(Arg(c, 3));
+  if (!s || s->desc.Format != 21 /* D3DFMT_A8R8G8B8 */) return D3DERR_INVALIDCALL;
+  uint32_t w = s->desc.Width, h = s->desc.Height, mem = 0, pitch = 0;
+  if (s->kind == Surface::Kind::Offscreen) {
+    mem = s->mem;
+    pitch = s->pitch;
+  } else if (s->kind == Surface::Kind::TextureLevel) {
+    const Texture::Level& l = s->texture->At(uint32_t(s->face), uint32_t(s->level));
+    mem = l.mem;
+    pitch = l.pitch;
+  }
+  if (!mem) {
+    WarnF("d3d9: SetCursorProperties with a surface whose pixels are not in memory\n");
+    return D3DERR_INVALIDCALL;
+  }
+  if (Arg(c, 1) >= w || Arg(c, 2) >= h) return D3DERR_INVALIDCALL;
+  d->cursor_px.resize(size_t(w) * h);
+  for (uint32_t y = 0; y < h; y++)
+    std::memcpy(&d->cursor_px[size_t(y) * w], GPtr(mem + y * pitch), w * 4);
+  d->cursor_w = w;
+  d->cursor_h = h;
+  d->cursor_hot_x = Arg(c, 1);
+  d->cursor_hot_y = Arg(c, 2);
   d->cursor_set = true;
-  NoteCursor(*d);
   return D3D_OK;
 }
 
-// (X, Y, Flags): the D3D cursor follows the host pointer.
+// Draws the cursor over the back buffer, before it is presented.
+void DrawCursor(Device& d) {
+  if (!d.cursor_shown || !d.cursor_set || d.cursor_px.empty()) return;
+  int cx = d.cursor_x, cy = d.cursor_y, cw, ch;
+  if (d.cursor_positioned) ScreenPointToClient(d.hwnd, &cx, &cy);
+  else CursorInClient(d.hwnd, &cx, &cy);
+  ClientAreaSize(d.hwnd, &cw, &ch);
+  const int bw = int(d.pp.BackBufferWidth), bh = int(d.pp.BackBufferHeight);
+  if (cw <= 0 || ch <= 0) return;
+  const int x = int(int64_t(cx) * bw / cw) - int(d.cursor_hot_x);
+  const int y = int(int64_t(cy) * bh / ch) - int(d.cursor_hot_y);
+  const int w = int(d.cursor_w), h = int(d.cursor_h);
+  gfx::ColorTarget back[4] = {};
+  d.gfx->SetRenderTargets(back, 0);
+  d.gfx->BlitBlend(d.cursor_px.data(), uint32_t(w * 4), {0, 0, w, h}, {x, y, x + w, y + h});
+  BindTargets(d);
+}
+
+// (X, Y, Flags): desktop coordinates. D3DCURSOR_IMMEDIATE_UPDATE (1)
+// changes nothing here: the cursor is drawn with the next frame anyway.
 HLE_NAMED("d3d9.dll", "IDirect3DDevice9::SetCursorPosition", D3DDev9_SetCursorPosition, 4) {
+  Device* d = Dev(c);
+  d->cursor_x = int32_t(Arg(c, 1));
+  d->cursor_y = int32_t(Arg(c, 2));
+  d->cursor_positioned = true;
   return 0;
 }
 
@@ -708,6 +765,16 @@ HLE_NAMED("d3d9.dll", "IDirect3DDevice9::Reset", D3DDev9_Reset, 2) {
 // (pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion)
 HLE_NAMED("d3d9.dll", "IDirect3DDevice9::Present", D3DDev9_Present, 5) {
   Device* d = Dev(c);
+  {
+    // Other windows' content over this frame (a video window), then the
+    // cursor over everything.
+    gfx::ColorTarget back[4] = {};
+    d->gfx->SetRenderTargets(back, 0);
+    DrawPresentOverlays({d->gfx.get(), d->hwnd, int(d->pp.BackBufferWidth),
+                         int(d->pp.BackBufferHeight)});
+    BindTargets(*d);
+  }
+  DrawCursor(*d);
   PresentFrame(*d->gfx, int(d->pp.BackBufferWidth), int(d->pp.BackBufferHeight));
   return D3D_OK;
 }
@@ -797,11 +864,24 @@ HLE_NAMED("d3d9.dll", "IDirect3DDevice9::Clear", D3DDev9_Clear, 7) {
   return D3D_OK;
 }
 
+// D3D7's number for a D3D9 transform gfx uses (FfState), 0 for others:
+// VIEW 2, PROJECTION 3 and TEXTURE0-7 16-23 are the same; WORLD-WORLD3
+// are 256-259 (D3D7: 1, 4-6).
+static uint32_t FfTransformType(uint32_t d3d9) {
+  if (d3d9 == 2 || d3d9 == 3 || (d3d9 >= 16 && d3d9 < 24)) return d3d9;
+  if (d3d9 == 256) return 1;
+  if (d3d9 >= 257 && d3d9 <= 259) return d3d9 - 253;
+  return 0;
+}
+
 // (State, Matrix*)
 HLE_NAMED("d3d9.dll", "IDirect3DDevice9::SetTransform", D3DDev9_SetTransform, 3) {
   std::array<float, 16> m;
   std::memcpy(m.data(), GPtr(Arg(c, 2)), sizeof m);
-  Dev(c)->transforms[Arg(c, 1)] = m;
+  Device* d = Dev(c);
+  d->transforms[Arg(c, 1)] = m;
+  if (float* to = gfx::FfTransform(d->ff_base, FfTransformType(Arg(c, 1))))
+    std::memcpy(to, m.data(), sizeof m);
   return D3D_OK;
 }
 
@@ -814,6 +894,67 @@ HLE_NAMED("d3d9.dll", "IDirect3DDevice9::GetTransform", D3DDev9_GetTransform, 3)
   else
     m[0] = m[5] = m[10] = m[15] = 1.0f;
   std::memcpy(GPtr(Arg(c, 2)), m.data(), sizeof m);
+  return D3D_OK;
+}
+
+// ---- fixed-function lighting ---------------------------------------------
+// D3DMATERIAL9 (68 bytes) and D3DLIGHT9 (104 bytes) are D3D7's structures;
+// DrawState (d3d9_draw.cpp) hands the enabled lights to gfx.
+static_assert(sizeof(gfx::Material) == 68 && sizeof(gfx::Light) == 104);
+
+HLE_NAMED("d3d9.dll", "IDirect3DDevice9::SetMaterial", D3DDev9_SetMaterial, 2) {
+  if (!Arg(c, 1)) return D3DERR_INVALIDCALL;
+  std::memcpy(&Dev(c)->material, GPtr(Arg(c, 1)), sizeof(gfx::Material));
+  return D3D_OK;
+}
+
+HLE_NAMED("d3d9.dll", "IDirect3DDevice9::GetMaterial", D3DDev9_GetMaterial, 2) {
+  if (!Arg(c, 1)) return D3DERR_INVALIDCALL;
+  std::memcpy(GPtr(Arg(c, 1)), &Dev(c)->material, sizeof(gfx::Material));
+  return D3D_OK;
+}
+
+HLE_NAMED("d3d9.dll", "IDirect3DDevice9::SetLight", D3DDev9_SetLight, 3) {
+  if (!Arg(c, 2)) return D3DERR_INVALIDCALL;
+  gfx::Light l;
+  std::memcpy(&l, GPtr(Arg(c, 2)), sizeof l);
+  if (l.type < 1 || l.type > 3) return D3DERR_INVALIDCALL;  // POINT, SPOT, DIRECTIONAL
+  Dev(c)->lights[Arg(c, 1)] = l;
+  return D3D_OK;
+}
+
+HLE_NAMED("d3d9.dll", "IDirect3DDevice9::GetLight", D3DDev9_GetLight, 3) {
+  Device* d = Dev(c);
+  auto it = d->lights.find(Arg(c, 1));
+  if (it == d->lights.end() || !Arg(c, 2)) return D3DERR_INVALIDCALL;
+  std::memcpy(GPtr(Arg(c, 2)), &it->second, sizeof it->second);
+  return D3D_OK;
+}
+
+// Enabling a light that was never set gives it D3D's default light
+// (white diffuse, directional along +z), as the runtime does.
+HLE_NAMED("d3d9.dll", "IDirect3DDevice9::LightEnable", D3DDev9_LightEnable, 3) {
+  Device* d = Dev(c);
+  uint32_t i = Arg(c, 1);
+  bool on = Arg(c, 2) != 0;
+  if (on && !d->lights.count(i)) {
+    gfx::Light l{};
+    l.type = 3;
+    l.diffuse = {1, 1, 1, 0};
+    l.direction[2] = 1;
+    d->lights[i] = l;
+  }
+  d->light_on[i] = on;
+  return D3D_OK;
+}
+
+// An enabled light reads back as 128 (the runtime's TRUE here), not 1.
+HLE_NAMED("d3d9.dll", "IDirect3DDevice9::GetLightEnable", D3DDev9_GetLightEnable, 3) {
+  Device* d = Dev(c);
+  uint32_t i = Arg(c, 1);
+  if (!d->lights.count(i) || !Arg(c, 2)) return D3DERR_INVALIDCALL;
+  auto it = d->light_on.find(i);
+  Wr32(Arg(c, 2), it != d->light_on.end() && it->second ? 128 : 0);
   return D3D_OK;
 }
 

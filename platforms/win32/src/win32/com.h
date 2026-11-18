@@ -12,6 +12,8 @@
 
 #include <cstdint>
 #include <memory>
+#include <type_traits>
+#include <typeinfo>
 #include <string>
 #include <vector>
 
@@ -35,11 +37,20 @@ uint32_t Publish(std::shared_ptr<Object> obj, uint32_t vtable);
 
 // Host object behind a guest interface pointer (nullptr if not ours).
 std::shared_ptr<Object> Lookup(uint32_t guest);
+// The same without taking a reference: valid while the guest holds one.
+Object* LookupRaw(uint32_t guest);
 
+// The object as a T, or null. The exact type is compared first: most
+// lookups name it, and a dynamic_cast that fails walks the whole class
+// hierarchy (d3d9's Bind asks every bound object whether it is a Surface).
+// For a final T nothing else can match.
 template <typename T>
 T* As(uint32_t guest) {
-  auto o = Lookup(guest);
-  return dynamic_cast<T*>(o.get());
+  Object* o = LookupRaw(guest);
+  if (!o) return nullptr;
+  if (typeid(*o) == typeid(T)) return static_cast<T*>(o);
+  if constexpr (std::is_final_v<T>) return nullptr;
+  else return dynamic_cast<T*>(o);
 }
 
 uint32_t AddRef(uint32_t guest);

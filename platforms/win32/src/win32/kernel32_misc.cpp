@@ -257,6 +257,26 @@ HLE("kernel32.dll", SystemTimeToFileTime, 2) {
   return 1;
 }
 
+// SystemTimeToTzSpecificLocalTime(TIME_ZONE_INFORMATION* tz, utc, local).
+// tz NULL: the host's zone, with the daylight saving in force at that
+// moment (the host's rules for its date). A given tz: its Bias only; its
+// StandardDate/DaylightDate rules are not applied.
+HLE("kernel32.dll", SystemTimeToTzSpecificLocalTime, 3) {
+  uint32_t tz = Arg(c, 0), utc = Arg(c, 1), out = Arg(c, 2);
+  std::tm t = ReadSystemTime(utc);
+  int ms = Rd16(utc + 14);
+  time_t secs = timegm(&t);
+  std::tm lt{};
+  if (tz) {
+    time_t local = secs - time_t(int32_t(Rd32(tz))) * 60;  // Bias: UTC = local + bias
+    gmtime_r(&local, &lt);
+  } else {
+    localtime_r(&secs, &lt);
+  }
+  WriteSystemTime(out, lt, ms);
+  return 1;
+}
+
 // The SYSTEMTIME a Get*Format call formats; null means now (local).
 std::tm TmFromSystemTime(uint32_t st) {
   if (st) return ReadSystemTime(st);
@@ -331,6 +351,25 @@ HLE("kernel32.dll", FormatMessageA, 7) {
   }
   if (s.size() + 1 > cap) return 0;
   PutStr(buf, s);
+  return uint32_t(s.size());
+}
+
+// The same in WCHARs; `cap` counts WCHARs.
+HLE("kernel32.dll", FormatMessageW, 7) {
+  uint32_t flags = Arg(c, 0), id = Arg(c, 2), buf = Arg(c, 4), cap = Arg(c, 5);
+  if (!(flags & 0x1000)) {  // only FORMAT_MESSAGE_FROM_SYSTEM
+    WarnF("FormatMessageW(flags %X): only FROM_SYSTEM is supported\n", flags);
+    return 0;
+  }
+  std::string s = "Error " + std::to_string(id) + ".\r\n";
+  if (flags & 0x100) {  // FORMAT_MESSAGE_ALLOCATE_BUFFER
+    uint32_t p = HeapAllocProcess(uint32_t(2 * (s.size() + 1)), false);
+    PutWStr(p, s);
+    Wr32(buf, p);
+    return uint32_t(s.size());
+  }
+  if (s.size() + 1 > cap) return 0;
+  PutWStr(buf, s);
   return uint32_t(s.size());
 }
 
@@ -461,6 +500,118 @@ HLE("version.dll", VerQueryValueA, 4) {
     Wr32(out_len, vlen);
   }
   return 1;
+}
+
+
+// ---- W forms -----------------------------------------------------------------------
+
+HLE("kernel32.dll", GetDateFormatW, 6) {
+  std::tm t = TmFromSystemTime(Arg(c, 2));
+  char out[64];
+  if (Arg(c, 1) & 2)  // DATE_LONGDATE
+    std::strftime(out, sizeof out, "%A, %B %d, %Y", &t);
+  else
+    std::snprintf(out, sizeof out, "%d/%d/%d", t.tm_mon + 1, t.tm_mday, t.tm_year + 1900);
+  if (Arg(c, 3)) WarnF("GetDateFormatW: custom picture ignored\n");
+  return PutCounted(Arg(c, 4), Arg(c, 5), out, true);
+}
+
+HLE("kernel32.dll", GetTimeFormatW, 6) {
+  std::tm t = TmFromSystemTime(Arg(c, 2));
+  char out[64];
+  int h = t.tm_hour % 12;
+  if (Arg(c, 1) & 2)  // TIME_NOSECONDS
+    std::snprintf(out, sizeof out, "%d:%02d %s", h ? h : 12, t.tm_min, t.tm_hour < 12 ? "AM" : "PM");
+  else
+    std::snprintf(out, sizeof out, "%d:%02d:%02d %s", h ? h : 12, t.tm_min, t.tm_sec,
+                  t.tm_hour < 12 ? "AM" : "PM");
+  if (Arg(c, 3)) WarnF("GetTimeFormatW: custom picture ignored\n");
+  return PutCounted(Arg(c, 4), Arg(c, 5), out, true);
+}
+
+// The version resource of the game's own EXE, as the A forms (W paths).
+HLE("version.dll", GetFileVersionInfoSizeW, 2) {
+  uint32_t va, size;
+  if (Arg(c, 1)) Wr32(Arg(c, 1), 0);
+  if (!IsOwnExe(NarrowPath(GWStr(Arg(c, 0)))) || !FindVersionResource(&va, &size)) {
+    SetLastError(kErrorFileNotFound);
+    return 0;
+  }
+  return size * 2 + 4;
+}
+
+HLE("version.dll", GetFileVersionInfoW, 4) {
+  uint32_t va, size;
+  uint32_t len = Arg(c, 2), buf = Arg(c, 3);
+  if (!IsOwnExe(NarrowPath(GWStr(Arg(c, 0)))) || !FindVersionResource(&va, &size)) {
+    SetLastError(kErrorFileNotFound);
+    return 0;
+  }
+  std::memcpy(GPtr(buf), GPtr(va), std::min(len, size));
+  if (len >= size + 4) std::memcpy(GPtr(buf + size), "FE2X", 4);
+  return 1;
+}
+
+// VerQueryValueW(block, subblock, out ptr, out len): values point into the
+// block itself (UTF-16 text needs no copy).
+HLE("version.dll", VerQueryValueW, 4) {
+  uint32_t buf = Arg(c, 0), out_ptr = Arg(c, 2), out_len = Arg(c, 3);
+  std::string sub = NarrowPath(GWStr(Arg(c, 1)));
+  std::vector<std::string> path;
+  std::string cur;
+  for (char ch : sub) {
+    if (ch == '\\') {
+      if (!cur.empty()) path.push_back(cur);
+      cur.clear();
+    } else {
+      cur += ch;
+    }
+  }
+  if (!cur.empty()) path.push_back(cur);
+  uint32_t value, vlen;
+  bool text;
+  if (!VersionLookup(buf, path, 0, &value, &vlen, &text)) return 0;
+  Wr32(out_ptr, value);
+  Wr32(out_len, vlen);
+  return 1;
+}
+
+// ---- odds and ends ---------------------------------------------------------------
+
+// File APIs take ANSI (code page) strings, not OEM ones.
+HLE("kernel32.dll", AreFileApisANSI, 0) { return 1; }
+
+HLE("kernel32.dll", OutputDebugStringW, 1) {
+  std::fprintf(stderr, "[guest] %s", Narrow(GWStr(Arg(c, 0))).c_str());
+  return 0;
+}
+
+// No named semaphore is ever shared with another process here; opening
+// one that this process did not create fails as for a missing name.
+HLE("kernel32.dll", OpenSemaphoreA, 3) {
+  SetLastError(2);  // ERROR_FILE_NOT_FOUND
+  return 0;
+}
+
+// Child processes and pipes to them are not supported: games use them for
+// launching tools and browsers. Fails as for a missing program.
+HLE("kernel32.dll", CreateProcessW, 10) {
+  WarnF("CreateProcessW(%s): not supported\n",
+        Arg(c, 1) ? Narrow(GWStr(Arg(c, 1))).c_str()
+                  : (Arg(c, 0) ? Narrow(GWStr(Arg(c, 0))).c_str() : ""));
+  SetLastError(2);  // ERROR_FILE_NOT_FOUND
+  return 0;
+}
+HLE("kernel32.dll", CreatePipe, 4) {
+  WarnF("CreatePipe: not supported\n");
+  SetLastError(50);  // ERROR_NOT_SUPPORTED
+  return 0;
+}
+
+// Device control (volume and disk queries): no devices to talk to.
+HLE("kernel32.dll", DeviceIoControl, 8) {
+  SetLastError(50);  // ERROR_NOT_SUPPORTED
+  return 0;
 }
 
 }  // namespace

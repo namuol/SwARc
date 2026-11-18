@@ -570,7 +570,18 @@ CPUID reports a fixed SSE2-class CPU (Pentium M, family 6 model 13),
 never the host's: lifted code must behave the same on every machine,
 Apple Silicon included (it has no CPUID), and nothing is claimed that
 the lifter does not implement (no SSE3+). The XMM registers and MXCSR
-live in Ctx and are used in place (never cached in locals).
+live in Ctx; lifted functions of 32-bit images keep the XMM registers
+they use in locals, like the general registers: loaded at entry,
+written back at every spill (calls, returns, tail calls, traps) and
+read again at every reload (the lifter's CacheXmm). Guest stores go
+through uint8_t*, which may alias anything, Ctx included, so with the
+registers used in place the compiler reloads them after each store
+(18% of a float-heavy function's time). Functions that FXSAVE/FXRSTOR
+(whose helpers read Ctx) or can be resumed into (SEH, setjmp) use them
+in place, as do x64 images for now. The SSE helpers pass copies to
+their out-of-line slow paths, so a local's address never escapes, and
+the bitwise ones work on 64-bit halves (a byte loop makes the compiler
+split a register into 16 bytes). MXCSR is used in place.
 - Float lanes go through SoftFloat with the SSE NaN rules applied in
   x86/sse.cpp (the shared SoftFloat build carries the x87 ones):
   one NaN operand is returned quieted, two give the first source, SNaN

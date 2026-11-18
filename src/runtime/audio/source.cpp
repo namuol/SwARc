@@ -5,6 +5,7 @@
 
 extern "C" {
 #include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
 #include <libavutil/channel_layout.h>
 }
 
@@ -376,6 +377,183 @@ void ConvertFrame(const AVFrame* f, int out_ch, float* out) {
             32768.0f;
       out[size_t(i) * out_ch + c] = v;
     }
+}
+
+// ---- media files (libavformat) ------------------------------------------------
+
+namespace {
+
+class MediaFileSource : public Source {
+ public:
+  explicit MediaFileSource(std::string path) : path_(std::move(path)) {}
+  ~MediaFileSource() override { Close(); }
+
+  bool Init(std::string* err) {
+    if (!Open(err)) return false;
+    channels_ = std::min(ctx_->ch_layout.nb_channels, 2);
+    rate_ = ctx_->sample_rate;
+    if (channels_ < 1 || rate_ <= 0) return *err = "no audio format", false;
+    const AVStream* st = fmt_->streams[stream_];
+    if (st->duration > 0)
+      length_ = av_rescale_q(st->duration, st->time_base, AVRational{1, rate_});
+    else if (fmt_->duration > 0)
+      length_ = av_rescale(fmt_->duration, rate_, AV_TIME_BASE);
+    return true;
+  }
+
+  int Read(float* out, int n) override {
+    int done = 0;
+    while (done < n) {
+      size_t avail = (pending_.size() - pending_pos_) / size_t(channels_);
+      if (!avail) {
+        if (!Decode()) break;
+        continue;
+      }
+      size_t take = std::min<size_t>(avail, size_t(n - done));
+      std::memcpy(out + size_t(done) * channels_, pending_.data() + pending_pos_,
+                  take * channels_ * sizeof(float));
+      pending_pos_ += take * channels_;
+      done += int(take);
+    }
+    return done;
+  }
+
+  // Seeks to the key frame at or before f, then decodes forward to f
+  // exactly (frames before it are dropped by their timestamps).
+  bool Seek(int64_t f) override {
+    if (f < 0) return false;
+    const AVStream* st = fmt_->streams[stream_];
+    int64_t ts = av_rescale_q(f, AVRational{1, rate_}, st->time_base);
+    if (av_seek_frame(fmt_, stream_, ts, AVSEEK_FLAG_BACKWARD) < 0) {
+      std::string err;
+      Close();
+      if (!Open(&err)) return false;
+    } else {
+      avcodec_flush_buffers(ctx_);
+    }
+    pending_.clear();
+    pending_pos_ = 0;
+    eof_ = false;
+    skip_to_ = f;
+    return true;
+  }
+
+  int64_t Length() const override { return length_; }
+
+ private:
+  bool Open(std::string* err) {
+    if (avformat_open_input(&fmt_, path_.c_str(), nullptr, nullptr) < 0)
+      return *err = "cannot open " + path_, false;
+    if (avformat_find_stream_info(fmt_, nullptr) < 0)
+      return *err = "cannot read the streams of " + path_, false;
+    const AVCodec* codec = nullptr;
+    stream_ = av_find_best_stream(fmt_, AVMEDIA_TYPE_AUDIO, -1, -1, &codec, 0);
+    if (stream_ < 0 || !codec) return *err = "no decodable audio in " + path_, false;
+    ctx_ = avcodec_alloc_context3(codec);
+    if (!ctx_ || avcodec_parameters_to_context(ctx_, fmt_->streams[stream_]->codecpar) < 0 ||
+        avcodec_open2(ctx_, codec, nullptr) < 0)
+      return *err = "cannot open the audio decoder for " + path_, false;
+    pkt_ = av_packet_alloc();
+    frame_ = av_frame_alloc();
+    eof_ = false;
+    return true;
+  }
+
+  void Close() {
+    av_frame_free(&frame_);
+    av_packet_free(&pkt_);
+    avcodec_free_context(&ctx_);
+    avformat_close_input(&fmt_);
+  }
+
+  // Decodes the next frame into pending_. False at the end of the stream.
+  bool Decode() {
+    pending_.clear();
+    pending_pos_ = 0;
+    for (;;) {
+      int r = avcodec_receive_frame(ctx_, frame_);
+      if (r == 0) {
+        Take();
+        av_frame_unref(frame_);
+        if (pending_pos_ < pending_.size()) return true;
+        pending_.clear();
+        pending_pos_ = 0;
+        continue;
+      }
+      if (r != AVERROR(EAGAIN)) return false;  // AVERROR_EOF or an error
+      if (eof_) return false;
+      int rr;
+      while ((rr = av_read_frame(fmt_, pkt_)) >= 0 && pkt_->stream_index != stream_)
+        av_packet_unref(pkt_);
+      if (rr < 0) {
+        eof_ = true;
+        avcodec_send_packet(ctx_, nullptr);  // drain
+        continue;
+      }
+      avcodec_send_packet(ctx_, pkt_);
+      av_packet_unref(pkt_);
+    }
+  }
+
+  // Appends the decoded frame, dropping what lies before skip_to_.
+  void Take() {
+    size_t base = pending_.size();
+    pending_.resize(base + size_t(frame_->nb_samples) * channels_);
+    ConvertFrame(frame_, channels_, pending_.data() + base);
+    if (skip_to_ < 0) return;
+    const AVStream* st = fmt_->streams[stream_];
+    int64_t pts = frame_->best_effort_timestamp;
+    if (pts == AV_NOPTS_VALUE) {
+      skip_to_ = -1;
+      return;
+    }
+    int64_t first = av_rescale_q(pts, st->time_base, AVRational{1, rate_});
+    int64_t drop = std::clamp<int64_t>(skip_to_ - first, 0, frame_->nb_samples);
+    pending_pos_ = base + size_t(drop) * channels_;
+    if (first + frame_->nb_samples > skip_to_) skip_to_ = -1;
+  }
+
+  std::string path_;
+  AVFormatContext* fmt_ = nullptr;
+  AVCodecContext* ctx_ = nullptr;
+  AVPacket* pkt_ = nullptr;
+  AVFrame* frame_ = nullptr;
+  int stream_ = -1;
+  bool eof_ = false;
+  int64_t length_ = -1;
+  int64_t skip_to_ = -1;  // after a seek: the first frame to keep
+  std::vector<float> pending_;
+  size_t pending_pos_ = 0;
+};
+
+}  // namespace
+
+bool ProbeMediaFile(const std::string& host_path, MediaInfo* out) {
+  AVFormatContext* fmt = nullptr;
+  if (avformat_open_input(&fmt, host_path.c_str(), nullptr, nullptr) < 0) return false;
+  bool ok = avformat_find_stream_info(fmt, nullptr) >= 0;
+  if (ok) {
+    *out = MediaInfo{};
+    out->audio = av_find_best_stream(fmt, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0) >= 0;
+    int v = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+    if (v >= 0) {
+      const AVStream* st = fmt->streams[v];
+      out->video = true;
+      out->width = st->codecpar->width;
+      out->height = st->codecpar->height;
+      AVRational r = st->avg_frame_rate.num ? st->avg_frame_rate : st->r_frame_rate;
+      out->fps = r.num && r.den ? av_q2d(r) : 0;
+    }
+    if (fmt->duration > 0) out->seconds = double(fmt->duration) / AV_TIME_BASE;
+  }
+  avformat_close_input(&fmt);
+  return ok;
+}
+
+std::unique_ptr<Source> MakeMediaFileSource(const std::string& host_path, std::string* err) {
+  auto s = std::make_unique<MediaFileSource>(host_path);
+  if (!s->Init(err)) return nullptr;
+  return s;
 }
 
 std::unique_ptr<Source> MakeSource(Bytes data, std::string* err) {

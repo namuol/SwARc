@@ -77,17 +77,28 @@ if(APPLE)
   find_program(RECOMP_SPIRV_CROSS spirv-cross REQUIRED)
 endif()
 set(_shader_dir "${CMAKE_CURRENT_BINARY_DIR}/gfx_shaders")
+# ff.frag is built twice: kFfFragAlphaTest with ALPHA_TEST defined.
 set(_shader_name_vert kFfVert)
 set(_shader_name_frag kFfFrag)
-foreach(_stage vert frag)
-  set(_src "${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/gfx/shaders/ff.${_stage}")
+set(_shader_name_frag_at kFfFragAlphaTest)
+set(_shader_src_vert vert)
+set(_shader_src_frag frag)
+set(_shader_src_frag_at frag)
+set(_shader_defs_frag_at -DALPHA_TEST)
+if(APPLE)
+  # 16-bit colour arithmetic on Metal (ff.frag, HALF).
+  set(_shader_defs_frag -DHALF)
+  list(APPEND _shader_defs_frag_at -DHALF)
+endif()
+foreach(_stage vert frag frag_at)
+  set(_src "${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/gfx/shaders/ff.${_shader_src_${_stage}}")
   set(_out "${_shader_dir}/ff_${_stage}.h")
   if(APPLE)
     add_custom_command(
       OUTPUT "${_out}"
       COMMAND "${CMAKE_COMMAND}" -E make_directory "${_shader_dir}"
-      COMMAND "${RECOMP_GLSLANG}" -V --quiet -DMETAL
-              -o "${_shader_dir}/ff_${_stage}.spv" "${_src}"
+      COMMAND "${RECOMP_GLSLANG}" -V --quiet -DMETAL ${_shader_defs_${_stage}}
+              -S ${_shader_src_${_stage}} -o "${_shader_dir}/ff_${_stage}.spv" "${_src}"
       COMMAND "${RECOMP_SPIRV_CROSS}" --msl --msl-version 20100
               --msl-decoration-binding --msl-no-clip-distance-user-varying
               "${_shader_dir}/ff_${_stage}.spv" --output "${_shader_dir}/ff_${_stage}.metal"
@@ -99,12 +110,22 @@ foreach(_stage vert frag)
     add_custom_command(
       OUTPUT "${_out}"
       COMMAND "${CMAKE_COMMAND}" -E make_directory "${_shader_dir}"
-      COMMAND "${RECOMP_GLSLANG}" -V --target-env vulkan1.0 --quiet
-              --vn ${_shader_name_${_stage}} -o "${_out}" "${_src}"
+      COMMAND "${RECOMP_GLSLANG}" -V --target-env vulkan1.0 --quiet ${_shader_defs_${_stage}}
+              -S ${_shader_src_${_stage}} --vn ${_shader_name_${_stage}} -o "${_out}" "${_src}"
       DEPENDS "${_src}" VERBATIM)
   endif()
   target_sources(recomp_gfx PRIVATE "${_out}")
 endforeach()
+# ff.frag's source too: gpu_device.cpp compiles variants of it per state.
+add_custom_command(
+  OUTPUT "${_shader_dir}/ff_frag_glsl.h"
+  COMMAND "${CMAKE_COMMAND}" -E make_directory "${_shader_dir}"
+  COMMAND "${CMAKE_COMMAND}" -DIN=${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/gfx/shaders/ff.frag
+          -DOUT=${_shader_dir}/ff_frag_glsl.h -DNAME=kFfFragGlsl
+          -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_text.cmake"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/gfx/shaders/ff.frag"
+          "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_text.cmake" VERBATIM)
+target_sources(recomp_gfx PRIVATE "${_shader_dir}/ff_frag_glsl.h")
 target_include_directories(recomp_gfx PRIVATE "${_shader_dir}")
 # Per-pixel host paths: optimised in every build type.
 set_source_files_properties(src/runtime/gfx/format.cpp

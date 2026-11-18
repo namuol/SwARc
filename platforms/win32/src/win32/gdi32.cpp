@@ -1,16 +1,65 @@
-// gdi32: device contexts, fonts and metrics. The game draws through
-// DirectDraw; GDI is only queried (metrics, device caps). Drawing calls
-// succeed without output. If the game turns out to render glyphs through
-// GDI (TextOutW/GetDIBits suggest IME text), real rasterisation goes here.
+// gdi32: fonts, text and metrics. Bitmaps, DCs and blits are in
+// gdi_draw.cpp. Text drawing succeeds without output; games that draw
+// glyphs through GDI need real rasterisation here.
 
 #include <atomic>
+#include <cstdio>
 #include <cstring>
+#include <map>
+#include <mutex>
 
 #include "runtime/log.h"
+#include "win32/gdi_state.h"
 #include "win32/hle.h"
 #include "win32/input_state.h"
 
 namespace recomp::hle {
+
+// ---- bitmaps loaded from files (gdi_state.h) ----------------------------------
+
+namespace {
+std::mutex g_bitmaps_mu;
+std::map<uint32_t, BitmapDesc> g_bitmaps;
+}  // namespace
+
+bool ReadBmpHeader(const std::string& host_path, BitmapDesc* out) {
+  std::FILE* f = std::fopen(host_path.c_str(), "rb");
+  if (!f) return false;
+  uint8_t h[14 + 16];
+  size_t n = std::fread(h, 1, sizeof h, f);
+  std::fclose(f);
+  if (n < 14 + 12 || h[0] != 'B' || h[1] != 'M') return false;
+  auto u16 = [&](int o) { return uint16_t(h[o] | h[o + 1] << 8); };
+  auto u32 = [&](int o) { return uint32_t(u16(o) | uint32_t(u16(o + 2)) << 16); };
+  uint32_t size = u32(14);
+  if (size == 12) {  // BITMAPCOREHEADER: 16-bit width and height
+    out->width = u16(18);
+    out->height = u16(20);
+    out->bits_per_pixel = u16(24);
+  } else if (size >= 40 && n >= 14 + 16) {  // BITMAPINFOHEADER and later
+    out->width = int32_t(u32(18));
+    int32_t height = int32_t(u32(22));
+    out->height = height < 0 ? -height : height;  // top-down
+    out->bits_per_pixel = u16(28);
+  } else {
+    return false;
+  }
+  return out->width > 0 && out->height > 0;
+}
+
+void RememberBitmap(uint32_t handle, const BitmapDesc& d) {
+  std::lock_guard<std::mutex> l(g_bitmaps_mu);
+  g_bitmaps[handle] = d;
+}
+
+bool FindBitmap(uint32_t handle, BitmapDesc* out) {
+  std::lock_guard<std::mutex> l(g_bitmaps_mu);
+  auto it = g_bitmaps.find(handle);
+  if (it == g_bitmaps.end()) return false;
+  *out = it->second;
+  return true;
+}
+
 namespace {
 
 std::atomic<uint32_t> g_next_gdi{0x00E00010};
@@ -21,12 +70,6 @@ HLE("gdi32.dll", GetStockObject, 1) { return 0x00E00000u | (Arg(c, 0) & 0xFF); }
 HLE("gdi32.dll", CreateFontA, 14) { return NewGdi(); }
 HLE("gdi32.dll", CreateFontIndirectA, 1) { return NewGdi(); }
 HLE("gdi32.dll", CreateHatchBrush, 2) { return NewGdi(); }
-HLE("gdi32.dll", CreateSolidBrush, 1) { return NewGdi(); }
-HLE("gdi32.dll", CreateCompatibleDC, 1) { return NewGdi(); }
-HLE("gdi32.dll", CreateCompatibleBitmap, 3) { return NewGdi(); }
-HLE("gdi32.dll", DeleteObject, 1) { return 1; }
-HLE("gdi32.dll", DeleteDC, 1) { return 1; }
-HLE("gdi32.dll", SelectObject, 2) { return 0x00E00000u; }
 
 HLE("gdi32.dll", SetBkMode, 2) { return 2; }      // previous: OPAQUE
 HLE("gdi32.dll", SetTextColor, 2) { return 0; }
@@ -80,6 +123,9 @@ HLE("gdi32.dll", TextOutW, 5) { return 1; }
 HLE("gdi32.dll", ExtTextOutA, 8) { return 1; }
 HLE("gdi32.dll", GetPixel, 3) { return 0; }
 HLE("gdi32.dll", DPtoLP, 3) { return 1; }
+
+// Drawing to a DC has no output (see the top of this file).
+HLE("gdi32.dll", TextOutA, 5) { return 1; }
 
 HLE("gdi32.dll", GetDIBits, 7) {
   WarnF("GetDIBits: no GDI surfaces; returning 0 lines\n");

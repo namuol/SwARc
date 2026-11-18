@@ -491,6 +491,40 @@ HLE("kernel32.dll", GetFileSize, 2) {
   return uint32_t(st.st_size);
 }
 
+// GetFileSizeEx(handle, LARGE_INTEGER* size).
+HLE("kernel32.dll", GetFileSizeEx, 2) {
+  int fd = FdOf(Arg(c, 0));
+  struct stat st;
+  if (fd < 0 || fstat(fd, &st) != 0) {
+    SetLastError(kErrorInvalidHandle);
+    return 0;
+  }
+  Wr64(Arg(c, 1), uint64_t(st.st_size));
+  return 1;
+}
+
+// ---- console -------------------------------------------------------------
+// A GUI process has no console: its standard handles, when it has any,
+// are files or pipes. GetConsoleMode is how a C runtime tells a console
+// from a file, and it fails for those with ERROR_INVALID_HANDLE, so the
+// console paths (WriteConsoleW, ReadConsoleW) are never taken; they fail
+// the same way if called.
+HLE("kernel32.dll", GetConsoleMode, 2) {
+  SetLastError(kErrorInvalidHandle);
+  return 0;
+}
+HLE("kernel32.dll", WriteConsoleW, 5) {
+  SetLastError(kErrorInvalidHandle);
+  return 0;
+}
+HLE("kernel32.dll", ReadConsoleW, 5) {
+  SetLastError(kErrorInvalidHandle);
+  return 0;
+}
+// Without a console the code pages are the system's OEM one.
+HLE("kernel32.dll", GetConsoleOutputCP, 0) { return 437; }
+HLE("kernel32.dll", GetConsoleCP, 0) { return 437; }
+
 HLE("kernel32.dll", GetFileTime, 4) {
   int fd = FdOf(Arg(c, 0));
   struct stat st;
@@ -725,22 +759,33 @@ HLE("kernel32.dll", GetTempFileNameA, 4) {
 
 // ---- find ------------------------------------------------------------------
 
-void FillFindData(uint32_t fd, const std::string& host_dir, const std::string& name) {
+// WIN32_FIND_DATAA (320 bytes) or WIN32_FIND_DATAW (592): the same
+// fields, then cFileName[260] and cAlternateFileName[14] in CHARs or WCHARs.
+void FillFindData(uint32_t fd, const std::string& host_dir, const std::string& name,
+                  bool wide = false) {
   struct stat st{};
   stat((host_dir + "/" + name).c_str(), &st);
-  std::memset(GPtr(fd), 0, 320);
+  std::memset(GPtr(fd), 0, wide ? 592 : 320);
   Wr32(fd + 0, AttributesOf(st, name));
   PutFileTime(fd + 4, platform::StatModifyTime(st));   // creation
   PutFileTime(fd + 12, platform::StatAccessTime(st));  // access
   PutFileTime(fd + 20, platform::StatModifyTime(st));  // write
   Wr32(fd + 28, uint32_t(uint64_t(st.st_size) >> 32));
   Wr32(fd + 32, uint32_t(st.st_size));
-  PutStr(fd + 44, name.substr(0, 259));  // cFileName
+  if (wide) {
+    std::u16string w = Widen(name.substr(0, 259));  // names are Windows-1252
+    std::memcpy(GPtr(fd + 44), w.data(), w.size() * 2);
+  } else {
+    PutStr(fd + 44, name.substr(0, 259));  // cFileName
+  }
   // cAlternateFileName (8.3) left empty.
 }
 
-HLE("kernel32.dll", FindFirstFileA, 2) {
-  std::string pattern = AbsGuest(GStr(Arg(c, 0)));
+// Opens a search for `pattern` (a guest path whose last component may hold
+// wildcards) and fills the first entry; INVALID_HANDLE_VALUE and
+// ERROR_FILE_NOT_FOUND if nothing matches.
+uint32_t FindFirst(const std::string& guest_pattern, uint32_t fd, bool wide) {
+  std::string pattern = AbsGuest(guest_pattern);
   size_t s = pattern.find_last_of('\\');
   std::string gdir = pattern.substr(0, s), mask = pattern.substr(s + 1);
   if (gdir.size() == 2) gdir += '\\';
@@ -760,13 +805,13 @@ HLE("kernel32.dll", FindFirstFileA, 2) {
     SetLastError(kErrorFileNotFound);
     return kInvalidHandle;
   }
-  FillFindData(Arg(c, 1), f->entries[0].first, f->entries[0].second);
+  FillFindData(fd, f->entries[0].first, f->entries[0].second, wide);
   f->next = 1;
   return NewHandle(f);
 }
 
-HLE("kernel32.dll", FindNextFileA, 2) {
-  auto o = GetHandle(Arg(c, 0));
+uint32_t FindNext(uint32_t h, uint32_t fd, bool wide) {
+  auto o = GetHandle(h);
   if (!o || o->type != KObject::Type::Find) {
     SetLastError(kErrorInvalidHandle);
     return 0;
@@ -777,9 +822,29 @@ HLE("kernel32.dll", FindNextFileA, 2) {
     return 0;
   }
   const auto& [hdir, name] = f->entries[f->next++];
-  FillFindData(Arg(c, 1), hdir, name);
+  FillFindData(fd, hdir, name, wide);
   return 1;
 }
+
+HLE("kernel32.dll", FindFirstFileA, 2) { return FindFirst(GStr(Arg(c, 0)), Arg(c, 1), false); }
+HLE("kernel32.dll", FindNextFileA, 2) { return FindNext(Arg(c, 0), Arg(c, 1), false); }
+
+// FindFirstFileExW(name, info level, data, search op, filter, flags). Both
+// info levels (FindExInfoStandard, FindExInfoBasic) fill the same fields
+// here, as cAlternateFileName stays empty anyway. The search ops only
+// narrow what a file system may return (FindExSearchLimitToDirectories is
+// advisory), and FIND_FIRST_EX_CASE_SENSITIVE does not apply to guest
+// paths, which are case-insensitive.
+HLE("kernel32.dll", FindFirstFileExW, 6) {
+  uint32_t level = Arg(c, 1);
+  if (level > 1 || Arg(c, 3) > 1) {  // FindExSearchLimitToDevices: not supported
+    SetLastError(kErrorInvalidParameter);
+    return kInvalidHandle;
+  }
+  return FindFirst(WidePath(Arg(c, 0)), Arg(c, 2), true);
+}
+HLE("kernel32.dll", FindFirstFileW, 2) { return FindFirst(WidePath(Arg(c, 0)), Arg(c, 1), true); }
+HLE("kernel32.dll", FindNextFileW, 2) { return FindNext(Arg(c, 0), Arg(c, 1), true); }
 
 HLE("kernel32.dll", FindClose, 1) {
   return CloseHandleValue(Arg(c, 0)) ? 1 : 0;
@@ -812,6 +877,103 @@ HLE("kernel32.dll", GetDiskFreeSpaceExA, 4) {
   if (Arg(c, 3)) Wr64(Arg(c, 3), 8ull << 30);
   return 1;
 }
+
+
+// ---- the W forms of the path queries --------------------------------------------
+
+// CopyOut for a WCHAR buffer of `size` characters.
+uint32_t CopyOutW(uint32_t buf, uint32_t size, const std::string& s) {
+  if (size > s.size()) {
+    PutWStr(buf, s);
+    return uint32_t(s.size());
+  }
+  return uint32_t(s.size() + 1);
+}
+
+HLE("kernel32.dll", GetCurrentDirectoryW, 2) { return CopyOutW(Arg(c, 1), Arg(c, 0), GuestCurrentDir()); }
+
+// SetCurrentDirectory: relative paths resolve against the new directory.
+uint32_t SetCurrentDirectory(const std::string& g) {
+  std::string full = AbsGuest(g);
+  while (full.size() > 3 && full.back() == '\\') full.pop_back();
+  struct stat st;
+  if (stat(HostPath(full).c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
+    SetLastError(3);  // ERROR_PATH_NOT_FOUND
+    return 0;
+  }
+  std::lock_guard<std::mutex> l(g_cwd_mu);
+  g_cwd = full;
+  return 1;
+}
+HLE("kernel32.dll", SetCurrentDirectoryA, 1) { return SetCurrentDirectory(GStr(Arg(c, 0))); }
+HLE("kernel32.dll", SetCurrentDirectoryW, 1) { return SetCurrentDirectory(WidePath(Arg(c, 0))); }
+
+HLE("kernel32.dll", GetFullPathNameW, 4) {
+  std::string full = AbsGuest(WidePath(Arg(c, 0)));
+  uint32_t size = Arg(c, 1), buf = Arg(c, 2), filepart = Arg(c, 3);
+  uint32_t r = CopyOutW(buf, size, full);
+  if (r == full.size() && filepart) {
+    size_t s = full.find_last_of('\\');
+    Wr32(filepart, s == std::string::npos || s + 1 == full.size() ? 0 : buf + uint32_t(2 * (s + 1)));
+  }
+  return r;
+}
+
+HLE("kernel32.dll", GetTempPathW, 2) {
+  MakeDirs(UserDataRoot() + "/TEMP");
+  return CopyOutW(Arg(c, 1), Arg(c, 0), "C:\\TEMP\\");
+}
+
+HLE("kernel32.dll", GetWindowsDirectoryA, 2) { return CopyOut(Arg(c, 0), Arg(c, 1), "C:\\WINDOWS"); }
+HLE("kernel32.dll", GetWindowsDirectoryW, 2) { return CopyOutW(Arg(c, 0), Arg(c, 1), "C:\\WINDOWS"); }
+
+HLE("kernel32.dll", GetDiskFreeSpaceExW, 4) {
+  if (Arg(c, 1)) Wr64(Arg(c, 1), 8ull << 30);
+  if (Arg(c, 2)) Wr64(Arg(c, 2), 64ull << 30);
+  if (Arg(c, 3)) Wr64(Arg(c, 3), 8ull << 30);
+  return 1;
+}
+
+// CreateDirectoryExW(template, new, security): the template's attributes
+// are not copied.
+HLE("kernel32.dll", CreateDirectoryExW, 3) { return CreateDirectory(WidePath(Arg(c, 1))); }
+
+HLE("kernel32.dll", FindFirstFileExA, 6) {
+  if (Arg(c, 1) > 1 || Arg(c, 3) > 1) {
+    SetLastError(kErrorInvalidParameter);
+    return kInvalidHandle;
+  }
+  return FindFirst(GStr(Arg(c, 0)), Arg(c, 2), false);
+}
+
+// CopyFileW(from, to, failIfExists)
+HLE("kernel32.dll", CopyFileW, 3) {
+  std::string from = HostPath(WidePath(Arg(c, 0)));
+  std::string to = HostPath(WidePath(Arg(c, 1)), PathAccess::kWrite);
+  int in = open(from.c_str(), O_RDONLY | O_CLOEXEC);
+  if (in < 0) {
+    SetLastError(ErrnoToWin(errno));
+    return 0;
+  }
+  int out = open(to.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | (Arg(c, 2) ? O_EXCL : 0), 0644);
+  if (out < 0) {
+    SetLastError(errno == EEXIST ? 80 /* ERROR_FILE_EXISTS */ : ErrnoToWin(errno));
+    close(in);
+    return 0;
+  }
+  char buf[65536];
+  ssize_t n;
+  bool ok = true;
+  while ((n = read(in, buf, sizeof buf)) > 0) ok &= write(out, buf, size_t(n)) == n;
+  close(in);
+  close(out);
+  if (!ok) SetLastError(39);  // ERROR_HANDLE_DISK_FULL
+  return ok ? 1 : 0;
+}
+
+// SetFileTime(file, creation, access, write): file times are the host's;
+// the request succeeds without changing them.
+HLE("kernel32.dll", SetFileTime, 4) { return 1; }
 
 }  // namespace
 }  // namespace hle

@@ -58,6 +58,22 @@ void ShowWindowNoActivate(uint32_t hwnd);
 // frame into it (gfx::FitRect) and the pointer is mapped back.
 void ClientAreaSize(uint32_t hwnd, int* w, int* h);
 
+// A presenter that shows the game's picture in a smaller rectangle than the
+// one the game drew it to (GDI integer scaling): pointer positions in
+// `shown` (client pixels) are reported to the game as the matching points
+// of `asked`, so clicks land where the game drew what the player sees.
+// shown_w = 0 removes it.
+void SetPointerRemap(uint32_t hwnd, int shown_l, int shown_t, int shown_w, int shown_h, int asked_l,
+                     int asked_t, int asked_w, int asked_h);
+
+// The cursor as GetCursorPos reports it, in hwnd's client coordinates.
+void CursorInClient(uint32_t hwnd, int* x, int* y);
+// PostMessage from host code (any thread): queues msg for hwnd's thread.
+// False if hwnd is not a window.
+bool PostWindowMessage(uint32_t hwnd, uint32_t msg, uint32_t wparam, uint32_t lparam);
+// Screen coordinates to hwnd's client coordinates (ScreenToClient).
+void ScreenPointToClient(uint32_t hwnd, int* x, int* y);
+
 // The display mode sizes games can switch to, smallest first: the classic
 // 4:3 and 5:4 ones, common wide ones and the desktop's own size, up to the
 // desktop's size (EnumDisplaySettings, ChangeDisplaySettings, DirectDraw's
@@ -66,5 +82,12 @@ struct ModeSize {
   int w, h;
 };
 std::vector<ModeSize> DisplayModeSizes();
+
+// The refresh rates every mode size is offered at, lowest first: 60 Hz,
+// and the desktop's own rate when it differs (a 120 Hz display offers 60
+// and 120). Presentation follows the host display whatever the game picks;
+// the list lets games that cap or pace by the mode's rate run at the
+// host's.
+std::vector<int> DisplayModeRates();
 
 }  // namespace recomp

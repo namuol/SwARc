@@ -132,9 +132,9 @@ void PutWStr(gaddr va, const std::string& s) {
 uint64_t CallGuest(Ctx& c, gaddr va, std::initializer_list<uint64_t> args) {
   // Guest code runs here: faults are guest access violations again.
   struct DepthGuard {
-    int saved = hle::t_hle_depth;
-    DepthGuard() { hle::t_hle_depth = 0; }
-    ~DepthGuard() { hle::t_hle_depth = saved; }
+    int saved = t_hle_state.depth;
+    DepthGuard() { t_hle_state.depth = 0; }
+    ~DepthGuard() { t_hle_state.depth = saved; }
   } guard;
   if (g_proc->sysv) {
     // System V: rdi, rsi, rdx, rcx, r8, r9, then the stack above the
@@ -323,7 +323,7 @@ static void* ServiceThreadMain(void* arg) {
   CheckHostFp();
   InstallSignalStack();
   RegisterGuestHostThread("service", s->t->tid);
-  hle::t_hle_depth = 1;
+  t_hle_state.depth = 1;
   s->fn();
   t_current = nullptr;
   ReleaseThread(s->t);

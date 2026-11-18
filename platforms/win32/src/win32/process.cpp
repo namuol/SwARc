@@ -188,8 +188,6 @@ int RunProcess(const win32::GameConfig& game, const std::string& exe_path,
   p.pump_events = PumpHostEvents;
   w.game_args = game_args;
   std::string err;
-  if (!w.img.Load(exe_path, p.mem, &err, 0, hle::ImportThunk))
-    FatalF("%s", err.c_str());
   for (const auto& d : game.lifted_dlls) {
     Module& m = w.modules.emplace_back();
     m.name = hle::NormaliseDll(d.name);
@@ -197,6 +195,25 @@ int RunProcess(const win32::GameConfig& game, const std::string& exe_path,
     m.base = d.base;
     MapModule(m);
   }
+  // The EXE's imports from a lifted DLL bind to that DLL's exports (by
+  // name, or "#<ordinal>"), as Windows' loader binds static imports; the
+  // rest go to the HLE.
+  auto bind = [&w](const std::string& dll, const std::string& name) -> gaddr {
+    std::string n = hle::NormaliseDll(dll);
+    for (Module& m : w.modules) {
+      if (m.name != n) continue;
+      m.static_import = true;
+      bool by_ordinal = !name.empty() && name[0] == '#';
+      uint32_t ordinal = by_ordinal ? uint32_t(std::stoul(name.substr(1))) : 0;
+      for (const PeExport& e : m.img.exports)
+        if (by_ordinal ? e.ordinal == ordinal : e.name == name) return e.va;
+      FatalF("%s imports %s!%s, which %s does not export", Game().exe_name.c_str(), dll.c_str(),
+             name.c_str(), m.name.c_str());
+    }
+    return hle::ImportThunk(dll, name);
+  };
+  if (!w.img.Load(exe_path, p.mem, &err, 0, bind))
+    FatalF("%s", err.c_str());
 
   if (p.x64) {
     // Everything above 4 GiB, below the TEBs.
@@ -209,10 +226,19 @@ int RunProcess(const win32::GameConfig& game, const std::string& exe_path,
   for (const Module& m : w.modules) p.vm.MarkReserved(m.img.image_base, m.img.image_size);
 
   // PEB: only the fields Win32 code commonly peeks at. x64 guests see
-  // Windows 10 (22H2), 32-bit ones Windows XP.
+  // Windows 10 (22H2), 32-bit ones Windows XP. ProcessParameters points
+  // at an RTL_USER_PROCESS_PARAMETERS in the same page (its sizes, and
+  // Flags = RTL_USER_PROC_PARAMS_NORMALIZED as a running process has it):
+  // the C runtime's exit path reads Flags to choose how to end the process.
+  constexpr uint32_t kParamsOffset = 0x800;
   if (p.x64) {
     p.mem.Commit(kPebVa64, 0x1000, Prot::RW);
     Wr64(kPebVa64 + 0x10, w.img.image_base);
+    const gaddr params = kPebVa64 + kParamsOffset;
+    Wr32(params + 0, 0x440);  // MaximumLength
+    Wr32(params + 4, 0x440);  // Length
+    Wr32(params + 8, 1);      // Flags: NORMALIZED
+    Wr64(kPebVa64 + 0x20, params);  // ProcessParameters
     Wr32(kPebVa64 + 0xB8, GuestProcessorCount());  // NumberOfProcessors
     Wr32(kPebVa64 + 0x118, 10);     // OSMajorVersion
     Wr32(kPebVa64 + 0x11C, 0);      // OSMinorVersion
@@ -221,6 +247,11 @@ int RunProcess(const win32::GameConfig& game, const std::string& exe_path,
   } else {
     p.mem.Commit(kPebVa, 0x1000, Prot::RW);
     Wr32(kPebVa + 0x08, uint32_t(w.img.image_base));
+    const uint32_t params = kPebVa + kParamsOffset;
+    Wr32(params + 0, 0x290);  // MaximumLength
+    Wr32(params + 4, 0x290);  // Length
+    Wr32(params + 8, 1);      // Flags: NORMALIZED
+    Wr32(kPebVa + 0x10, params);  // ProcessParameters
     Wr32(kPebVa + 0x64, GuestProcessorCount());  // NumberOfProcessors
     Wr32(kPebVa + 0xA4, 5);      // OSMajorVersion (Windows XP)
     Wr32(kPebVa + 0xA8, 1);      // OSMinorVersion
@@ -250,7 +281,20 @@ int RunProcess(const win32::GameConfig& game, const std::string& exe_path,
 
   Thread* main = CreateGuestThread(w.img.stack_reserve);
   RegisterMainThread(main);
-  return int(RunMainThread(main, [&](Ctx& c) { return CallGuest(c, w.img.entry, {}); }));
+  return int(RunMainThread(main, [&](Ctx& c) {
+    // DLLs the EXE imports from are loaded (one reference) and initialised
+    // first, on the main thread, as Windows' loader does before the EXE's
+    // entry point.
+    for (Module& m : w.modules) {
+      if (!m.static_import) continue;
+      m.refs = 1;
+      if (!m.img.entry) continue;
+      m.stale = true;
+      if (!uint32_t(CallGuest(c, m.img.entry, {m.img.image_base, 1 /* PROCESS_ATTACH */, 0})))
+        FatalF("%s: DllMain(PROCESS_ATTACH) failed", m.name.c_str());
+    }
+    return CallGuest(c, w.img.entry, {});
+  }));
 }
 
 }  // namespace recomp

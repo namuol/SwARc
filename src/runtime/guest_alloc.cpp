@@ -198,20 +198,60 @@ bool GuestHeap::IsSegmentStart(uint64_t addr) const {
   return false;
 }
 
+// Best fit, and among free blocks of the best size the one freed first:
+// the order a size-keyed multimap (equal keys in insertion order) gives,
+// which this heap used before and whose addresses the guest has seen. Free
+// block sizes are multiples of kAlign (segments, requests and splits are),
+// so the lists by size / kAlign cover every size up to kBinMax exactly.
 void GuestHeap::InsertFree(uint64_t addr, uint64_t size) {
-  free_[addr] = size;
-  free_by_size_.emplace(size, addr);
+  FreeBlock& b = free_[addr];
+  b = {size};
+  free_end_[addr + size] = addr;
+  if (size > kBinMax) {
+    free_by_size_.emplace(size, addr);
+    return;
+  }
+  const uint64_t i = size / kAlign;
+  b.prev = bin_last_[i];
+  if (b.prev) free_[b.prev].next = addr;
+  else bin_first_[i] = addr;
+  bin_last_[i] = addr;
+  bin_bits_[i / 64] |= uint64_t(1) << (i % 64);
 }
 
 void GuestHeap::EraseFree(uint64_t addr) {
   auto it = free_.find(addr);
-  auto range = free_by_size_.equal_range(it->second);
-  for (auto r = range.first; r != range.second; ++r)
-    if (r->second == addr) {
-      free_by_size_.erase(r);
-      break;
-    }
+  const FreeBlock b = it->second;
+  free_end_.erase(addr + b.size);
+  if (b.size > kBinMax) {
+    auto range = free_by_size_.equal_range(b.size);
+    for (auto r = range.first; r != range.second; ++r)
+      if (r->second == addr) {
+        free_by_size_.erase(r);
+        break;
+      }
+  } else {
+    const uint64_t i = b.size / kAlign;
+    if (b.prev) free_[b.prev].next = b.next;
+    else bin_first_[i] = b.next;
+    if (b.next) free_[b.next].prev = b.prev;
+    else bin_last_[i] = b.prev;
+    if (!bin_first_[i]) bin_bits_[i / 64] &= ~(uint64_t(1) << (i % 64));
+  }
   free_.erase(it);
+}
+
+uint64_t GuestHeap::FindFree(uint64_t size) const {
+  if (size <= kBinMax) {
+    uint64_t i = size / kAlign;
+    for (uint64_t w = i / 64; w < bin_bits_.size(); w++) {
+      uint64_t bits = bin_bits_[w];
+      if (w == i / 64) bits &= ~uint64_t(0) << (i % 64);
+      if (bits) return bin_first_[w * 64 + uint64_t(__builtin_ctzll(bits))];
+    }
+  }
+  auto it = free_by_size_.lower_bound(size);
+  return it == free_by_size_.end() ? 0 : it->second;
 }
 
 uint64_t GuestHeap::Alloc(uint64_t size, bool zero) {
@@ -219,12 +259,12 @@ uint64_t GuestHeap::Alloc(uint64_t size, bool zero) {
   uint64_t req = size;
   if (size > UINT64_MAX - (kAlign - 1)) return 0;  // would round to 0
   size = RoundUp(std::max<uint64_t>(size, 1), kAlign);
-  auto it = free_by_size_.lower_bound(size);
-  if (it == free_by_size_.end()) {
+  uint64_t addr = FindFree(size);
+  if (!addr) {
     if (max_size_ || !Grow(size)) return 0;
-    it = free_by_size_.lower_bound(size);
+    addr = FindFree(size);
   }
-  uint64_t addr = it->second, have = it->first;
+  const uint64_t have = free_.at(addr).size;
   EraseFree(addr);
   if (have - size >= kAlign)
     InsertFree(addr + size, have - size);
@@ -244,20 +284,17 @@ bool GuestHeap::Free(uint64_t p) {
   // Coalesce with the following free block, unless it starts a segment.
   auto nx = free_.find(addr + size);
   if (nx != free_.end() && !IsSegmentStart(nx->first)) {
-    uint64_t s = nx->second;
+    uint64_t s = nx->second.size;
     EraseFree(nx->first);
     size += s;
   }
-  // And with the preceding one.
-  auto pv = free_.lower_bound(addr);
-  if (pv != free_.begin()) {
-    --pv;
-    if (pv->first + pv->second == addr && !IsSegmentStart(addr)) {
-      uint64_t a = pv->first, s = pv->second;
-      EraseFree(a);
-      addr = a;
-      size += s;
-    }
+  // And with the preceding one (the free block that ends here).
+  auto pv = free_end_.find(addr);
+  if (pv != free_end_.end() && !IsSegmentStart(addr)) {
+    uint64_t a = pv->second, s = addr - a;
+    EraseFree(a);
+    addr = a;
+    size += s;
   }
   InsertFree(addr, size);
   return true;
@@ -281,8 +318,8 @@ uint64_t GuestHeap::ReAlloc(uint64_t p, uint64_t size, bool zero,
     // Try to grow into a following free block.
     auto nx = free_.find(p + old_size);
     if (nx != free_.end() && !IsSegmentStart(nx->first) &&
-        old_size + nx->second >= want) {
-      uint64_t total = old_size + nx->second;
+        old_size + nx->second.size >= want) {
+      uint64_t total = old_size + nx->second.size;
       EraseFree(nx->first);
       if (total - want >= kAlign) {
         InsertFree(p + want, total - want);

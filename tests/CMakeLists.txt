@@ -146,10 +146,16 @@ if(RECOMP_HOST)
                        ENVIRONMENT "SDL_VIDEO_DRIVER=offscreen;SDL_GPU_DRIVER=vulkan")
 
 # gfx_ff_test: explicit fixed-function draws (DrawFf) against the
-# stateful ones on SDL_GPU; skipped without a Vulkan device.
+# stateful ones on SDL_GPU, and the fragment shader variants against the
+# general shader; skipped without a Vulkan device (Metal on macOS, where
+# SDL's offscreen video driver offers none).
   add_executable(gfx_ff_test gfx_ff_test.cpp)
   target_link_libraries(gfx_ff_test PRIVATE recomp_gfx recomp_log)
   add_test(NAME gfx_ff COMMAND gfx_ff_test)
-  set_tests_properties(gfx_ff PROPERTIES SKIP_RETURN_CODE 77
-                       ENVIRONMENT "SDL_VIDEO_DRIVER=offscreen;SDL_GPU_DRIVER=vulkan")
+  if(APPLE)
+    set(_gfx_ff_env "SDL_GPU_DRIVER=metal")
+  else()
+    set(_gfx_ff_env "SDL_VIDEO_DRIVER=offscreen;SDL_GPU_DRIVER=vulkan")
+  endif()
+  set_tests_properties(gfx_ff PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "${_gfx_ff_env}")
 endif()

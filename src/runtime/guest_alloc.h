@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <map>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 
 #include "runtime/guest_memory.h"
@@ -86,18 +87,36 @@ class GuestHeap {
     uint64_t requested;  // size the caller asked for (HeapSize)
   };
 
+  // A free block. Sizes up to kBinMax sit in a list per size (in the
+  // order they were freed: prev/next, 0 for none), larger ones in
+  // free_by_size_.
+  struct FreeBlock {
+    uint64_t size;
+    uint64_t prev = 0, next = 0;
+  };
+  static constexpr uint64_t kBinMax = 64 * 1024;
+
   bool Grow(uint64_t need);
   void InsertFree(uint64_t addr, uint64_t size);
   void EraseFree(uint64_t addr);
+  // The smallest free block of at least `size` bytes, the one freed first
+  // among those of that size; 0 if none.
+  uint64_t FindFree(uint64_t size) const;
   bool IsSegmentStart(uint64_t addr) const;
 
   GuestAllocator& vm_;
   uint64_t max_size_;
   uint64_t handle_ = 0;
   std::vector<std::pair<uint64_t, uint64_t>> segments_;  // base, size
-  std::map<uint64_t, Block> used_;
-  std::map<uint64_t, uint64_t> free_;                // addr -> size
-  std::multimap<uint64_t, uint64_t> free_by_size_;   // size -> addr
+  std::unordered_map<uint64_t, Block> used_;
+  std::unordered_map<uint64_t, FreeBlock> free_;     // addr -> block
+  std::unordered_map<uint64_t, uint64_t> free_end_;  // a free block's end -> its addr
+  // Per size / 16 up to kBinMax: the list's first and last block, and a
+  // bit per nonempty list.
+  std::vector<uint64_t> bin_first_ = std::vector<uint64_t>(kBinMax / 16 + 1);
+  std::vector<uint64_t> bin_last_ = std::vector<uint64_t>(kBinMax / 16 + 1);
+  std::vector<uint64_t> bin_bits_ = std::vector<uint64_t>((kBinMax / 16 + 1 + 63) / 64);
+  std::multimap<uint64_t, uint64_t> free_by_size_;   // larger: size -> addr
   mutable std::mutex mu_;
 };
 
