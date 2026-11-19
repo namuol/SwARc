@@ -185,6 +185,28 @@ std::condition_variable_any g_queue_cv;
 uint32_t g_next_hwnd = 0x00010010;
 uint16_t g_next_atom = 0xC100;
 uint32_t g_focus = 0, g_active = 0;
+
+// WH_CBT hooks, the last installed first (see "hooks").
+struct CbtHook {
+  uint32_t handle, proc, tid;  // tid 0: every thread
+};
+std::vector<CbtHook> g_cbt_hooks;
+
+// The procedure of the calling thread's first WH_CBT hook after `after`
+// (0: the first one); 0 if there is none.
+uint32_t NextCbtHook(uint32_t after) {
+  std::lock_guard<std::recursive_mutex> l(g_mu);
+  uint32_t tid = CurrentThread()->tid;
+  bool past = after == 0;
+  for (const CbtHook& k : g_cbt_hooks) {
+    if (!past) {
+      past = k.handle == after;
+      continue;
+    }
+    if (!k.tid || k.tid == tid) return k.proc;
+  }
+  return 0;
+}
 int g_cursor_count = 0;  // ShowCursor display counter
 int32_t g_mouse_x = 0, g_mouse_y = 0;  // screen coordinates
 // The host pointer over the game window, in client (mode) coordinates;
@@ -541,6 +563,22 @@ void AttachClip() {
   if (grab && !Background()) SDL_SetWindowRelativeMouseMode(grab, true);
 }
 
+// Where a key typed into top-level `h` goes: the focus window when it is
+// `h` or lies within it (a control, or a dialog drawn into it and its
+// controls, through parents and owners), or within a dialog that has no
+// owner (it has no host window of its own to type into); else `h`.
+uint32_t KeyTarget(uint32_t h) {
+  std::lock_guard<std::recursive_mutex> l(g_mu);
+  for (uint32_t w = g_focus; w; ) {
+    if (w == h) return g_focus;
+    Window* win = Win(w);
+    if (!win || win->destroyed) break;
+    if (win->is_dialog && !win->parent && !win->sdl) return g_focus;
+    w = win->parent;
+  }
+  return h;
+}
+
 void ActivateApp(uint32_t hwnd, bool active) {
   {
     std::lock_guard<std::recursive_mutex> l(g_mu);
@@ -582,7 +620,12 @@ void HandleSdlEvent(const SDL_Event& e) {
       break;
     case SDL_EVENT_KEY_DOWN:
     case SDL_EVENT_KEY_UP: {
-      uint32_t h = HwndForSdl(e.key.windowID);
+      uint32_t h = e.key.windowID ? HwndForSdl(e.key.windowID) : 0;
+      if (!e.key.windowID) {
+        std::lock_guard<std::recursive_mutex> l(g_mu);
+        Window* f = Win(g_focus);
+        if (f && !f->destroyed) h = g_focus;
+      }
       uint8_t vk = VkFromScancode(e.key.scancode);
       if (!h || !vk) break;
       bool down = e.type == SDL_EVENT_KEY_DOWN;
@@ -620,7 +663,7 @@ void HandleSdlEvent(const SDL_Event& e) {
       }
       uint32_t msg = down ? (sys ? WM_SYSKEYDOWN : WM_KEYDOWN)
                           : (sys ? WM_SYSKEYUP : WM_KEYUP);
-      Post(h, msg, gvk, lp);
+      Post(KeyTarget(h), msg, gvk, lp);
       break;
     }
     case SDL_EVENT_MOUSE_MOTION: {
@@ -1271,7 +1314,8 @@ void InjectTestInput() {
       for (auto& [h, w] : g_windows)
         if (w.sdl && !w.destroyed) wid = SDL_GetWindowID(w.sdl);
     }
-    if (!wid) return;
+    // With no host window (only a dialog without an owner, say), windowID
+    // 0: the key goes to the focus window.
     e.key.windowID = wid;
     HandleSdlEvent(e);
   };
@@ -1769,7 +1813,16 @@ HLE("user32.dll", CreateWindowExA, 12) {
   Wr32(cs + 36, title_va);
   Wr32(cs + 40, cls_va);
   Wr32(cs + 44, exstyle);
-  bool ok = Send(hwnd, WM_NCCREATE, 0, cs) != 0;
+  // HCBT_CREATEWND (3) to the WH_CBT hooks, with a CBT_CREATEWNDA
+  // {lpcs, hwndInsertAfter}: nonzero fails the creation.
+  bool ok = true;
+  if (uint32_t proc = NextCbtHook(0)) {
+    uint32_t cbt = HeapAllocProcess(8, true);
+    Wr32(cbt, cs);
+    ok = CallGuest(c, proc, {3, hwnd, cbt}) == 0;
+    HeapFreeProcess(cbt);
+  }
+  if (ok) ok = Send(hwnd, WM_NCCREATE, 0, cs) != 0;
   if (ok) ok = int32_t(Send(hwnd, WM_CREATE, 0, cs)) != -1;
   HeapFreeProcess(cs);
   if (!ok) {
@@ -2698,7 +2751,40 @@ HLE("user32.dll", TranslateMessage, 1) {
 }
 
 HLE("user32.dll", TranslateAcceleratorA, 3) { return 0; }
-HLE("user32.dll", IsDialogMessageA, 2) { return 0; }
+uint32_t DlgItem(uint32_t dlg, uint32_t id);
+uint32_t UserProc(const char* name);
+
+// IsDialogMessage(dlg, msg): a message for the dialog or one of its
+// controls is handled here: Enter is the default button's WM_COMMAND
+// (DM_GETDEFID, else IDOK), Escape IDCANCEL's; anything else is translated
+// and dispatched. TRUE when it was the dialog's. (No Tab/arrow navigation
+// or mnemonics.)
+HLE("user32.dll", IsDialogMessageA, 2) {
+  uint32_t dlg = Arg(c, 0), m = Arg(c, 1);
+  uint32_t hwnd = Rd32(m), msg = Rd32(m + 4), wp = Rd32(m + 8);
+  {
+    std::lock_guard<std::recursive_mutex> l(g_mu);
+    uint32_t w = hwnd;
+    while (w && w != dlg) {
+      Window* win = Win(w);
+      w = win && (win->style & WS_CHILD) ? win->parent : 0;
+    }
+    if (!w || !dlg) return 0;
+  }
+  if (msg == WM_KEYDOWN && (wp == 0x0D || wp == 0x1B)) {
+    uint32_t id = 2;  // IDCANCEL
+    if (wp == 0x0D) {
+      uint32_t def = Send(dlg, 0x0400 /* DM_GETDEFID */, 0, 0);
+      id = (def >> 16) == 0x534B /* DC_HASDEFID */ ? (def & 0xFFFF) : 1 /* IDOK */;
+    }
+    Send(dlg, 0x0111 /* WM_COMMAND */, id, DlgItem(dlg, id));
+    return 1;
+  }
+  if (msg == WM_CHAR && (wp == 0x0D || wp == 0x1B)) return 1;  // used by the keydown
+  CallGuest(c, UserProc("TranslateMessage"), {m});
+  CallGuest(c, UserProc("DispatchMessageA"), {m});
+  return 1;
+}
 
 HLE("user32.dll", CallWindowProcA, 5) {
   return CallGuest(c, Arg(c, 0), {Arg(c, 1), Arg(c, 2), Arg(c, 3), Arg(c, 4)});
@@ -2908,7 +2994,12 @@ uint32_t CreateDialogFromTemplate(Ctx& c, uint32_t hinst, uint32_t t, uint32_t o
     }
     if (!focus && (istyle & WS_TABSTOP)) focus = hc;
   }
-  Send(hdlg, WM_INITDIALOG, focus, param);
+  // A nonzero result: the dialog manager gives the focus to the control
+  // in wParam (the first tab stop).
+  if (Send(hdlg, WM_INITDIALOG, focus, param) && focus) {
+    std::lock_guard<std::recursive_mutex> l(g_mu);
+    g_focus = focus;
+  }
   if (style & WS_VISIBLE) CallGuest(c, UserProc("ShowWindow"), {hdlg, 5 /* SW_SHOW */});
   return hdlg;
 }
@@ -3024,6 +3115,13 @@ uint32_t DefDlg(Ctx& c, uint32_t hwnd, uint32_t msg, uint32_t wp, uint32_t lp) {
     case WM_CLOSE: Post(hwnd, WM_COMMAND, 2 /* IDCANCEL */, 0); return 0;
     case WM_ERASEBKGND: return 1;
     case WM_INITDIALOG: return 1;
+    case 0x0400: {  // DM_GETDEFID: the first default push button's
+      std::lock_guard<std::recursive_mutex> l(g_mu);
+      for (auto& [h, w] : g_windows)
+        if (!w.destroyed && w.parent == hwnd && w.cls == "button" && (w.style & 0xF) == 1)
+          return w.id | 0x534B0000u;  // DC_HASDEFID
+      return 0;
+    }
     default: return CallDefWindowProc(c, hwnd, msg, wp, lp);
   }
 }
@@ -3851,18 +3949,44 @@ HLE("user32.dll", MsgWaitForMultipleObjects, 5) {
 }
 
 // ---- hooks ---------------------------------------------------------------------------
-// The only hook is WH_KEYBOARD_LL (13), installed to swallow the Windows
-// keys. Our input never produces system hotkeys, so the hook gets a handle
-// and is never called.
+// WH_CBT (5) hooks are called for HCBT_CREATEWND (CbtCreateWindow): class
+// libraries attach their window objects to new windows there. Other hooks
+// get a handle and are never called: WH_KEYBOARD_LL (13), installed to
+// swallow the Windows keys (our input never produces system hotkeys), and
+// WH_MSGFILTER (-1), called only by user32's own modal loops (menus,
+// message boxes), which do not run guest code here.
 
 HLE64("user32.dll", SetWindowsHookExA, 4) {
   static uint32_t next = 0x00F00010;
-  RECOMP_TRACE("  SetWindowsHookExA(type %d, proc %08llX): ignored\n", int32_t(Arg(c, 0)),
-               (unsigned long long)Arg(c, 1));
-  return HandleRet(next += 0x10);
+  int32_t type = int32_t(Arg(c, 0));
+  uint32_t h = next += 0x10;
+  if (type == 5) {
+    std::lock_guard<std::recursive_mutex> l(g_mu);
+    uint32_t tid = uint32_t(Arg(c, 3));
+    g_cbt_hooks.insert(g_cbt_hooks.begin(),
+                       CbtHook{h, uint32_t(Arg(c, 1)), tid});
+  } else {
+    RECOMP_TRACE("  SetWindowsHookExA(type %d, proc %08llX): never called\n", type,
+                 (unsigned long long)Arg(c, 1));
+  }
+  return HandleRet(h);
 }
-HLE64("user32.dll", UnhookWindowsHookEx, 1) { return 1; }
-HLE64("user32.dll", CallNextHookEx, 4) { return 0; }
+HLE64("user32.dll", UnhookWindowsHookEx, 1) {
+  std::lock_guard<std::recursive_mutex> l(g_mu);
+  for (auto it = g_cbt_hooks.begin(); it != g_cbt_hooks.end(); ++it)
+    if (it->handle == uint32_t(Arg(c, 0))) {
+      g_cbt_hooks.erase(it);
+      break;
+    }
+  return 1;
+}
+// CallNextHookEx(hook, code, wp, lp): the next WH_CBT hook of the chain
+// after `hook` (for this thread or global); 0 at its end.
+HLE64("user32.dll", CallNextHookEx, 4) {
+  uint32_t proc = NextCbtHook(uint32_t(Arg(c, 0)));
+  if (!proc) return 0;
+  return CallGuest(c, proc, {Arg(c, 1), Arg(c, 2), Arg(c, 3)});
+}
 
 // ---- cursor ------------------------------------------------------------------------
 

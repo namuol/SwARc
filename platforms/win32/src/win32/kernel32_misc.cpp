@@ -218,6 +218,9 @@ HLE("user32.dll", LoadStringW, 4) {
 }
 
 HLE("kernel32.dll", LockResource, 1) { return Arg(c, 0); }
+// FreeResource: obsolete on Win32, a resource lives as long as its module;
+// FALSE, as Windows returns.
+HLE("kernel32.dll", FreeResource, 1) { return 0; }
 
 // Enumeration callbacks get either an integer id or a guest string.
 uint32_t KeyArg(const std::string& key, uint32_t* tmp) {
