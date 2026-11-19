@@ -81,9 +81,20 @@ void Save() {
   }
 }
 
+void LoadFile();
+
+// The registry file, or the seed on the first run, with the keys every
+// Windows registry has (class libraries open HKCU\Software before
+// creating their own key under it).
 void LoadOnce() {
   if (g_reg_loaded) return;
   g_reg_loaded = true;
+  LoadFile();
+  for (const char* k : {"hkcu", "hkcu\\software", "hklm", "hklm\\software", "hkcr", "hku"})
+    g_reg[k];
+}
+
+void LoadFile() {
   std::ifstream f(RegFile());
   if (!f) {
     Seed();
