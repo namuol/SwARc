@@ -411,6 +411,7 @@ int SamplerIndex(uint32_t s) {
   return -1;
 }
 
+// A bound texture level holds its texture, as the level's own references do.
 void Bind(uint32_t* slot, uint32_t obj) {
   if (obj == *slot) return;  // AddRef then Release of the same object: no change
   if (obj) com::AddRef(RefTarget(obj));

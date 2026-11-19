@@ -99,8 +99,9 @@ target_link_libraries(recomp_gdiplus PUBLIC recomp_win32)
 add_library(recomp_dinput8 SHARED src/win32/dinput8.cpp)
 target_link_libraries(recomp_dinput8 PUBLIC recomp_win32 recomp_xinput)
 
-# Direct3D 9 and D3DX 9 over gfx::Device.
-add_library(recomp_d3d9 SHARED src/win32/d3d9.cpp
+# Direct3D 9 and D3DX 9 over gfx::Device; Direct3D 8 on the Direct3D 9
+# objects (d3d8.cpp).
+add_library(recomp_d3d9 SHARED src/win32/d3d9.cpp src/win32/d3d8.cpp
   src/win32/d3d9_draw.cpp src/win32/d3d9_resource.cpp
   src/win32/d3dx9.cpp src/win32/d3dx9_effect.cpp src/win32/d3dx9_effect_format.cpp)
 target_link_libraries(recomp_d3d9 PUBLIC recomp_win32 recomp_gfx recomp_hlsl)

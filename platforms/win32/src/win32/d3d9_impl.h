@@ -222,6 +222,13 @@ struct Device : com::Object {
   // Where SetCursorPosition put it (desktop coordinates), once it has.
   bool cursor_positioned = false;
   int cursor_x = 0, cursor_y = 0;
+  // Vertex shaders standing in for the fixed-function vertex stage in
+  // draws with a pixel shader (d3d9_draw.cpp), by their HLSL source.
+  struct FfVertexShader {
+    std::shared_ptr<const hlsl::Program> program;
+    gfx::ShaderId id = 0;
+  };
+  std::map<std::string, FfVertexShader> ff_vs;
 };
 
 // IUnknown::QueryInterface for an object with one interface `iid` (and
