@@ -3080,7 +3080,8 @@ void InsnEmitter::Emit64() {
         L("switch (t) {");
         for (uint64_t tgt : jt->second)
           L(Fmt("  case %s: %s", Hex(tgt).c_str(), GotoOrTail(tgt).c_str()));
-        L(Fmt("  default: LIFT_SPILL; ::recomp::BadJump(c, %s, t);", va.c_str()));
+        // As for 32-bit code: an unlisted target is dispatched.
+        L(Fmt("  default: LIFT_SPILL; ::recomp::Dispatch(c, t, %s); return;", va.c_str()));
         L("}");
       } else {
         L(Fmt("LIFT_SPILL; ::recomp::Dispatch(c, t, %s); return;", va.c_str()));
@@ -3549,7 +3550,11 @@ void InsnEmitter::Emit() {
         L("switch (t) {");
         for (uint64_t tgt : jt->second)
           L(Fmt("  case %s: %s", Hex(tgt).c_str(), GotoOrTail(tgt).c_str()));
-        L(Fmt("  default: LIFT_SPILL; ::recomp::BadJump(c, %s, t);",
+        // A target the table does not list: a function entry is a tail
+        // call (a jump through a pointer the program rewrites, which an
+        // analyser resolved to its initial value); anything else is
+        // Dispatch's fatal "indirect branch to unlifted address".
+        L(Fmt("  default: LIFT_SPILL; ::recomp::Dispatch(c, t, %s); return;",
               Hex(in_.va).c_str()));
         L("}");
       } else {
