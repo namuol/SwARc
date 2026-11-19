@@ -73,9 +73,10 @@ TS's and Soldiers' logos and DX-Ball 2's; Return Spelunky's intro story.
 Press it inside the wait for the menu (`press Escape 0.5`), so presses stop
 the moment the menu is up, unless the key does something on the menu:
 
-- DX-Ball 2 quits on Escape at the menu, and a press meant for the logo
-  can land on the menu when the machine is busy (it did, in a parallel
-  run): its logo plays out. Where a stray press is fatal, don't press.
+- DX-Ball 2 quits on Escape at its menu, and Tiberian Sun on its game
+  choice; a press meant for the intro landed there under load (both failed
+  once in parallel runs). Their intros play out: where a stray press is
+  fatal, don't press. RA2's Escape on its menu does nothing, so it presses.
 - Soldiers opens a Quit dialog on Escape at the menu (and the next Escape
   closes it): pressing through its videos needed `!=` on the dialog's text.
   Hiding the videos (above) made that unnecessary.
@@ -103,9 +104,13 @@ language chosen, which skips the language screen.
 
 ## Shots and references
 
-The shot's moment must match the reference's. A menu or sidebar is the same
-whenever it's taken; mid-game screens are not (DX-Ball 2's ball), so prefer
-a still screen, or a `region` of one. Changing when a shot is taken may need
+The shot comes a fixed time after a wait has seen its screen, so it must
+show something that time doesn't change. A menu or sidebar is the same
+whenever it's taken; mid-game screens are not (DX-Ball 2's ball once cleared
+a board before the shot; its shot is now the board before launch, and play
+continues after it for crash coverage). Watch for menus with moving 3D
+scenes too (Soldiers'): take the reference at the same moment after the
+wait as the runs do. Changing when a shot is taken may need
 new local references (`--update`, then look at them).
 
 ## Many at once

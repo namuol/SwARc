@@ -123,3 +123,12 @@ out. Timeouts now scale with N (`<ID>_TEST_WAIT_SCALE`). Then:
 `-j 3` is as fast (RA2's five cases, ~92 s one after another, are the
 floor) and loads the machine half as much: **~100 s for everything, from
 ~12 min.**
+
+## Later the same day: no fatal key presses, steadier shots
+
+A `-j 3` run had two failures: Tiberian Sun quit (an Escape meant for its
+intro landed on the game choice, where Escape quits) and DX-Ball 2's
+mid-game shot showed its second board. Tiberian Sun's intro now plays out
+(skirmish 19 -> 27 s, campaign-list 12 -> 20 s), DX-Ball 2's shot is the
+board before launch (new local reference). Soldiers: 8 s with TEST_HIDE.
+Then `-j 3`, twice: **11/11 in 92 s and 91 s**.
