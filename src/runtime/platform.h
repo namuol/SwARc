@@ -123,4 +123,12 @@ inline constexpr bool kThrowThroughSignalFrames = true;
 // not need it. False if this host has no implementation.
 bool RedirectToCall(void* uc, void (*fn)());
 
+// ---- display
+// The primary display's top safe-area inset in pixels: nonzero where the
+// display has a camera housing at the top (a notched Mac's built-in
+// display), whose strip fullscreen windows do not get. 0 where there is
+// none, or on hosts without the notion. Call after the host's window
+// system is up (SDL video).
+int PrimaryDisplayTopInset();
+
 }  // namespace recomp::platform

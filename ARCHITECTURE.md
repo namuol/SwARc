@@ -894,6 +894,12 @@ game's back. What games see and what the host shows:
   size, the output's size and the fitted rectangle, so the output's
   aspect). Deciding what to do with them (FOV, where 2D goes) is the
   game's.
+- The desktop games see is the area a fullscreen window gets: on a Mac
+  with a notched display, the display less the strip beside the camera
+  housing, where macOS puts no fullscreen window: the menu bar's height
+  (the usable bounds' top), on displays `platform::PrimaryDisplayTopInset`
+  finds a housing on. A game that sizes its swap chain
+  to the desktop then matches its fullscreen surface.
 
 ### Frame pacing
 Old games limit their frame rate by spinning on a millisecond timer,

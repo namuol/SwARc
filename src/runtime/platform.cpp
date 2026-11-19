@@ -21,6 +21,8 @@
 #include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <mach/thread_policy.h>
+#include <objc/message.h>
+#include <objc/runtime.h>
 #include <pthread.h>
 #else
 #include <sys/prctl.h>
@@ -274,6 +276,44 @@ bool RedirectToCall(void* uc, void (*fn)()) {
   (void)uc;
   (void)fn;
   return false;
+#endif
+}
+
+int PrimaryDisplayTopInset() {
+#if defined(__APPLE__)
+  // [[NSScreen screens] firstObject] (the primary display, the one with
+  // the menu bar): its safeAreaInsets (macOS 12) in points, times its
+  // backingScaleFactor. Through the Objective-C runtime: AppKit is loaded
+  // by the window system (SDL), so the base needs no Objective-C source.
+  struct EdgeInsets {
+    double top, left, bottom, right;
+  };
+  Class screen_class = objc_getClass("NSScreen");
+  if (!screen_class) return 0;
+  using IdFn = id (*)(id, SEL);
+  id screens = reinterpret_cast<IdFn>(objc_msgSend)(reinterpret_cast<id>(screen_class),
+                                                    sel_registerName("screens"));
+  if (!screens) return 0;
+  id screen = reinterpret_cast<IdFn>(objc_msgSend)(screens, sel_registerName("firstObject"));
+  SEL safe = sel_registerName("safeAreaInsets");
+  using RespondsFn = bool (*)(id, SEL, SEL);
+  if (!screen || !reinterpret_cast<RespondsFn>(objc_msgSend)(
+                     screen, sel_registerName("respondsToSelector:"), safe))
+    return 0;
+  // Four doubles: arm64 returns them in registers through objc_msgSend,
+  // x86-64 in memory through objc_msgSend_stret.
+#if defined(__x86_64__)
+  EdgeInsets in{};
+  reinterpret_cast<void (*)(EdgeInsets*, id, SEL)>(objc_msgSend_stret)(&in, screen, safe);
+#else
+  const EdgeInsets in = reinterpret_cast<EdgeInsets (*)(id, SEL)>(objc_msgSend)(screen, safe);
+#endif
+  using ScaleFn = double (*)(id, SEL);
+  const double scale =
+      reinterpret_cast<ScaleFn>(objc_msgSend)(screen, sel_registerName("backingScaleFactor"));
+  return in.top > 0 ? int(in.top * (scale > 0 ? scale : 1.0) + 0.5) : 0;
+#else
+  return 0;
 #endif
 }
 

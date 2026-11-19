@@ -11,7 +11,8 @@ namespace recomp {
 // The host desktop's size in pixels, the unit of everything games see
 // (display modes, screen metrics, client areas), even where the desktop
 // is scaled and host windows are sized in points (macOS, scaled Wayland
-// outputs). Does not change when the game switches modes. Main thread;
+// outputs), less a notched display's top strip that fullscreen windows do
+// not get. Does not change when the game switches modes. Main thread;
 // brings up SDL video if needed.
 void DesktopSize(int* w, int* h);
 

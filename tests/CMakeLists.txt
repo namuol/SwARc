@@ -60,6 +60,12 @@ target_compile_features(platform_fault_test PRIVATE cxx_std_20)
 set_source_files_properties(platform_fault_test.cpp PROPERTIES COMPILE_OPTIONS
   "-fnon-call-exceptions;-fno-omit-frame-pointer;-mno-omit-leaf-frame-pointer;-mno-red-zone")
 add_test(NAME platform_fault COMMAND platform_fault_test)
+# platform.cpp asks AppKit through the Objective-C runtime on macOS
+# (PrimaryDisplayTopInset), as recomp_base links it.
+if(APPLE)
+  target_link_libraries(pacing_test PRIVATE objc)
+  target_link_libraries(platform_fault_test PRIVATE objc)
+endif()
 
 # lazy_mem_test: lazily read-back images (DirectDraw Lock of GPU
 # surfaces) through real page faults; portable.

@@ -238,6 +238,10 @@ add_library(recomp_base SHARED
 target_include_directories(recomp_base PUBLIC src)
 target_compile_features(recomp_base PUBLIC cxx_std_20)
 target_link_libraries(recomp_base PUBLIC recomp_log Threads::Threads)
+# The Objective-C runtime: PrimaryDisplayTopInset asks AppKit.
+if(APPLE)
+  target_link_libraries(recomp_base PRIVATE objc)
+endif()
 
 # --- x86 core --------------------------------------------------------------
 # x87 and SSE models (SoftFloat 3e, from the base).
