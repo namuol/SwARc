@@ -333,16 +333,21 @@ HLE("user32.dll", GetSystemMetrics, 1) {
 HLE("user32.dll", GetDoubleClickTime, 0) { return 500; }
 HLE("user32.dll", GetCaretBlinkTime, 0) { return 530; }
 
-HLE("user32.dll", GetSysColor, 1) {
+}  // namespace
+
+uint32_t SysColor(uint32_t i) {
   static const uint32_t kColors[31] = {
       0xC8D0D4, 0x6E3A0A, 0x6A240A, 0x808080, 0xC8D0D4, 0xFFFFFF, 0x000000,
       0x000000, 0x000000, 0xFFFFFF, 0xC8D0D4, 0xC8D0D4, 0x808080, 0x6A240A,
       0xFFFFFF, 0xC8D0D4, 0x808080, 0x808080, 0x000000, 0xC8D0D4, 0xFFFFFF,
       0x404040, 0xC8D0D4, 0x000000, 0xE1FFFF, 0xB5B5B5, 0x800000, 0xF0CAA6,
       0xC0C0C0, 0xC56A31, 0xF0F0F0};
-  uint32_t i = Arg(c, 0);
   return i < 31 ? kColors[i] : 0;
 }
+
+namespace {
+
+HLE("user32.dll", GetSysColor, 1) { return SysColor(Arg(c, 0)); }
 
 HLE("user32.dll", SystemParametersInfoA, 4) {
   uint32_t action = Arg(c, 0), pv = Arg(c, 2);
@@ -379,15 +384,107 @@ HLE("user32.dll", SystemParametersInfoA, 4) {
   }
 }
 
-HLE("user32.dll", RegisterWindowMessageA, 1) {
-  static std::mutex mu;
-  static std::map<std::string, uint32_t> atoms;
-  static uint32_t next = 0xC000;
-  std::lock_guard<std::mutex> l(mu);
-  std::string n = Lower(GStr(Arg(c, 0)));
-  auto it = atoms.find(n);
-  if (it != atoms.end()) return it->second;
-  return atoms[n] = next++;
+// ---- the global atom table -------------------------------------------------------
+// One table of string atoms (0xC000 up), as Windows has: global atoms,
+// registered window messages and clipboard formats share it. Names compare
+// without case and keep the spelling of their first registration. Global
+// atoms count references (GlobalDeleteAtom); registered messages and
+// formats stay. "#<n>" names are integer atoms (1..0xBFFF): the number.
+struct AtomTable {
+  std::mutex mu;
+  struct Entry {
+    std::string name;
+    uint32_t refs = 0;
+    bool permanent = false;
+  };
+  std::map<std::string, uint16_t> by_name;  // lower-case name -> atom
+  std::map<uint16_t, Entry> by_atom;
+  uint32_t next = 0xC000;
+};
+AtomTable& Atoms() {
+  static AtomTable t;
+  return t;
+}
+
+// An integer atom's value, or 0 if `name` is not "#<n>" with n in range.
+uint16_t IntegerAtom(const std::string& name) {
+  if (name.size() < 2 || name[0] != '#') return 0;
+  uint32_t v = 0;
+  for (size_t i = 1; i < name.size(); i++) {
+    if (name[i] < '0' || name[i] > '9') return 0;
+    v = v * 10 + uint32_t(name[i] - '0');
+    if (v >= 0xC000) return 0;
+  }
+  return uint16_t(v);
+}
+
+// The atom for `name`, added if `add` (a reference more, or permanent);
+// 0 if it is not there (or the table is full).
+uint16_t AtomFor(const std::string& name, bool add, bool permanent) {
+  if (uint16_t i = IntegerAtom(name)) return i;
+  AtomTable& t = Atoms();
+  std::lock_guard<std::mutex> l(t.mu);
+  std::string key = Lower(name);
+  auto it = t.by_name.find(key);
+  if (it == t.by_name.end()) {
+    if (!add || t.next > 0xFFFF) return 0;
+    it = t.by_name.emplace(key, uint16_t(t.next++)).first;
+    t.by_atom[it->second].name = name;
+  }
+  if (add) {
+    AtomTable::Entry& e = t.by_atom[it->second];
+    if (permanent) e.permanent = true;
+    else e.refs++;
+  }
+  return it->second;
+}
+
+// (lpString): an atom, or an integer atom when the pointer is one (high
+// word 0), as the Atom functions take MAKEINTATOM values.
+std::string AtomArg(uint32_t p) {
+  return p >> 16 ? GStr(p) : "#" + std::to_string(p & 0xFFFF);
+}
+
+HLE("user32.dll", RegisterWindowMessageA, 1) { return AtomFor(GStr(Arg(c, 0)), true, true); }
+HLE("user32.dll", RegisterClipboardFormatA, 1) { return AtomFor(GStr(Arg(c, 0)), true, true); }
+
+HLE("kernel32.dll", GlobalAddAtomA, 1) { return AtomFor(AtomArg(Arg(c, 0)), true, false); }
+HLE("kernel32.dll", GlobalFindAtomA, 1) { return AtomFor(AtomArg(Arg(c, 0)), false, false); }
+
+// GlobalDeleteAtom(atom): one reference less; returns 0 (success).
+HLE("kernel32.dll", GlobalDeleteAtom, 1) {
+  uint16_t a = uint16_t(Arg(c, 0));
+  if (a < 0xC000) return 0;
+  AtomTable& t = Atoms();
+  std::lock_guard<std::mutex> l(t.mu);
+  auto it = t.by_atom.find(a);
+  if (it == t.by_atom.end()) return a;  // not found: the atom back
+  if (!it->second.permanent && it->second.refs && --it->second.refs == 0) {
+    t.by_name.erase(Lower(it->second.name));
+    t.by_atom.erase(it);
+  }
+  return 0;
+}
+
+// GlobalGetAtomNameA(atom, buffer, size): the name (truncated to size - 1),
+// its length; 0 if there is no such atom.
+HLE("kernel32.dll", GlobalGetAtomNameA, 3) {
+  uint16_t a = uint16_t(Arg(c, 0));
+  uint32_t buf = Arg(c, 1), size = Arg(c, 2);
+  std::string name;
+  if (a && a < 0xC000) {
+    name = "#" + std::to_string(a);
+  } else {
+    AtomTable& t = Atoms();
+    std::lock_guard<std::mutex> l(t.mu);
+    auto it = t.by_atom.find(a);
+    if (it == t.by_atom.end() || !size) return 0;
+    name = it->second.name;
+  }
+  if (!size) return 0;
+  if (name.size() > size - 1) name.resize(size - 1);
+  PutStr(buf, name);
+  return uint32_t(name.size());
 }
 
 // Cursors and icons: opaque handles; the visible cursor is SDL's.

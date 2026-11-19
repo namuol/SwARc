@@ -129,6 +129,9 @@ struct Module {
   bool stale = false;  // has run since it was mapped: map afresh on load
   int tls_index = -1;  // its static TLS slot (x64 guests), -1: none
   bool static_import = false;  // the EXE imports from it: loaded before the EXE runs
+  // Lifted DLLs it imports from (bound to their exports, MapModule):
+  // loaded and initialised before it, released after it.
+  std::vector<Module*> deps;
 };
 
 // The Win32 side of g_proc.
@@ -159,8 +162,18 @@ void ForEachTeb(const std::function<void(gaddr teb)>& f);
 // The EXE's or a lifted DLL's image containing va, or null.
 const PeImage* ImageAt(gaddr va);
 
-// (Re)maps lifted DLL m from its file: fresh data, imports bound.
+// (Re)maps lifted DLL m from its file: fresh data, imports bound (to
+// other lifted DLLs' exports where it imports from them, else the HLE).
 void MapModule(Module& m);
+
+// One reference on lifted DLL m (LoadLibrary, or a static import): the
+// first maps it afresh if it has run before, attaches the lifted DLLs it
+// imports from, then runs its DllMain(PROCESS_ATTACH). False (nothing
+// held) if a DllMain failed. The caller holds the loader lock.
+bool AttachModule(Ctx& c, Module& m);
+// Drops one: the last runs DllMain(PROCESS_DETACH), then releases its
+// dependencies.
+void DetachModule(Ctx& c, Module& m);
 
 // Sets up the process (arena, image, PEB, heaps, command line) and runs
 // the guest entry point on a new guest thread. exe_path is the host file

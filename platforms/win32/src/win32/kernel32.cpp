@@ -176,16 +176,6 @@ Module* LoadedDllAt(gaddr hmodule) {
   return nullptr;
 }
 
-constexpr uint32_t kDllProcessDetach = 0, kDllProcessAttach = 1;
-
-// DllMain(hinstDLL, reason, NULL); false if it failed.
-bool CallDllMain(Ctx& c, Module& m, uint32_t reason) {
-  if (!m.img.entry) return true;
-  m.stale = true;
-  RECOMP_TRACE("  %s: DllMain(%u)\n", m.name.c_str(), reason);
-  return uint32_t(CallGuest(c, m.img.entry, {m.img.image_base, reason, 0})) != 0;
-}
-
 // A guest string argument, ANSI or UTF-16.
 std::string GArg(gaddr p, bool wide) { return wide ? Narrow(GWStr(p)) : GStr(p); }
 
@@ -292,11 +282,8 @@ HLE64("kernel32.dll", DecodePointer, 1) { return Arg(c, 0); }
 gaddr LoadModule(Ctx& c, const char* api, const std::string& n) {
   if (Module* m = LiftedDll(n)) {
     std::lock_guard<std::recursive_mutex> l(g_loader_mu);
-    if (m->refs++) return m->img.image_base;
-    if (m->stale) MapModule(*m);
-    if (!CallDllMain(c, *m, kDllProcessAttach)) {
+    if (!AttachModule(c, *m)) {
       WarnF("%s(%s): DllMain failed\n", api, n.c_str());
-      m->refs = 0;
       SetLastError(kErrorDllInitFailed);
       return 0;
     }
@@ -323,8 +310,7 @@ HLE64("kernel32.dll", LoadLibraryExW, 3) {
 
 HLE64("kernel32.dll", FreeLibrary, 1) {
   std::lock_guard<std::recursive_mutex> l(g_loader_mu);
-  if (Module* m = LoadedDllAt(Arg(c, 0)); m && --m->refs == 0)
-    CallDllMain(c, *m, kDllProcessDetach);
+  if (Module* m = LoadedDllAt(Arg(c, 0))) DetachModule(c, *m);
   return 1;
 }
 
@@ -333,8 +319,7 @@ HLE64("kernel32.dll", FreeLibrary, 1) {
 HLE("kernel32.dll", FreeLibraryAndExitThread, 2) {
   {
     std::lock_guard<std::recursive_mutex> l(g_loader_mu);
-    if (Module* m = LoadedDllAt(Arg(c, 0)); m && --m->refs == 0)
-      CallDllMain(c, *m, kDllProcessDetach);
+    if (Module* m = LoadedDllAt(Arg(c, 0))) DetachModule(c, *m);
   }
   GuestSyncFence();
   throw GuestThreadExit{uint32_t(Arg(c, 1))};
@@ -697,6 +682,30 @@ HLE64("kernel32.dll", LocalFree, 1) {
   if (Arg(c, 0)) g_process_heap->Free(Arg(c, 0));
   return 0;
 }
+
+// Handles are the blocks' pointers (above), so locking is the identity
+// and there is no lock count: Unlock reports "no longer locked" (0),
+// Flags none.
+HLE("kernel32.dll", LocalLock, 1) { return Arg(c, 0); }
+HLE("kernel32.dll", LocalUnlock, 1) { return 0; }
+HLE("kernel32.dll", LocalSize, 1) {
+  uint32_t s = g_process_heap->Size(Arg(c, 0));
+  return s == 0xFFFFFFFF ? 0 : s;
+}
+HLE("kernel32.dll", GlobalFlags, 1) { return 0; }
+HLE("kernel32.dll", GlobalHandle, 1) { return Arg(c, 0); }
+
+// LocalReAlloc / GlobalReAlloc(handle, size, flags): MODIFY (0x80) changes
+// only attributes (nothing to do); otherwise resized, the growth zeroed
+// with ZEROINIT (0x40), moved only if MOVEABLE (2), else NULL when it
+// cannot grow in place.
+uint32_t ReAllocBlock(uint32_t h, uint32_t size, uint32_t flags) {
+  if (flags & 0x80) return h;
+  if (!h) return 0;
+  return g_process_heap->ReAlloc(h, size ? size : 1, flags & 0x40, !(flags & 2));
+}
+HLE("kernel32.dll", LocalReAlloc, 3) { return ReAllocBlock(Arg(c, 0), Arg(c, 1), Arg(c, 2)); }
+HLE("kernel32.dll", GlobalReAlloc, 3) { return ReAllocBlock(Arg(c, 0), Arg(c, 1), Arg(c, 2)); }
 
 // ---- virtual memory ------------------------------------------------------
 

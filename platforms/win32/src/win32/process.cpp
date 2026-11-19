@@ -152,11 +152,41 @@ const PeImage* ImageAt(gaddr va) {
   return nullptr;
 }
 
+// An import of `importer` (the EXE: null) from `dll`: a lifted DLL's export
+// (by name, or "#<ordinal>"), as Windows' loader binds static imports, else
+// the HLE. A lifted DLL not mapped yet gets the HLE thunk for now
+// (RunProcess maps every module twice, so the second pass binds it).
+static gaddr BindImport(Module* importer, const std::string& dll, const std::string& name) {
+  std::string n = hle::NormaliseDll(dll);
+  for (Module& m : g_win32->modules) {
+    if (m.name != n) continue;
+    if (!m.img.image_size) return hle::ImportThunk(dll, name);
+    if (importer) {
+      if (std::find(importer->deps.begin(), importer->deps.end(), &m) == importer->deps.end())
+        importer->deps.push_back(&m);
+    } else {
+      m.static_import = true;
+    }
+    bool by_ordinal = !name.empty() && name[0] == '#';
+    uint32_t ordinal = by_ordinal ? uint32_t(std::stoul(name.substr(1))) : 0;
+    for (const PeExport& e : m.img.exports)
+      if (by_ordinal ? e.ordinal == ordinal : e.name == name) return e.va;
+    FatalF("%s imports %s!%s, which %s does not export",
+           importer ? importer->name.c_str() : Game().exe_name.c_str(), dll.c_str(), name.c_str(),
+           m.name.c_str());
+  }
+  return hle::ImportThunk(dll, name);
+}
+
 void MapModule(Module& m) {
   Process& p = *g_proc;
   if (m.img.image_size) p.mem.Decommit(m.img.image_base, m.img.image_size);
   std::string err;
-  if (!m.img.Load(m.host_path, p.mem, &err, m.base, hle::ImportThunk))
+  m.deps.clear();
+  auto bind = [&m](const std::string& dll, const std::string& name) {
+    return BindImport(&m, dll, name);
+  };
+  if (!m.img.Load(m.host_path, p.mem, &err, m.base, bind))
     FatalF("lifted DLL %s: %s", m.name.c_str(), err.c_str());
   // Windows XP did not set up static TLS for LoadLibrary'd DLLs either,
   // so 32-bit DLLs of that era have none. x64 ones get a slot of their own
@@ -174,6 +204,34 @@ void MapModule(Module& m) {
     Wr32(m.img.tls.index_va, uint32_t(m.tls_index));
   }
   m.stale = false;
+}
+
+bool AttachModule(Ctx& c, Module& m) {
+  if (m.refs++) return true;
+  if (m.stale) MapModule(m);
+  for (size_t i = 0; i < m.deps.size(); i++)
+    if (!AttachModule(c, *m.deps[i])) {
+      while (i--) DetachModule(c, *m.deps[i]);
+      m.refs = 0;
+      return false;
+    }
+  if (!m.img.entry) return true;
+  m.stale = true;
+  RECOMP_TRACE("  %s: DllMain(PROCESS_ATTACH)\n", m.name.c_str());
+  if (uint32_t(CallGuest(c, m.img.entry, {m.img.image_base, 1 /* PROCESS_ATTACH */, 0})))
+    return true;
+  for (Module* d : m.deps) DetachModule(c, *d);
+  m.refs = 0;
+  return false;
+}
+
+void DetachModule(Ctx& c, Module& m) {
+  if (m.refs == 0 || --m.refs) return;
+  if (m.img.entry) {
+    RECOMP_TRACE("  %s: DllMain(PROCESS_DETACH)\n", m.name.c_str());
+    CallGuest(c, m.img.entry, {m.img.image_base, 0 /* PROCESS_DETACH */, 0});
+  }
+  for (auto it = m.deps.rbegin(); it != m.deps.rend(); ++it) DetachModule(c, **it);
 }
 
 // Windows has no small cap on open handles, and games keep their data
@@ -217,24 +275,15 @@ int RunProcess(const win32::GameConfig& game, const std::string& exe_path,
     m.name = hle::NormaliseDll(d.name);
     m.host_path = HostPath(GuestGameDir() + "\\" + d.name);
     m.base = d.base;
-    MapModule(m);
   }
-  // The EXE's imports from a lifted DLL bind to that DLL's exports (by
-  // name, or "#<ordinal>"), as Windows' loader binds static imports; the
-  // rest go to the HLE.
-  auto bind = [&w](const std::string& dll, const std::string& name) -> gaddr {
-    std::string n = hle::NormaliseDll(dll);
-    for (Module& m : w.modules) {
-      if (m.name != n) continue;
-      m.static_import = true;
-      bool by_ordinal = !name.empty() && name[0] == '#';
-      uint32_t ordinal = by_ordinal ? uint32_t(std::stoul(name.substr(1))) : 0;
-      for (const PeExport& e : m.img.exports)
-        if (by_ordinal ? e.ordinal == ordinal : e.name == name) return e.va;
-      FatalF("%s imports %s!%s, which %s does not export", Game().exe_name.c_str(), dll.c_str(),
-             name.c_str(), m.name.c_str());
-    }
-    return hle::ImportThunk(dll, name);
+  // Twice: the first pass maps every DLL (so all export tables are known),
+  // the second binds each one's imports from the others.
+  for (int pass = 0; pass < 2; pass++)
+    for (Module& m : w.modules) MapModule(m);
+  // The EXE's imports from a lifted DLL bind to its exports; the rest go
+  // to the HLE.
+  auto bind = [](const std::string& dll, const std::string& name) {
+    return BindImport(nullptr, dll, name);
   };
   if (!w.img.Load(exe_path, p.mem, &err, 0, bind))
     FatalF("%s", err.c_str());
@@ -309,13 +358,10 @@ int RunProcess(const win32::GameConfig& game, const std::string& exe_path,
     // DLLs the EXE imports from are loaded (one reference) and initialised
     // first, on the main thread, as Windows' loader does before the EXE's
     // entry point.
+    // The DLLs they import from first (AttachModule).
     for (Module& m : w.modules) {
       if (!m.static_import) continue;
-      m.refs = 1;
-      if (!m.img.entry) continue;
-      m.stale = true;
-      if (!uint32_t(CallGuest(c, m.img.entry, {m.img.image_base, 1 /* PROCESS_ATTACH */, 0})))
-        FatalF("%s: DllMain(PROCESS_ATTACH) failed", m.name.c_str());
+      if (!AttachModule(c, m)) FatalF("%s: DllMain(PROCESS_ATTACH) failed", m.name.c_str());
     }
     return CallGuest(c, w.img.entry, {});
   }));
