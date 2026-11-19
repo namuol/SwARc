@@ -1,36 +1,56 @@
 #!/usr/bin/env python3
 """Smoke tests for recomps built on SwARc: scripted runs with pass/fail checks.
 
-    python3 -I tools/smoke.py [--update] [--only NAME[,NAME]] REPO...
+    python3 -I tools/smoke.py [-j N] [--update] [--only NAME[,NAME]] REPO...
 
 Each REPO (a recomp's checkout) lists its cases in smoke/cases.json:
 
     {"run": "tools/try-run.sh", "prefix": "TIBSUN",
-     "cases": [{"name": "skirmish", "input": "tools/input/skirmish-start.txt",
-                "seconds": 56, "min_frames": 300, "shot": "end"}]}
+     "cases": [{"name": "skirmish", "input": "smoke/skirmish.txt",
+                "seconds": 45, "min_frames": 100}]}
 
 `run` and `prefix` can be set per case too. A case runs the game in the
-background with <PREFIX>_TEST_INPUT for `seconds` (the run script rebuilds
-first), then fails if:
-  - the build failed, or the game exited before `seconds` (unless "exits": true);
+background with <PREFIX>_TEST_INPUT (the run script rebuilds first). The
+input script should wait for each screen ("wait": the platform's
+TEST_INPUT, e.g. win32's user32_window.cpp) and end the run itself
+("exit"), so a case takes as long as the game does; `seconds` is then
+only a timeout. See docs/smoke-tests.md for writing fast, steady cases.
+
+A case fails if:
+  - the build failed, or the game exited before `seconds` (unless the
+    script's own "exit" ended it, or "exits": true);
+  - the script has an "exit" that never came, a "wait" that timed out (the
+    pixels it found are reported), or a bad line;
   - the run log shows a crash or fatal error (both save a report);
-  - fewer than `min_frames` frames were presented (counted every 50);
+  - fewer than `min_frames` frames were presented;
   - the input script's "shot <shot>" frame is missing, or differs from the
     reference smoke/ref/<name>.bmp by more than `threshold` (default 0.10:
     the share of sampled pixels that differ clearly), or is blank (one colour).
     "region": [x0, y0, x1, y1] (fractions of the frame) compares only that
-    part: the sidebar of a match whose start position is random, say.
+    part: the sidebar of a match whose start position is random, say;
+  - its "check" (a command; "{out}" is the case's result folder, holding
+    the frames kept with "shot_every": N) exits non-zero.
+Other case keys: "args" (game arguments, after "--"), "fresh_data": true
+(new per-user data each run, as $XDG_DATA_HOME) and "data" (a folder
+copied in as that data first: settings that skip a first-run screen).
 A case with no reference saves its shot as the reference (NEW: look at it).
 --update replaces the references with this run's shots. References are the
 game's own pixels: keep smoke/ref/ out of git.
 
+-j N runs N repos at once (each repo's cases one after another: they share
+its build/run.log). Games then load slower, so timeouts (`seconds` and the
+waits') are multiplied by N: a pass costs no more, a failure takes longer.
+-j 3 runs every recomp in about 100 s (docs/smoke-timings.md).
+
 Runs are muted (SDL_AUDIO_DRIVER=dummy) unless SDL_AUDIO_DRIVER is set.
 
-Results go to REPO/build/smoke/<name>/ (shot, run log, frames). Exit status
-1 if any case failed.
+Results go to REPO/build/smoke/<name>/ (shot, run log, check output). Exit
+status 1 if any case failed.
 """
 
 import argparse
+import concurrent.futures
+import re
 import json
 import os
 import shutil
@@ -113,11 +133,19 @@ def shot_name(input_path):
     return None
 
 
-def run_case(repo, defaults, case, update):
+def script_exits(input_path):
+    """True if the input script ends the run itself ("exit")."""
+    with open(input_path) as f:
+        return any(line.split("#")[0].split()[1:2] == ["exit"] for line in f)
+
+
+def run_case(repo, defaults, case, update, scale=1):
     name = case["name"]
     prefix = case.get("prefix", defaults.get("prefix"))
     script = case.get("run", defaults.get("run", "tools/try-run.sh"))
-    seconds = int(case["seconds"])
+    # With N repos at once each game loads slower: timeouts (the case's and
+    # its waits', <PREFIX>_TEST_WAIT_SCALE) are scaled by N.
+    seconds = int(case["seconds"]) * scale
     inp = os.path.join(repo, case["input"])
     out = os.path.join(repo, "build", "smoke", name)
     shutil.rmtree(out, ignore_errors=True)
@@ -125,10 +153,27 @@ def run_case(repo, defaults, case, update):
     env = dict(os.environ)
     # Muted (SDL's dummy audio driver) unless SDL_AUDIO_DRIVER is set.
     env.setdefault('SDL_AUDIO_DRIVER', 'dummy')
+    # "fresh_data": per-user data (saves, settings) made anew for each run,
+    # from the "data" folder if given (copied as $XDG_DATA_HOME), so no
+    # earlier run or play session changes what the game shows.
+    if case.get("fresh_data") or case.get("data"):
+        data = os.path.join(out, "data")
+        if case.get("data"):
+            shutil.copytree(os.path.join(repo, case["data"]), data)
+        else:
+            os.makedirs(data)
+        env["XDG_DATA_HOME"] = data
+    ends = script_exits(inp)
     env.update({f"{prefix}_TEST_INPUT": inp, f"{prefix}_SHOT_DIR": out,
-                f"{prefix}_SHOT_EVERY": "50", f"{prefix}_BACKGROUND": "1"})
+                f"{prefix}_BACKGROUND": "1", f"{prefix}_TEST_WAIT_SCALE": str(scale)})
+    if case.get("shot_every"):  # frames the "check" looks at
+        env[f"{prefix}_SHOT_EVERY"] = str(case["shot_every"])
+    elif not ends:  # frames counted from the saved ones; an exit logs the count
+        env[f"{prefix}_SHOT_EVERY"] = "50"
     started = time.time()
-    proc = subprocess.run([os.path.join(repo, script), str(seconds)], cwd=repo, env=env,
+    args = case.get("args", [])
+    proc = subprocess.run([os.path.join(repo, script), str(seconds)] + (["--"] + args if args else []),
+                          cwd=repo, env=env,
                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     took = time.time() - started
     with open(os.path.join(out, "try-run.txt"), "w") as f:
@@ -144,13 +189,36 @@ def run_case(repo, defaults, case, update):
     if "BUILD FAILED" in proc.stdout:
         problems.append("build failed")
     elif "exited with" in proc.stdout and not case.get("exits"):
-        problems.append("game exited early (" + proc.stdout.split("exited with")[1].split()[0] + ")")
+        status_code = proc.stdout.split("exited with")[1].split()[0]
+        if not (ends and status_code == "0" and "TEST_INPUT: exit" in log):
+            problems.append("game exited early (" + status_code + ")")
+    elif ends and "TEST_INPUT: exit" not in log:
+        problems.append(f"the script's exit never came within {seconds} s")
+    for m in re.finditer(r"TEST_INPUT: wait \(line (\d+)\) timed out after ([\d.]+) s; the frame has(.*)", log):
+        problems.append(f"wait at line {m.group(1)} timed out ({m.group(2)} s):{m.group(3)}")
+    if "TEST_INPUT: bad" in log:
+        problems.append("the input script has a bad line (see run.log)")
+    waits = [f"L{m.group(1)} {float(m.group(2)):.1f}s"
+             for m in re.finditer(r"TEST_INPUT: wait \(line (\d+)\) matched after ([\d.]+) s", log)]
+    if waits:
+        notes.append("waits " + ", ".join(waits))
     if "report saved to" in log:  # every crash and fatal error saves one
         problems.append("crash or fatal error (report in run.log)")
     frames = [int(f[6:11]) for f in os.listdir(out) if f.startswith("frame_") and f.endswith(".bmp")]
     presented = max(frames, default=0)
+    m = re.search(r"TEST_INPUT: exit at [\d.]+ s, (\d+) frames presented", log)
+    if m:
+        presented = int(m.group(1))
     if presented < case.get("min_frames", 1):
         problems.append(f"~{presented} frames presented, want {case.get('min_frames', 1)}")
+    if case.get("check") and not problems:
+        cmd = [a.replace("{out}", out) for a in case["check"]]
+        chk = subprocess.run(cmd, cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        with open(os.path.join(out, "check.txt"), "w") as f:
+            f.write(chk.stdout)
+        if chk.returncode != 0:
+            last = [l for l in chk.stdout.splitlines() if l.strip()][-1:] or ["(no output)"]
+            problems.append(f"check failed: {last[0]}")
     for f in os.listdir(out):  # the frame counting needs no pixels kept
         if f.startswith("frame_"):
             os.remove(os.path.join(out, f))
@@ -182,36 +250,46 @@ def run_case(repo, defaults, case, update):
     return status, took, problems, notes, out
 
 
+def run_repo(repo, only, update, scale=1):
+    """Runs one repo's cases in order (they share its build/run.log)."""
+    repo = os.path.abspath(repo)
+    with open(os.path.join(repo, "smoke", "cases.json")) as f:
+        spec = json.load(f)
+    results = []
+    for case in spec["cases"]:
+        if only and case["name"] not in only:
+            continue
+        label = f"{os.path.basename(repo)}/{case['name']}"
+        print(f"... {label} (up to {case['seconds']} s)", flush=True)
+        status, took, problems, notes, out = run_case(repo, spec, case, update, scale)
+        results.append((label, status, took, problems, notes, out))
+        print(f"{status:4}  {label}  {took:.0f} s  " + "; ".join(problems + notes), flush=True)
+    return results
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("repos", nargs="+")
     ap.add_argument("--update", action="store_true", help="replace references with this run's shots")
     ap.add_argument("--only", help="comma-separated case names")
+    ap.add_argument("-j", "--jobs", type=int, default=1,
+                    help="repos run at once (each repo's cases still run one at a time)")
     args = ap.parse_args()
     only = set(args.only.split(",")) if args.only else None
-    failed = 0
-    results = []
-    for repo in args.repos:
-        repo = os.path.abspath(repo)
-        with open(os.path.join(repo, "smoke", "cases.json")) as f:
-            spec = json.load(f)
-        for case in spec["cases"]:
-            if only and case["name"] not in only:
-                continue
-            label = f"{os.path.basename(repo)}/{case['name']}"
-            print(f"... {label} ({case['seconds']} s)", flush=True)
-            status, took, problems, notes, out = run_case(repo, spec, case, args.update)
-            failed += status == "FAIL"
-            results.append((label, status, took, problems, notes, out))
-            print(f"{status:4}  {label}  {took:.0f} s  " + "; ".join(problems + notes), flush=True)
+    started = time.time()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
+        scale = min(max(1, args.jobs), len(args.repos))
+        per_repo = list(pool.map(lambda r: run_repo(r, only, args.update, scale), args.repos))
+    results = [r for rs in per_repo for r in rs]
+    failed = sum(1 for r in results if r[1] == "FAIL")
     print()
     for label, status, took, problems, notes, out in results:
-        print(f"{status:4}  {label}")
+        print(f"{status:4}  {label}  {took:.0f} s")
         for p in problems:
             print(f"        {p}")
         if status == "FAIL":
             print(f"        see {out}")
-    print(f"\n{len(results) - failed}/{len(results)} passed")
+    print(f"\n{len(results) - failed}/{len(results)} passed in {time.time() - started:.0f} s")
     return 1 if failed else 0
 
 
