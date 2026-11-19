@@ -34,7 +34,7 @@ const std::vector<std::string>& KnownDlls() {
       "imm32.dll",    "shfolder.dll", "ntdll.dll",   "opengl32.dll",
       "comctl32.dll",
       // Appended (handles are by index): games that load these by name.
-      "shell32.dll",  "dsound.dll",   "vulkan-1.dll"};
+      "shell32.dll",  "dsound.dll",   "vulkan-1.dll", "d3d8.dll"};
   return dlls;
 }
 
