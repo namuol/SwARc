@@ -107,6 +107,7 @@ int main(int argc, char** argv) {
   uint64_t per_file = 12000;
   uint64_t dump = 0;
   std::string x87_test, int_test, sse_test, forms, code;
+  bool sweep_gaps = false;
   bool forms_x64 = false;
   std::set<uint64_t> only;
   for (int i = 1; i < argc; i++) {
@@ -120,6 +121,7 @@ int main(int argc, char** argv) {
     else if (a == "--out") outdir = val();
     else if (a == "--insns-per-file") per_file = std::stoull(val());
     else if (a == "--dump") dump = std::stoull(val(), nullptr, 16);
+    else if (a == "--sweep-gaps") sweep_gaps = true;
     else if (a == "--x87-test") x87_test = val();
     else if (a == "--int-test") int_test = val();
     else if (a == "--sse-test") sse_test = val();
@@ -250,6 +252,12 @@ int main(int argc, char** argv) {
           candidate(&m, p.mem.read<uint32_t>(a), &from_data_ptrs);
     }
   size_t recovered_tables = 0, extended_tables = 0;
+  // Bytes of .text that some lifted function decodes (for --sweep-gaps).
+  std::map<const lifter::Module*, std::vector<bool>> covered;
+  for (const auto& m : p.modules) covered[&m].assign(m.text_hi - m.text_lo, false);
+  size_t from_gaps = 0, gap_rejected = 0;
+  std::set<uint64_t> gap_entries;
+  for (int sweep = 0;; sweep++) {
   while (!work.empty()) {
     uint64_t e = work.front();
     work.pop_front();
@@ -288,6 +296,58 @@ int main(int argc, char** argv) {
         lifter::BuildFunction(p, dec, e, &f);
       }
     }
+    for (const auto& [va, in] : f.insns) {
+      const lifter::Module* im = p.TextOf(va);
+      if (!im) continue;
+      auto& cv = covered[im];
+      for (uint64_t b = va; b < in.next() && b < im->text_hi; b++) cv[b - im->text_lo] = true;
+    }
+    for (const auto& [jva, ts] : p.jumptables) {
+      (void)ts;
+      auto jt = f.insns.find(jva);
+      if (jt == f.insns.end() || jt->second.ops[0].type != ZYDIS_OPERAND_TYPE_MEMORY) continue;
+      const uint64_t t0 = static_cast<uint32_t>(jt->second.ops[0].mem.disp.value);
+      const lifter::Module* tm = p.TextOf(t0);
+      if (!tm) continue;
+      for (uint64_t a = t0; a + 4 <= tm->text_hi; a += 4) {
+        if (p.TextOf(p.mem.read<uint32_t>(a)) != tm) break;
+        for (int k = 0; k < 4; k++) covered[tm][a + k - tm->text_lo] = true;
+      }
+    }
+    // A gap's code that does not look like compiled user code (undecodable
+    // bytes, privileged or obsolete instructions) is data: dropped.
+    if (gap_entries.count(e)) {
+      bool bogus = false;
+      for (const auto& [va, in] : f.insns) {
+        if (!in.ok) { bogus = true; break; }
+        switch (in.d.mnemonic) {
+          case ZYDIS_MNEMONIC_IN: case ZYDIS_MNEMONIC_OUT: case ZYDIS_MNEMONIC_INSB:
+          case ZYDIS_MNEMONIC_INSD: case ZYDIS_MNEMONIC_INSW: case ZYDIS_MNEMONIC_OUTSB:
+          case ZYDIS_MNEMONIC_OUTSD: case ZYDIS_MNEMONIC_OUTSW: case ZYDIS_MNEMONIC_CLI:
+          case ZYDIS_MNEMONIC_STI: case ZYDIS_MNEMONIC_HLT: case ZYDIS_MNEMONIC_IRETD:
+          case ZYDIS_MNEMONIC_IRET: case ZYDIS_MNEMONIC_LES: case ZYDIS_MNEMONIC_LDS:
+          case ZYDIS_MNEMONIC_ARPL: case ZYDIS_MNEMONIC_BOUND: case ZYDIS_MNEMONIC_AAA:
+          case ZYDIS_MNEMONIC_AAD: case ZYDIS_MNEMONIC_AAM: case ZYDIS_MNEMONIC_AAS:
+          case ZYDIS_MNEMONIC_DAA: case ZYDIS_MNEMONIC_DAS: case ZYDIS_MNEMONIC_SALC:
+          case ZYDIS_MNEMONIC_INTO: case ZYDIS_MNEMONIC_SLDT: case ZYDIS_MNEMONIC_VERW:
+          case ZYDIS_MNEMONIC_RDPMC: case ZYDIS_MNEMONIC_ENTER: case ZYDIS_MNEMONIC_INT1:
+            bogus = true;
+            break;
+          default:
+            if (in.d.mnemonic == ZYDIS_MNEMONIC_JMP &&
+                in.ops[0].type == ZYDIS_OPERAND_TYPE_POINTER)
+              bogus = true;  // far jmp
+            break;
+        }
+        if (bogus) break;
+      }
+      if (bogus) {
+        p.entries.erase(e);
+        p.weak.erase(e);
+        gap_rejected++;
+        continue;
+      }
+    }
     for (const auto* s : {&f.direct_calls, &f.tail_calls, &f.setjmp_returns})
       for (uint64_t t : *s) {
         if (!p.InText(t)) continue;
@@ -310,10 +370,42 @@ int main(int argc, char** argv) {
       }
     }
   }
+  if (!sweep_gaps || !only.empty()) break;
+  // --sweep-gaps: code that nothing found refers to (reached through a
+  // computed address, or never) is lifted too, as weak entries: each run
+  // of .text no function decodes, past padding and pointer tables, starts
+  // one, until no gap is left that decodes.
+  size_t before_sweep = from_gaps;
+  for (const auto& m : p.modules) {
+    auto& cv = covered[&m];
+    for (uint64_t a = m.text_lo; a < m.text_hi;) {
+      if (cv[a - m.text_lo]) { a++; continue; }
+      const uint8_t b0 = p.mem.read<uint8_t>(a);
+      if (b0 == 0xCC || b0 == 0x90 || b0 == 0x00) { a++; continue; }
+      // A run of dwords that point into this .text: a table, not code.
+      if (a % 4 == 0 && a + 8 <= m.text_hi &&
+          p.TextOf(p.mem.read<uint32_t>(a)) == &m && p.TextOf(p.mem.read<uint32_t>(a + 4)) == &m) {
+        while (a + 4 <= m.text_hi && p.TextOf(p.mem.read<uint32_t>(a)) == &m) a += 4;
+        continue;
+      }
+      lifter::Insn in;
+      if (p.entries.count(a) || !dec.Decode(p, a, &in) || !in.ok) {
+        a++;
+        continue;
+      }
+      candidate(&m, a, &from_gaps);
+      gap_entries.insert(a);
+      // Skip the rest of this gap; the next sweep sees what is still left.
+      while (a < m.text_hi && !cv[a - m.text_lo]) a++;
+    }
+  }
+  if (from_gaps == before_sweep) break;
+  std::fprintf(stderr, "sweep %d: %zu gap entries, %zu rejected\n", sweep, from_gaps, gap_rejected);
+  }
   std::printf("functions: %zu (%zu from Ghidra/exports, %zu discovered: "
-              "%zu via code pointers, %zu via data pointers; %zu weak)\n",
+              "%zu via code pointers, %zu via data pointers, %zu from gaps; %zu weak)\n",
               p.entries.size(), initial, p.entries.size() - initial,
-              from_code_ptrs, from_data_ptrs, p.weak.size());
+              from_code_ptrs, from_data_ptrs, from_gaps, p.weak.size());
   std::printf("jump tables: %zu from Ghidra (%zu extended), %zu recovered\n",
               p.jumptables.size() - recovered_tables, extended_tables, recovered_tables);
 
