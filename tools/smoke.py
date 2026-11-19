@@ -24,6 +24,8 @@ A case with no reference saves its shot as the reference (NEW: look at it).
 --update replaces the references with this run's shots. References are the
 game's own pixels: keep smoke/ref/ out of git.
 
+Runs are muted (SDL_AUDIO_DRIVER=dummy) unless SDL_AUDIO_DRIVER is set.
+
 Results go to REPO/build/smoke/<name>/ (shot, run log, frames). Exit status
 1 if any case failed.
 """
@@ -121,6 +123,8 @@ def run_case(repo, defaults, case, update):
     shutil.rmtree(out, ignore_errors=True)
     os.makedirs(out)
     env = dict(os.environ)
+    # Muted (SDL's dummy audio driver) unless SDL_AUDIO_DRIVER is set.
+    env.setdefault('SDL_AUDIO_DRIVER', 'dummy')
     env.update({f"{prefix}_TEST_INPUT": inp, f"{prefix}_SHOT_DIR": out,
                 f"{prefix}_SHOT_EVERY": "50", f"{prefix}_BACKGROUND": "1"})
     started = time.time()
