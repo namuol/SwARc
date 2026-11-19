@@ -7,7 +7,8 @@ Run from the topic's worktree: tools/land.py [--dry-run] [--presets A,B]
 1. Refuses a dirty worktree.
 2. Fetches and rebases the topic onto origin/main.
 3. Picks the presets the changed paths call for, builds each in
-   out/land/<preset> and runs its ctest (niced, memory-capped). Docs
+   out/land/<preset> and runs its ctest (niced; memory-capped where
+   systemd-run is available, i.e. Linux, uncapped elsewhere). Docs
    (.md) and C/C++ files whose change is only to comments and whitespace
    build nothing. --presets names them instead, when the rules over-reach
    (a top-level CMakeLists.txt change that only the x86 presets use).
@@ -27,6 +28,7 @@ import argparse
 import bisect
 import os
 import re
+import shutil
 import subprocess
 import sys
 
@@ -227,9 +229,12 @@ def run_preset(preset, root):
         ["cmake", "--build", build, "-j", str(max(1, os.cpu_count() - 4))],
         ["ctest", "--test-dir", build, "-j", "8", "--output-on-failure"],
     ]
+    # systemd-run caps memory on Linux; macOS has no equivalent, so there
+    # the steps are only niced.
+    cap = (["systemd-run", "--user", "--scope", "-q", "-p", "MemoryMax=24G"]
+           if shutil.which("systemd-run") else [])
     for step in steps:
-        cmd = ["systemd-run", "--user", "--scope", "-q", "-p", "MemoryMax=24G",
-               "nice", "-n", "10", *step]
+        cmd = [*cap, "nice", "-n", "10", *step]
         print("  $", " ".join(step), flush=True)
         if subprocess.run(cmd, cwd=root).returncode != 0:
             return False
