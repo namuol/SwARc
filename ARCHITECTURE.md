@@ -705,6 +705,21 @@ API front ends:
   (D3D9's sampler states and transform numbers mapped to D3D7's). Mixing
   a shader with the fixed-function pipeline, fixed-function draws with a
   vertex declaration, and instancing are not done yet (fatal and named).
+- D3DX 9 effects (ID3DXEffect, d3dx9_effect*.cpp): compiled fx_2_0 files
+  only (fxc's output; effect source is fatal and named). The file is read
+  as data (d3dx9_effect_format.h, unit-tested without a device): its
+  parameters, techniques, passes and their states, and the shaders. A
+  pass drives the device through its own methods, as the game's calls do;
+  parameters reach each shader through its constant table, and the
+  preshaders (parameter-only expressions the compiler moved to the CPU, in
+  the shader's PRES comment) are evaluated in doubles before each pass and
+  commit. Begin saves what the technique sets and End restores it. Only
+  render states, sampler states, textures and vertex/pixel shaders are
+  covered; other state classes, structs, pools, state managers and
+  parameter blocks are fatal and named. Any d3dx9_NN.dll binds to the one
+  D3DX HLE (the exports kept their signatures across builds).
+- D3DX textures from memory: DDS, PNG (SDL) and JPEG (ffmpeg's MJPEG
+  decoder, when ffmpeg is found).
 
 ### Shaders: HLSL translated from source
 Games that build HLSL at run time and compile it with D3DXCompileShader

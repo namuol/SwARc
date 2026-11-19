@@ -102,7 +102,7 @@ target_link_libraries(recomp_dinput8 PUBLIC recomp_win32 recomp_xinput)
 # Direct3D 9 and D3DX 9 over gfx::Device.
 add_library(recomp_d3d9 SHARED src/win32/d3d9.cpp
   src/win32/d3d9_draw.cpp src/win32/d3d9_resource.cpp
-  src/win32/d3dx9.cpp)
+  src/win32/d3dx9.cpp src/win32/d3dx9_effect.cpp src/win32/d3dx9_effect_format.cpp)
 target_link_libraries(recomp_d3d9 PUBLIC recomp_win32 recomp_gfx recomp_hlsl)
 # JPEG textures (D3DX) decode with ffmpeg when it is there.
 if(FFMPEG_FOUND)
