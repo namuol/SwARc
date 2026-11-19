@@ -641,6 +641,26 @@ template <typename T>
 inline T* AtomicPtr(uint8_t* b, uint64_t a) {
   return reinterpret_cast<T*>(b + a);
 }
+// CMPXCHG8B (32-bit guests): if the 8 bytes at p equal edx:eax, stores
+// ecx:ebx and returns true (ZF); otherwise loads them into edx:eax. Atomic
+// (seq_cst) when p is 8-byte aligned, as host 64-bit atomics need; an
+// unaligned operand (a split lock on x86) is compared and stored under one
+// process-wide lock instead.
+bool Cas64Unaligned(uint8_t* p, uint32_t* eax, uint32_t* edx, uint32_t ebx, uint32_t ecx);
+[[gnu::always_inline]] inline bool Cas64(uint8_t* p, uint32_t* eax, uint32_t* edx, uint32_t ebx,
+                                         uint32_t ecx) {
+  if (reinterpret_cast<uintptr_t>(p) & 7) return Cas64Unaligned(p, eax, edx, ebx, ecx);
+  uint64_t e = uint64_t(*edx) << 32 | *eax;
+  const bool ok = __atomic_compare_exchange_n(reinterpret_cast<uint64_t*>(p), &e,
+                                              uint64_t(ecx) << 32 | ebx, false, __ATOMIC_SEQ_CST,
+                                              __ATOMIC_SEQ_CST);
+  if (!ok) {
+    *eax = uint32_t(e);
+    *edx = uint32_t(e >> 32);
+  }
+  return ok;
+}
+
 // CMPXCHG16B: if the 16 bytes at p (16-byte aligned) equal hi:lo, stores
 // new_hi:new_lo and returns true; otherwise loads them into hi:lo.
 // Atomic (x86/atomic128.cpp).

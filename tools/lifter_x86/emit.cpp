@@ -3205,6 +3205,14 @@ void InsnEmitter::Emit() {
   const auto m = d_.mnemonic;
   const uint64_t next = in_.next();
 
+  // CMPXCHG8B (32-bit): compares edx:eax with the 8-byte operand; equal,
+  // ZF and ecx:ebx stored; otherwise edx:eax loaded. Only ZF changes.
+  // Atomic with or without lock (an unlocked one is a special case of it).
+  if (!X64() && m == ZYDIS_MNEMONIC_CMPXCHG8B) {
+    if (!PrepareMem()) return Unimpl();
+    L("F.zf = ::recomp::lift::Cas64(B + m0, &eax, &edx, ebx, ecx);");
+    return;
+  }
   if (m == ZYDIS_MNEMONIC_FXSAVE || m == ZYDIS_MNEMONIC_FXRSTOR ||
       (X64() && (m == ZYDIS_MNEMONIC_CMPXCHG16B || m == ZYDIS_MNEMONIC_FXSAVE64 ||
                  m == ZYDIS_MNEMONIC_FXRSTOR64)))
