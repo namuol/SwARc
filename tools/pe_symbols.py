@@ -15,6 +15,12 @@ Outputs (in --out, gitignored, regenerable):
   pe_info.txt      sections, entry point, TLS, imports, rich header
   exports.tsv      va<TAB>kind<TAB>mangled<TAB>demangled
   imports.tsv      iat_va<TAB>dll<TAB>name_or_ordinal
+With --seeds, also what recomp_lift reads besides exports.tsv, so it lifts
+the image without Ghidra's tables (with --sweep-gaps it finds the rest of
+the code itself: calls, pointers, switch tables, code nothing refers to):
+  functions.tsv    the entry point and TLS callbacks
+  jumptables.tsv   no tables (the lifter recovers them)
+--quiet leaves pe_info.txt out of stdout.
 """
 import argparse
 import os
@@ -161,6 +167,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("exe")
     ap.add_argument("--out", default="symbols")
+    ap.add_argument("--seeds", action="store_true")
+    ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
     pe = PE(open(args.exe, "rb").read())
     os.makedirs(args.out, exist_ok=True)
@@ -212,7 +220,28 @@ def main():
         for prod, build, count in pe.rich():
             p(f"  {prod:3d} {build:5d} {count}")
 
-    sys.stdout.write(open(os.path.join(args.out, "pe_info.txt")).read())
+    if args.seeds:
+        seeds = {}
+        if pe.entry_rva:
+            seeds[pe.image_base + pe.entry_rva] = "entry_point"
+        tls_rva, tls_size = pe.dirs[9]
+        if tls_size:
+            cb = struct.unpack_from("<I", pe.d, pe.off(tls_rva) + 12)[0]
+            while cb:
+                fn = u32(pe.d, pe.off(cb - pe.image_base))
+                if not fn:
+                    break
+                seeds.setdefault(fn, f"tls_callback_{len(seeds)}")
+                cb += 4
+        with open(os.path.join(args.out, "functions.tsv"), "w") as f:
+            f.write("entry\tmin\tmax\tchunks\tthunk\tnoreturn\tcallconv\tname\n")
+            for va, name in sorted(seeds.items()):
+                f.write(f"{va:08X}\t{va:08X}\t{va:08X}\t1\t0\t0\tunknown\t{name}\n")
+        with open(os.path.join(args.out, "jumptables.tsv"), "w") as f:
+            f.write("jmp\ttargets\n")
+
+    if not args.quiet:
+        sys.stdout.write(open(os.path.join(args.out, "pe_info.txt")).read())
 
 
 if __name__ == "__main__":
