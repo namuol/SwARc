@@ -155,6 +155,11 @@ bool Program::LoadManifest(const std::string& path, std::string* err) {
       if (!name.empty()) names[va] = name;
     } else if (kind == "name") {
       names[va] = name;
+    } else if (kind == "returns") {
+      // returns <va>: the function returns, whatever the symbol table
+      // says (an analyser can take one that moves the stack pointer
+      // around a load for one that never returns).
+      noreturn.erase(va);
     } else if (kind == "resume") {
       resume_sites.insert(va);
     } else if (kind == "setjmp") {

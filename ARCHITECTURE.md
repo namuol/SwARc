@@ -231,7 +231,9 @@ lifter is tractable (rexglue-style: one C++ function per guest function).
 - Decoder: Zydis (fetched via CMake FetchContent), build-time only.
 - Function list: Ghidra functions.tsv + exports + a per-game line-based
   manifest (lifter.manifest) for overrides: extra entries, names, entry
-  probes, resume sites (SEH, longjmp), setjmp functions.
+  probes, resume sites (SEH, longjmp), setjmp functions, and `returns
+  <va>` for a function the analyser wrongly took for one that never
+  returns (its callers' code after the call would be cut off).
 - Output is plain C++20: no x86 intrinsics, no inline asm, no
   `long double`, no reliance on host FPU state other than the default
   environment (x87 runs on host doubles).
