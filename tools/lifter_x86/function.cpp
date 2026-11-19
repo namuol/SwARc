@@ -564,9 +564,13 @@ bool RecoverJumpTable32Exact(const Program& p, const Function& f, const Insn& jm
 // (the index reloaded from a spill, compared in another register, ...):
 // MSVC puts the table in .text right after the function's code, so its
 // entries are read while they point back into code shortly before it,
-// at most as many as a cmp with ja just before the jmp bounds, if there is
-// one. A wrong extra target only adds lifted code (as a stray data
-// pointer does); a missing one would be a fatal jump at run time.
+// at most as many as a cmp just before the jmp bounds, if there is one
+// (`cmp r, N`, or `cmp r, r2` with r2 set by `mov r2, N` in the function),
+// and never into what the function itself shows is something else: its
+// own code, or another table one of its instructions addresses (the next
+// switch's jump or byte index table, laid out right after this one). A
+// wrong extra target only adds lifted code (as a stray data pointer does);
+// a missing one would be a fatal jump at run time.
 bool RecoverJumpTable32Loose(const Program& p, const Function& f, const Insn& jmp,
                              std::vector<uint64_t>* targets) {
   const auto& m = jmp.ops[0];
@@ -577,20 +581,62 @@ bool RecoverJumpTable32Loose(const Program& p, const Function& f, const Insn& jm
   const Module* mod = p.TextOf(jmp.va);
   const uint32_t table = static_cast<uint32_t>(m.mem.disp.value);
   if (p.TextOf(table) != mod || table < jmp.va) return false;
+  // The value a `mov r, imm` gives r, if the last write to r before `va`
+  // (in address order, within f) is one: the largest such mov, as one of
+  // several paths may set it.
+  auto constant_before = [&](uint64_t va, ZydisRegister r, uint32_t* value) {
+    bool nearest = true, found = false;
+    for (auto it = f.insns.lower_bound(va); it != f.insns.begin();) {
+      const Insn& w = (--it)->second;
+      if (!w.ok || !WritesReg(w, r)) continue;
+      const bool mov_imm = w.d.mnemonic == ZYDIS_MNEMONIC_MOV &&
+                           w.ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                           w.ops[0].size == 32 && Full(w.ops[0].reg.value) == Full(r) &&
+                           w.ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE;
+      if (nearest && !mov_imm) return false;
+      nearest = false;
+      if (mov_imm && (!found || w.ops[1].imm.value.u > *value)) {
+        *value = static_cast<uint32_t>(w.ops[1].imm.value.u);
+        found = true;
+      }
+    }
+    return found;
+  };
   uint32_t cap = 1024;
   const Insn* in = &jmp;
   for (int steps = 0; steps < 24 && (in = Before(f, in->va)); steps++) {
-    if (in->d.mnemonic == ZYDIS_MNEMONIC_CMP && in->ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
-        in->ops[1].imm.value.u < 1024) {
-      cap = static_cast<uint32_t>(in->ops[1].imm.value.u) + 1;
+    if (in->d.mnemonic != ZYDIS_MNEMONIC_CMP) continue;
+    const auto& o1 = in->ops[1];
+    uint32_t n = 0;
+    if (o1.type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+      n = static_cast<uint32_t>(o1.imm.value.u);
+    } else if (o1.type != ZYDIS_OPERAND_TYPE_REGISTER || o1.size != 32 ||
+               !constant_before(in->va, o1.reg.value, &n)) {
+      continue;
+    }
+    if (n < 1024) {
+      cap = n + 1;
       break;
+    }
+  }
+  // Where the table must end: the function's own code after it, or
+  // another table (or byte index table) one of its instructions addresses.
+  uint64_t limit = mod->text_hi;
+  for (const auto& [va, w] : f.insns) {
+    if (va > table) limit = std::min(limit, va);
+    if (!w.ok) continue;
+    for (int i = 0; i < w.d.operand_count_visible; i++) {
+      const auto& o = w.ops[i];
+      if (o.type != ZYDIS_OPERAND_TYPE_MEMORY || !o.mem.disp.has_displacement) continue;
+      const uint32_t d = static_cast<uint32_t>(o.mem.disp.value);
+      if (d > table && p.TextOf(d) == mod) limit = std::min<uint64_t>(limit, d);
     }
   }
   constexpr uint32_t kWindow = 0x20000;  // how far before its table a case may lie
   targets->clear();
   for (uint32_t i = 0; i < cap; i++) {
     const uint64_t a = table + 4ull * i;
-    if (p.TextOf(a) != mod || p.TextOf(a + 3) != mod) break;
+    if (a + 4 > limit) break;
     const uint64_t t = p.mem.read<uint32_t>(a);
     if (p.TextOf(t) != mod || t >= table || table - t > kWindow) break;
     if (std::find(targets->begin(), targets->end(), t) == targets->end()) targets->push_back(t);
