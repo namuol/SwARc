@@ -218,6 +218,71 @@ HLE("advapi32.dll", RegSetValueExA, 6) {
   return kErrorSuccess;
 }
 
+// ---- the Windows 3.1 forms: a key's default value (value name "") ----
+
+// Creates `path` and its parents (under g_reg_mu); true if it was new.
+bool CreateKeyPath(const std::string& path) {
+  bool existed = g_reg.count(path);
+  for (size_t i = 0; i <= path.size(); i++)
+    if (i == path.size() || path[i] == '\\') g_reg[path.substr(0, i)];
+  return !existed;
+}
+
+// RegCreateKeyA(hkey, subkey, &out): RegCreateKeyExA with the defaults.
+HLE("advapi32.dll", RegCreateKeyA, 3) {
+  std::lock_guard<std::mutex> l(g_reg_mu);
+  LoadOnce();
+  std::string base = RootName(Arg(c, 0));
+  if (base.empty()) return kErrorInvalidHandle;
+  std::string sub = Arg(c, 1) ? GStr(Arg(c, 1)) : std::string();
+  std::string path = sub.empty() ? base : Join(base, sub);
+  if (CreateKeyPath(path)) Save();
+  uint32_t h = g_next_hkey += 4;
+  g_open[h] = path;
+  Wr32(Arg(c, 2), h);
+  return kErrorSuccess;
+}
+
+// RegSetValueA(hkey, subkey, REG_SZ, string, size): the subkey's default
+// value (the subkey created if needed); only REG_SZ is allowed.
+HLE("advapi32.dll", RegSetValueA, 5) {
+  std::lock_guard<std::mutex> l(g_reg_mu);
+  LoadOnce();
+  if (Arg(c, 2) != kRegSz || !Arg(c, 3)) return 87;  // ERROR_INVALID_PARAMETER
+  std::string base = RootName(Arg(c, 0));
+  if (base.empty() || !g_reg.count(base)) return kErrorInvalidHandle;
+  std::string sub = Arg(c, 1) ? GStr(Arg(c, 1)) : std::string();
+  std::string path = sub.empty() ? base : Join(base, sub);
+  CreateKeyPath(path);
+  g_reg[path][""] = Str(GStr(Arg(c, 3)));
+  Save();
+  return kErrorSuccess;
+}
+
+// RegQueryValueA(hkey, subkey, data, &size): the subkey's default value as
+// a string (empty if it has none); size in bytes with the NUL, as
+// RegQueryValueExA's. ERROR_FILE_NOT_FOUND if the subkey does not exist.
+HLE("advapi32.dll", RegQueryValueA, 4) {
+  std::lock_guard<std::mutex> l(g_reg_mu);
+  LoadOnce();
+  std::string base = RootName(Arg(c, 0));
+  if (base.empty() || !g_reg.count(base)) return kErrorInvalidHandle;
+  std::string sub = Arg(c, 1) ? GStr(Arg(c, 1)) : std::string();
+  auto k = g_reg.find(sub.empty() ? base : Join(base, sub));
+  if (k == g_reg.end()) return kErrorFileNotFound;
+  auto v = k->second.find("");
+  RegValue val = v != k->second.end() ? v->second : Str("");
+  uint32_t data = Arg(c, 2), size_ptr = Arg(c, 3);
+  uint32_t n = uint32_t(val.data.size());
+  if (!size_ptr) return data ? kErrorInvalidHandle : kErrorSuccess;
+  uint32_t cap = Rd32(size_ptr);
+  Wr32(size_ptr, n);
+  if (!data) return kErrorSuccess;
+  if (cap < n) return kErrorMoreData;
+  std::memcpy(GPtr(data), val.data.data(), n);
+  return kErrorSuccess;
+}
+
 // Direct subkeys of `key`, in order (key names as stored: lower case).
 std::vector<std::string> Subkeys(const std::string& key) {
   std::vector<std::string> out;
@@ -257,6 +322,21 @@ HLE("advapi32.dll", RegEnumKeyExA, 8) {
   if (Arg(c, 5) && Arg(c, 6) && Rd32(Arg(c, 6))) Wr8(Arg(c, 5), 0);
   if (Arg(c, 6)) Wr32(Arg(c, 6), 0);
   if (Arg(c, 7)) { Wr32(Arg(c, 7), 0); Wr32(Arg(c, 7) + 4, 0); }
+  return kErrorSuccess;
+}
+
+// RegEnumKeyA(hkey, index, name, size): RegEnumKeyExA's names, the buffer's
+// size in characters with the NUL.
+HLE("advapi32.dll", RegEnumKeyA, 4) {
+  std::lock_guard<std::mutex> l(g_reg_mu);
+  LoadOnce();
+  std::string key = RootName(Arg(c, 0));
+  if (!g_reg.count(key)) return kErrorInvalidHandle;
+  std::vector<std::string> subs = Subkeys(key);
+  uint32_t i = Arg(c, 1);
+  if (i >= subs.size()) return 259;  // ERROR_NO_MORE_ITEMS
+  if (Arg(c, 3) < subs[i].size() + 1) return kErrorMoreData;
+  PutStr(Arg(c, 2), subs[i]);
   return kErrorSuccess;
 }
 

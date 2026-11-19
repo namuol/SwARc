@@ -660,6 +660,18 @@ uint32_t GetFileAttributes(const std::string& g) {
   return StatGuest(g, &st, &a) ? a : 0xFFFFFFFF;
 }
 HLE64("kernel32.dll", GetFileAttributesA, 1) { return GetFileAttributes(GStr(Arg(c, 0))); }
+
+// GetShortPathNameA(long, short, size): the guest's volumes have no 8.3
+// names (as an NTFS volume with their creation turned off), so the path
+// comes back as given if it exists; 0 with the stat's error if not. The
+// return is CopyOut's: the length, or the size needed.
+HLE("kernel32.dll", GetShortPathNameA, 3) {
+  std::string path = GStr(Arg(c, 0));
+  struct stat st;
+  uint32_t attrs;
+  if (!StatGuest(path, &st, &attrs)) return 0;
+  return CopyOut(Arg(c, 1), Arg(c, 2), path);
+}
 HLE64("kernel32.dll", GetFileAttributesW, 1) { return GetFileAttributes(WidePath(Arg(c, 0))); }
 
 // GetFileAttributesExW(path, GetFileExInfoStandard, WIN32_FILE_ATTRIBUTE_DATA*).

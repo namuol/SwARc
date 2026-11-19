@@ -150,6 +150,23 @@ HLE("kernel32.dll", LoadResource, 2) {
   return hrsrc && img ? uint32_t(img->image_base) + Rd32(hrsrc) : 0;
 }
 
+// LoadAcceleratorsA(module, name): the RT_ACCELERATOR (9) table's data is
+// the handle (ACCEL entries, as LoadResource gives them); TranslateAccelerator
+// here does not translate, so nothing reads it yet. 0 if there is none.
+HLE("user32.dll", LoadAcceleratorsA, 2) {
+  const PeImage* img = ResImage(Arg(c, 0));
+  std::string name;
+  if (!img || !ResKey(Arg(c, 1), &name)) return 0;
+  uint32_t r = FindResourceIn(*img, "#9", name, 0);
+  if (!r) {
+    SetLastError(kErrorResourceNameNotFound);
+    return 0;
+  }
+  return uint32_t(img->image_base) + Rd32(r);
+}
+// DestroyAcceleratorTable(haccel): a loaded table is the module's data.
+HLE("user32.dll", DestroyAcceleratorTable, 1) { return 1; }
+
 HLE("kernel32.dll", SizeofResource, 2) {
   uint32_t hrsrc = Arg(c, 1);
   return hrsrc ? Rd32(hrsrc + 4) : 0;
