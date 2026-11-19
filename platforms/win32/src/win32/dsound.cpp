@@ -456,6 +456,14 @@ HLE_NAMED("dsound.dll", "IDirectSound8::SetCooperativeLevel", DS8_SetCooperative
   return DS_OK;
 }
 
+// Compact(): moves hardware buffer memory together; nothing to do in
+// software.
+HLE_NAMED("dsound.dll", "IDirectSound8::Compact", DS8_Compact, 1) { return DS_OK; }
+
+// SetSpeakerConfig(config): the mixer's output is what the host has;
+// accepted and ignored.
+HLE_NAMED("dsound.dll", "IDirectSound8::SetSpeakerConfig", DS8_SetSpeakerConfig, 2) { return DS_OK; }
+
 // (pDSCaps): DSCAPS, 96 bytes. Software only, as Windows reports since
 // Vista: no hardware mixing or 3D buffers.
 HLE_NAMED("dsound.dll", "IDirectSound8::GetCaps", DS8_GetCaps, 2) {
