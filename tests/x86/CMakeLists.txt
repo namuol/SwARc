@@ -162,6 +162,36 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$" AND TARGET recomp_lif
   endforeach()
 endif()
 
+# lift_discovery: recomp_lift's discovery of switch tables and of code
+# nothing refers to (--sweep-gaps) on fixture/discovery.S, assembled by
+# clang for i686 and not linked (it needs no linker, and runs on any
+# host): recomp_lift_fixture is the lifter with a reader for that object
+# (fixture_reader.cpp), lift_discovery_test runs it and checks what it
+# found against the fixture's expectations.
+if(TARGET recomp_lift)
+  if(CMAKE_C_COMPILER_ID MATCHES "Clang")
+    set(_fix "${CMAKE_CURRENT_BINARY_DIR}/fixture")
+    add_custom_command(OUTPUT "${_fix}/discovery.o"
+      COMMAND "${CMAKE_COMMAND}" -E make_directory "${_fix}"
+      COMMAND "${CMAKE_C_COMPILER}" --target=i686-unknown-linux-gnu -c
+              "${CMAKE_CURRENT_SOURCE_DIR}/fixture/discovery.S" -o "${_fix}/discovery.o"
+      DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/fixture/discovery.S"
+      COMMENT "Assembling the x86 lifter fixture discovery.S")
+    add_custom_target(lift_discovery_fixture ALL DEPENDS "${_fix}/discovery.o")
+    add_executable(recomp_lift_fixture fixture_reader.cpp)
+    target_link_libraries(recomp_lift_fixture PRIVATE recomp_lift_objs)
+    add_executable(lift_discovery_test lift_discovery_test.cpp)
+    add_dependencies(lift_discovery_test recomp_lift_fixture lift_discovery_fixture)
+    add_test(NAME lift_discovery
+             COMMAND lift_discovery_test $<TARGET_FILE:recomp_lift_fixture> "${_fix}/discovery.o"
+                     "${CMAKE_CURRENT_BINARY_DIR}/lift_discovery")
+  elseif(NOT RECOMP_ALLOW_MISSING_TEST_TOOLS)
+    add_test(NAME x86_discovery_prerequisites COMMAND "${CMAKE_COMMAND}" -E echo
+             "lift_discovery needs clang as the C compiler (RECOMP_ALLOW_MISSING_TEST_TOOLS=ON leaves it out)")
+    set_tests_properties(x86_discovery_prerequisites PROPERTIES FAIL_REGULAR_EXPRESSION .)
+  endif()
+endif()
+
 # lift_fixture_int, lift_fixture_sse, lift_fixture_x87: lift_int_test.cpp,
 # lift_sse_test.cpp and lift_x87_test.cpp on the forms of fixture/forms.s,
 # assembled by clang for i686 and linked by LLD to flat code, which

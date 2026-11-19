@@ -10,11 +10,17 @@ FetchContent_Declare(zydis
   GIT_SHALLOW FALSE)
 FetchContent_MakeAvailable(zydis)
 
-add_executable(recomp_lift
+# The lifter's objects, also linked with a test-only image reader into
+# recomp_lift_fixture (tests/x86).
+add_library(recomp_lift_objs OBJECT
   main.cpp
   program.cpp
   function.cpp
   emit.cpp
   x87test.cpp)
-target_include_directories(recomp_lift PRIVATE ${RECOMP_ROOT}/src)
-target_link_libraries(recomp_lift PRIVATE recomp_base Zydis)
+target_include_directories(recomp_lift_objs PUBLIC ${RECOMP_ROOT}/src
+                           ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(recomp_lift_objs PUBLIC recomp_base Zydis)
+
+add_executable(recomp_lift)
+target_link_libraries(recomp_lift PRIVATE recomp_lift_objs)
