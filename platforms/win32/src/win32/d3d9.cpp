@@ -421,6 +421,28 @@ void Bind(uint32_t* slot, uint32_t obj) {
 
 }  // namespace recomp::d3d9
 
+namespace recomp::d3d9 {
+
+// D3D7's number for a D3D9 transform gfx uses (FfState), 0 for others:
+// VIEW 2, PROJECTION 3 and TEXTURE0-7 16-23 are the same; WORLD-WORLD3
+// are 256-259 (D3D7: 1, 4-6).
+static uint32_t FfTransformType(uint32_t d3d9) {
+  if (d3d9 == 2 || d3d9 == 3 || (d3d9 >= 16 && d3d9 < 24)) return d3d9;
+  if (d3d9 == 256) return 1;
+  if (d3d9 >= 257 && d3d9 <= 259) return d3d9 - 253;
+  return 0;
+}
+
+void SetTransform(Device& d, uint32_t type, const float* m) {
+  std::array<float, 16> a;
+  std::memcpy(a.data(), m, sizeof a);
+  d.transforms[type] = a;
+  if (float* to = gfx::FfTransform(d.ff_base, FfTransformType(type)))
+    std::memcpy(to, a.data(), sizeof a);
+}
+
+}  // namespace recomp::d3d9
+
 namespace recomp::hle {
 namespace {
 
@@ -869,24 +891,11 @@ HLE_NAMED("d3d9.dll", "IDirect3DDevice9::Clear", D3DDev9_Clear, 7) {
   return D3D_OK;
 }
 
-// D3D7's number for a D3D9 transform gfx uses (FfState), 0 for others:
-// VIEW 2, PROJECTION 3 and TEXTURE0-7 16-23 are the same; WORLD-WORLD3
-// are 256-259 (D3D7: 1, 4-6).
-static uint32_t FfTransformType(uint32_t d3d9) {
-  if (d3d9 == 2 || d3d9 == 3 || (d3d9 >= 16 && d3d9 < 24)) return d3d9;
-  if (d3d9 == 256) return 1;
-  if (d3d9 >= 257 && d3d9 <= 259) return d3d9 - 253;
-  return 0;
-}
-
 // (State, Matrix*)
 HLE_NAMED("d3d9.dll", "IDirect3DDevice9::SetTransform", D3DDev9_SetTransform, 3) {
-  std::array<float, 16> m;
-  std::memcpy(m.data(), GPtr(Arg(c, 2)), sizeof m);
-  Device* d = Dev(c);
-  d->transforms[Arg(c, 1)] = m;
-  if (float* to = gfx::FfTransform(d->ff_base, FfTransformType(Arg(c, 1))))
-    std::memcpy(to, m.data(), sizeof m);
+  float m[16];
+  std::memcpy(m, GPtr(Arg(c, 2)), sizeof m);
+  SetTransform(*Dev(c), Arg(c, 1), m);
   return D3D_OK;
 }
 
