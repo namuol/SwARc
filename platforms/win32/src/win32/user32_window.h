@@ -10,6 +10,10 @@
 
 namespace recomp {
 
+// The one monitor's HMONITOR (user32_window.cpp, "monitors"): the primary,
+// covering the screen the game sees.
+inline constexpr uint32_t kPrimaryMonitor = 0x00010001;
+
 // The SDL window behind a top-level HWND, or nullptr.
 SDL_Window* SdlWindowFor(uint32_t hwnd);
 

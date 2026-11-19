@@ -3857,7 +3857,14 @@ HLE("user32.dll", EnumDisplaySettingsA, 3) {
 // One monitor, the primary, covering the screen the game sees (the
 // virtual display mode); its work area is all of it (no taskbar).
 
-constexpr uint32_t kPrimaryMonitor = 0x00010001;  // the HMONITOR
+// kPrimaryMonitor (user32_window.h) is its HMONITOR.
+
+// MonitorFromWindow(hwnd, flags), MonitorFromPoint(POINT by value, flags),
+// MonitorFromRect(rect, flags): the one monitor, whatever the flags ask
+// for a window or point off every monitor (nearest or primary are it).
+HLE("user32.dll", MonitorFromWindow, 2) { return kPrimaryMonitor; }
+HLE("user32.dll", MonitorFromPoint, 3) { return kPrimaryMonitor; }
+HLE("user32.dll", MonitorFromRect, 2) { return kPrimaryMonitor; }
 
 HLE("user32.dll", SetProcessDPIAware, 0) { return 1; }
 

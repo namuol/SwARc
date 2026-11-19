@@ -155,6 +155,46 @@ HLE(kDll, waveOutGetDevCapsA, 3) {
   return kMmNoError;
 }
 
+// (uDeviceID, WAVEOUTCAPSW*, cbwoc): as the A form, the name in UTF-16
+// (WCHAR[32]), so the later fields sit 32 bytes further on.
+HLE(kDll, waveOutGetDevCapsW, 3) {
+  uint32_t id = Arg(c, 0), caps = Arg(c, 1), size = Arg(c, 2);
+  if (id != 0 && id != kWaveMapper) return kMmBadDeviceId;
+  if (!caps) return kMmInvalParam;
+  uint8_t buf[84] = {};
+  auto p16 = [&](int o, uint16_t v) { std::memcpy(buf + o, &v, 2); };
+  auto p32 = [&](int o, uint32_t v) { std::memcpy(buf + o, &v, 4); };
+  p16(0, 1);
+  p16(2, 100);
+  p32(4, 0x0500);
+  const char* name = "Speakers";
+  for (int i = 0; name[i]; i++) p16(8 + 2 * i, uint16_t(name[i]));
+  p32(72, 0x000FFFFF);
+  p16(76, 2);
+  p32(80, 0x002C);
+  std::memcpy(GPtr(caps), buf, std::min<uint32_t>(size, sizeof buf));
+  return kMmNoError;
+}
+
+// waveIn: no recording devices. With none to open, no handle exists for
+// the per-handle calls either.
+HLE(kDll, waveInGetNumDevs, 0) { return 0; }
+HLE(kDll, waveInGetDevCapsA, 3) { return kMmBadDeviceId; }
+HLE(kDll, waveInGetDevCapsW, 3) { return kMmBadDeviceId; }
+HLE(kDll, waveInOpen, 6) {
+  if (Arg(c, 0)) Wr32(Arg(c, 0), 0);
+  return kMmBadDeviceId;
+}
+#define WAVE_IN_NO_HANDLE(name, n) \
+  HLE(kDll, name, n) { return 5; /* MMSYSERR_INVALHANDLE */ }
+WAVE_IN_NO_HANDLE(waveInClose, 1)
+WAVE_IN_NO_HANDLE(waveInReset, 1)
+WAVE_IN_NO_HANDLE(waveInStart, 1)
+WAVE_IN_NO_HANDLE(waveInPrepareHeader, 3)
+WAVE_IN_NO_HANDLE(waveInUnprepareHeader, 3)
+WAVE_IN_NO_HANDLE(waveInAddBuffer, 3)
+#undef WAVE_IN_NO_HANDLE
+
 // (phwo, uDeviceID, pwfx, dwCallback, dwInstance, fdwOpen)
 HLE(kDll, waveOutOpen, 6) {
   uint32_t out = Arg(c, 0), id = Arg(c, 1), fmt = Arg(c, 2), flags = Arg(c, 5);

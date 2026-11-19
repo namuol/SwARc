@@ -342,11 +342,37 @@ void WriteFormat(uint32_t va, uint32_t size, const Format& f) {
 // device, the primary sound driver (NULL GUID, as DirectSound reports it
 // first), which is what DirectSoundCreate8 opens. The callback is
 // BOOL CALLBACK (LPGUID, LPCSTR description, LPCSTR module, LPVOID ctx).
+// Then the device itself, under its own GUID (kSpeakersGuid), as
+// DirectSound lists each device after the primary driver; some callers
+// skip the NULL-GUID entry and open a device by GUID. Every GUID opens
+// the one output.
+constexpr guest::GUID kSpeakersGuid = {0x5A1D0001, 0x5A1D, 0x4D50,
+                                       {0x80, 0x00, 0x53, 0x50, 0x4B, 0x52, 0x00, 0x01}};
 uint64_t EnumerateA(Ctx& c) {
-  gaddr desc = HeapAllocProcess(64, true);
+  gaddr desc = HeapAllocProcess(160, true);
   PutStr(desc, "Primary Sound Driver");
   gaddr module = desc + 32;  // "": the primary driver has no module name
-  CallGuest(c, Arg(c, 0), {0, desc, module, Arg(c, 1)});
+  gaddr guid = desc + 48, desc2 = desc + 64, module2 = desc + 112;
+  std::memcpy(GPtr(guid), &kSpeakersGuid, 16);
+  PutStr(desc2, "Speakers");
+  PutStr(module2, "{0.0.0.00000000}.{5a1d0001-5a1d-4d50-8000-5350524b0001}");
+  if (CallGuest(c, Arg(c, 0), {0, desc, module, Arg(c, 1)}) & 0xFFFFFFFF)
+    CallGuest(c, Arg(c, 0), {guid, desc2, module2, Arg(c, 1)});
+  HeapFreeProcess(desc);
+  return DS_OK;
+}
+
+// DirectSoundEnumerateW (ordinal 3): as the A form, with UTF-16 strings.
+uint64_t EnumerateW(Ctx& c) {
+  gaddr desc = HeapAllocProcess(320, true);
+  PutWStr(desc, "Primary Sound Driver");
+  gaddr module = desc + 64;
+  gaddr guid = desc + 80, desc2 = desc + 96, module2 = desc + 160;
+  std::memcpy(GPtr(guid), &kSpeakersGuid, 16);
+  PutWStr(desc2, "Speakers");
+  PutWStr(module2, "{0.0.0.00000000}.{5a1d0001-5a1d-4d50-8000-5350524b0001}");
+  if (CallGuest(c, Arg(c, 0), {0, desc, module, Arg(c, 1)}) & 0xFFFFFFFF)
+    CallGuest(c, Arg(c, 0), {guid, desc2, module2, Arg(c, 1)});
   HeapFreeProcess(desc);
   return DS_OK;
 }
@@ -365,6 +391,23 @@ uint64_t Create(Ctx& c) {
 
 // Imports bind by ordinal; GetProcAddress asks by name.
 HLE_NAMED("dsound.dll", "#2", DirectSoundEnumerateA, 2) { return EnumerateA(c); }
+HLE_NAMED("dsound.dll", "#3", DirectSoundEnumerateW, 2) { return EnumerateW(c); }
+HLE_NAMED("dsound.dll", "DirectSoundEnumerateW", DirectSoundEnumerateW_n, 2) {
+  return EnumerateW(c);
+}
+// Capture: no capture devices. Enumerating lists none; creating fails.
+HLE_NAMED("dsound.dll", "#7", DirectSoundCaptureEnumerateA, 2) { return DS_OK; }
+HLE_NAMED("dsound.dll", "DirectSoundCaptureEnumerateA", DirectSoundCaptureEnumerateA_n, 2) { return DS_OK; }
+HLE_NAMED("dsound.dll", "#8", DirectSoundCaptureEnumerateW, 2) { return DS_OK; }
+HLE_NAMED("dsound.dll", "DirectSoundCaptureEnumerateW", DirectSoundCaptureEnumerateW_n, 2) { return DS_OK; }
+uint64_t CaptureCreate(Ctx& c) {
+  if (Arg(c, 1)) Wr32(Arg(c, 1), 0);
+  return DSERR_NODRIVER;
+}
+HLE_NAMED("dsound.dll", "#6", DirectSoundCaptureCreate, 3) { return CaptureCreate(c); }
+HLE_NAMED("dsound.dll", "DirectSoundCaptureCreate", DirectSoundCaptureCreate_n, 3) { return CaptureCreate(c); }
+HLE_NAMED("dsound.dll", "#12", DirectSoundCaptureCreate8, 3) { return CaptureCreate(c); }
+HLE_NAMED("dsound.dll", "DirectSoundCaptureCreate8", DirectSoundCaptureCreate8_n, 3) { return CaptureCreate(c); }
 HLE_NAMED("dsound.dll", "DirectSoundEnumerateA", DirectSoundEnumerateA_n, 2) {
   return EnumerateA(c);
 }

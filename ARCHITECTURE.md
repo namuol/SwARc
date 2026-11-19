@@ -980,7 +980,10 @@ late-frame rule; on an idle host wake-ups land 15-30 us (Linux) or
   how far the mixer has read ahead. DirectSound's volume and pan law;
   DS3D buffers and the listener (deferred settings, rolloff) use the
   DS3D panning model above. Cones and Doppler are stored only;
-  notifications and effects are not implemented.
+  notifications and effects are not implemented. Enumeration lists the
+  primary driver (NULL GUID) and then the one device under its own GUID,
+  as Windows does (FMOD Ex opens the latter); every GUID opens the one
+  output. No capture devices (DirectSoundCapture, waveIn).
 - xinput1_3: SDL gamepads in the Xbox controller's layout, user indices
   in connection order; none in automated runs. DirectInput lists the
   same pads as game controllers, and WMI (Win32_PNPEntity DeviceIDs with

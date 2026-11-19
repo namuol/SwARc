@@ -447,6 +447,8 @@ HLE_NAMED("d3d9.dll", "IDirect3D9::QueryInterface", D3D9_QueryInterface, 3) {
 HLE_NAMED("d3d9.dll", "IDirect3D9::AddRef", D3D9_AddRef, 1) { return com::AddRef(Arg(c, 0)); }
 HLE_NAMED("d3d9.dll", "IDirect3D9::Release", D3D9_Release, 1) { return com::Release(Arg(c, 0)); }
 HLE_NAMED("d3d9.dll", "IDirect3D9::GetAdapterCount", D3D9_GetAdapterCount, 1) { return 1; }
+// GetAdapterMonitor(adapter): the one adapter's screen is the one monitor.
+HLE_NAMED("d3d9.dll", "IDirect3D9::GetAdapterMonitor", D3D9_GetAdapterMonitor, 2) { return kPrimaryMonitor; }
 
 HLE_NAMED("d3d9.dll", "IDirect3D9::GetAdapterIdentifier", D3D9_GetAdapterIdentifier, 4) {
   if (Arg(c, 1) != 0) return D3DERR_INVALIDCALL;
