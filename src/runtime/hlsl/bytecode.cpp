@@ -16,8 +16,10 @@
 // component of the swizzled source, which compilers always replicate.
 // As in the HLSL path, rsq, log and pow take |x| as the instructions do.
 // ps_1_x: t# registers hold tex / texcoord results from TEXCOORD#, samplers
-// are 2D (the stage's texture), r0 is the colour. The ps_1_x texture-matrix
-// and bump instructions and ps_1_4 phases are not supported (named).
+// are 2D (the stage's texture; cube for texm3x3tex/spec/vspec), r0 is the
+// colour. The texture-matrix instructions (texm3x2*, texm3x3*, texdp3*,
+// texreg2ar/gb) are supported; the bump ones (texbem*, bem), texreg2rgb,
+// texm3x2depth, texdepth and ps_1_4 phases are not (named).
 
 #include <algorithm>
 #include <array>
@@ -255,6 +257,28 @@ class Translator {
       if (pixel_ && major_ == 1 && (in.op == TEX || in.op == TEXCOORD || in.op == TEXKILL)) {
         ps_texcoords_.insert(in.dst.num);
         if (in.op == TEX) sampler_type_[in.dst.num] = ParamType::Sampler2D;
+      }
+      // The texture-matrix rows read their stage's coordinates; the
+      // instructions that sample give the stage's sampler its type.
+      if (pixel_ && major_ == 1) {
+        uint32_t n = in.dst.num;
+        switch (in.op) {
+          case TEXM3X2PAD: case TEXM3X3PAD: case TEXDP3: case TEXM3X3:
+            ps_texcoords_.insert(n);
+            break;
+          case TEXM3X2TEX: case TEXDP3TEX:
+            ps_texcoords_.insert(n);
+            sampler_type_[n] = ParamType::Sampler2D;
+            break;
+          case TEXM3X3TEX: case TEXM3X3SPEC: case TEXM3X3VSPEC:
+            ps_texcoords_.insert(n);
+            sampler_type_[n] = ParamType::SamplerCube;
+            break;
+          case TEXREG2AR: case TEXREG2GB:
+            sampler_type_[n] = ParamType::Sampler2D;
+            break;
+          default: break;
+        }
       }
     }
     if (rel_const_) max_c_ = pixel_ ? 224 : 256;
@@ -736,6 +760,64 @@ class Translator {
       Line("r_tx[" + n + "] = vec4(clamp(r_tc[" + n + "].xyz, 0.0, 1.0), 1.0);");
       return;
     }
+    // ps_1_x texture-matrix and dependent reads (Direct3D's reference
+    // definitions): each row is the dot product of the stage's coordinates
+    // with an earlier stage's result tM; the pads' rows are kept in r_m[]
+    // by stage and the last row's instruction uses them.
+    if (pixel_ && major_ == 1 && !in.src.empty()) {
+      std::string n = std::to_string(in.dst.num);
+      std::string m = S(in.src[0]);
+      std::string row = "dot(r_tc[" + n + "].xyz, (" + m + ").xyz)";
+      auto prev = [&](int k) { return "r_m[" + std::to_string(int(in.dst.num) - k) + "]"; };
+      auto sample = [&](const std::string& coord) {
+        return "texture(" + SamplerName(in.dst.num) + ", " + coord + ", R_BIAS(" + n + "))";
+      };
+      switch (in.op) {
+        case TEXM3X2PAD: case TEXM3X3PAD:
+          Line("r_m[" + n + "] = " + row + ";");
+          return;
+        case TEXM3X2TEX:
+          Line("r_tx[" + n + "] = " + sample("vec2(" + prev(1) + ", " + row + ")") + ";");
+          return;
+        case TEXM3X3TEX:
+          Line("r_tx[" + n + "] = " + sample("vec3(" + prev(2) + ", " + prev(1) + ", " + row + ")") + ";");
+          return;
+        case TEXM3X3:
+          Line("r_tx[" + n + "] = vec4(" + prev(2) + ", " + prev(1) + ", " + row + ", 1.0);");
+          return;
+        case TEXM3X3SPEC: case TEXM3X3VSPEC: {
+          // The normal (the three rows) reflects the eye vector: a constant,
+          // or the three stages' w (vspec).
+          if (in.op == TEXM3X3SPEC && in.src.size() < 2) Fail("texm3x3spec without an eye vector");
+          std::string eye = in.op == TEXM3X3SPEC
+                                ? "(" + S(in.src[1]) + ").xyz"
+                                : "vec3(r_tc[" + std::to_string(in.dst.num - 2) + "].w, r_tc[" +
+                                      std::to_string(in.dst.num - 1) + "].w, r_tc[" + n + "].w)";
+          Line("{");
+          indent_++;
+          Line("vec3 r_nv = vec3(" + prev(2) + ", " + prev(1) + ", " + row + ");");
+          Line("vec3 r_ev = " + eye + ";");
+          Line("r_tx[" + n + "] = " +
+               sample("2.0 * r_nv * dot(r_nv, r_ev) / dot(r_nv, r_nv) - r_ev") + ";");
+          indent_--;
+          Line("}");
+          return;
+        }
+        case TEXDP3:
+          Line("r_tx[" + n + "] = vec4(" + row + ");");
+          return;
+        case TEXDP3TEX:
+          Line("r_tx[" + n + "] = " + sample("vec2(" + row + ", 0.0)") + ";");
+          return;
+        case TEXREG2AR:
+          Line("r_tx[" + n + "] = " + sample("(" + m + ").wx") + ";");
+          return;
+        case TEXREG2GB:
+          Line("r_tx[" + n + "] = " + sample("(" + m + ").yz") + ";");
+          return;
+        default: break;
+      }
+    }
     switch (in.op) {
       case TEXBEM: case TEXBEML: case TEXREG2AR: case TEXREG2GB: case TEXM3X2PAD: case TEXM3X2TEX:
       case TEXM3X3PAD: case TEXM3X3TEX: case TEXM3X3SPEC: case TEXM3X3VSPEC: case TEXREG2RGB:
@@ -891,7 +973,7 @@ class Translator {
         for (uint32_t n : ps_colors_)
           pre += "  r_v[" + std::to_string(n) + "] = " +
                  Varying({kColor, n}, false, centroid_.count({kColor, n}) ? 4 : 0) + ";\n";
-        g += major_ == 1 ? "vec4 r_tx[8];\n" : "";
+        g += major_ == 1 ? "vec4 r_tx[8];\nfloat r_m[8];\n" : "";
         g += "vec4 r_tc[8];\n";
         for (uint32_t n : ps_texcoords_)
           pre += "  r_tc[" + std::to_string(n) + "] = " +
