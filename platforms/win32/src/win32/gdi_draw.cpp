@@ -572,6 +572,21 @@ HLE("gdi32.dll", CreateSolidBrush, 1) {
   return h;
 }
 
+// GetSysColorBrush(index): a solid brush of that system colour, one per
+// index for the whole process (DeleteObject does not free it on Windows,
+// and callers never need to); 0 for an index past the colours.
+HLE("user32.dll", GetSysColorBrush, 1) {
+  uint32_t i = Arg(c, 0);
+  if (i >= 31) return 0;
+  std::lock_guard<std::recursive_mutex> l(g_mu);
+  static uint32_t brushes[31];
+  if (!brushes[i]) {
+    brushes[i] = NewHandle();
+    g_brushes[brushes[i]].xrgb = ColorRefToXrgb(SysColor(i));
+  }
+  return brushes[i];
+}
+
 // (const LOGPALETTE*): palVersion, palNumEntries, PALETTEENTRY {r, g, b, flags}.
 HLE("gdi32.dll", CreatePalette, 1) {
   std::lock_guard<std::recursive_mutex> l(g_mu);

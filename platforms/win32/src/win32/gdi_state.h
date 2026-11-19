@@ -28,6 +28,9 @@ uint32_t GdiDcForMemory(uint32_t bits, int w, int h, int bpp, uint32_t pitch, ui
                         uint32_t gmask, uint32_t bmask);
 void GdiReleaseMemoryDc(uint32_t hdc);
 
+// GetSysColor's colours (COLORREF), by COLOR_* index; 0 past the table.
+uint32_t SysColor(uint32_t index);
+
 // A graphics API (Direct3D, DirectDraw, OpenGL) is about to create its
 // device for this host window: GDI drawing on the window (which keeps a
 // GPU device of its own once the game draws on a window DC) lets go of it
