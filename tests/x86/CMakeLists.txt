@@ -114,6 +114,15 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
   add_test(NAME fxsave COMMAND fxsave_test)
 endif()
 
+# mmx_test: the MMX helpers (x86/mmx.h) and the x87 state MMX code leaves
+# against the host. Under Rosetta 2 (x86_64 macOS build) it checks the
+# values only.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+  add_executable(mmx_test mmx_test.cpp)
+  target_link_libraries(mmx_test PRIVATE recomp_x87)
+  add_test(NAME mmx COMMAND mmx_test)
+endif()
+
 # lift_semantics_test checks the integer/flag helpers in lifted.h against
 # the host CPU the same way.
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")

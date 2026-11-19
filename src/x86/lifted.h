@@ -8,6 +8,7 @@
 #include <cstring>
 
 #include "x86/ctx.h"
+#include "x86/mmx.h"
 #include "x86/sse.h"
 #include "x86/x87.h"
 

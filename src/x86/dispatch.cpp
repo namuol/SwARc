@@ -531,9 +531,9 @@ void Cpuid(Ctx& c) {
   // machine (Apple Silicon has no CPUID), and nothing beyond SSE2 is
   // claimed. SSE and SSE2 are reported because every PC these games still
   // run on has them, so their SSE paths are the ones that matter
-  // (x86/sse.h). MMX comes with any SSE CPU; the lifter does not
-  // translate MMX, so a game with MMX paths turns it off (cpu_mmx). Family 6
-  // model 13 (Pentium M) is a real SSE2 part without SSE3.
+  // (x86/sse.h). MMX comes with any SSE CPU, and code that finds it
+  // takes its MMX paths (x86/mmx.h); a game can still hide it (cpu_mmx).
+  // Family 6 model 13 (Pentium M) is a real SSE2 part without SSE3.
   switch (c.eax) {
     case 0:
       c.eax = 2;
