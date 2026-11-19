@@ -8,6 +8,8 @@
 //            [--module <game.dll> --symbols DIR [--manifest FILE]
 //             [--base HEX]]...
 //            [--only VA[,VA...]]   (just these functions and their callees)
+//            [--sweep-gaps]   (also lift .text code nothing refers to)
+//            [--dump-discovery]   (final_jumptables/entries, lifted_insns.txt)
 //   recomp_lift (--forms LIST | --code BIN) [--x64]
 //               (--x87-test | --int-test | --sse-test) OUT.cpp
 //
@@ -107,7 +109,7 @@ int main(int argc, char** argv) {
   uint64_t per_file = 12000;
   uint64_t dump = 0;
   std::string x87_test, int_test, sse_test, forms, code;
-  bool sweep_gaps = false;
+  bool sweep_gaps = false, dump_discovery = false;
   bool forms_x64 = false;
   std::set<uint64_t> only;
   for (int i = 1; i < argc; i++) {
@@ -122,6 +124,7 @@ int main(int argc, char** argv) {
     else if (a == "--insns-per-file") per_file = std::stoull(val());
     else if (a == "--dump") dump = std::stoull(val(), nullptr, 16);
     else if (a == "--sweep-gaps") sweep_gaps = true;
+    else if (a == "--dump-discovery") dump_discovery = true;
     else if (a == "--x87-test") x87_test = val();
     else if (a == "--int-test") int_test = val();
     else if (a == "--sse-test") sse_test = val();
@@ -400,7 +403,6 @@ int main(int argc, char** argv) {
     }
   }
   if (from_gaps == before_sweep) break;
-  std::fprintf(stderr, "sweep %d: %zu gap entries, %zu rejected\n", sweep, from_gaps, gap_rejected);
   }
   std::printf("functions: %zu (%zu from Ghidra/exports, %zu discovered: "
               "%zu via code pointers, %zu via data pointers, %zu from gaps; %zu weak)\n",
@@ -456,7 +458,8 @@ int main(int argc, char** argv) {
     }
     lifter::Function f;
     lifter::BuildFunction(p, dec, e, &f);
-    for (const auto& [va, in] : f.insns) lifted_insns.insert(va);
+    if (dump_discovery)
+      for (const auto& [va, in] : f.insns) lifted_insns.insert(va);
     // Indirect jumps left to the dispatcher (no table): each one is a
     // place where a target the lifter did not find is fatal at run time.
     for (auto it = f.insns.begin(); it != f.insns.end(); ++it) {
@@ -573,7 +576,7 @@ int main(int argc, char** argv) {
   }
   WriteIfChanged(std::filesystem::path(outdir) / "lift_report.txt", report);
   WriteIfChanged(std::filesystem::path(outdir) / "dispatch_report.txt", report_dispatch);
-  {
+  if (dump_discovery) {  // what discovery found, for analysis
     std::string jt;
     for (const auto& [va, ts] : p.jumptables) {
       char buf[32];
