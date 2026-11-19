@@ -519,7 +519,9 @@ HLE_NAMED("dsound.dll", "IDirectSound8::CreateSoundBuffer", DS8_CreateSoundBuffe
   bytes -= bytes % d->fmt.block;
   RECOMP_TRACE("  buffer: %u Hz, %u channels, %u bits, %u bytes, flags %X\n", d->fmt.rate,
                d->fmt.channels, d->fmt.bits, bytes, flags);
-  if ((flags & DSBCAPS_CTRL3D) && d->fmt.channels != 1) return DSERR_INVALIDPARAM;
+  // 3D buffers with a stereo format are created: games that run on
+  // Windows rely on it (and do not check the result). The 3D position
+  // sets both channels' gains, as for a mono buffer.
   d->bytes.assign(bytes, d->fmt.bits == 8 ? 0x80 : 0);
   d->mem = HeapAllocProcess(bytes, true);
   if (d->fmt.bits == 8) std::memset(GPtr(d->mem), 0x80, bytes);
