@@ -50,6 +50,20 @@ constexpr SDL_MouseID kTestRelative = 0xD51D53;
 // TEST_INPUT "shot NAME": an SDL user event whose code indexes g_shot_names.
 constexpr Uint32 kShotEvent = SDL_EVENT_USER + 0x51;
 std::vector<std::string> g_shot_names;
+// TEST_INPUT "wait" (code indexes g_waits) and "exit".
+constexpr Uint32 kWaitEvent = SDL_EVENT_USER + 0x52;
+constexpr Uint32 kExitEvent = SDL_EVENT_USER + 0x53;
+struct TestWait {
+  int line = 0;
+  double timeout = 0;
+  std::vector<std::pair<int, int>> points;
+  std::vector<uint32_t> colours;  // 0xRRGGBB, per point
+  std::vector<bool> unlike;       // per point: "!=": must not be that colour
+  int tolerance = 24;             // per channel
+  SDL_Scancode press = SDL_SCANCODE_UNKNOWN;
+  double every = 0;               // seconds between presses
+};
+std::vector<TestWait> g_waits;
 
 namespace {
 
@@ -1061,7 +1075,22 @@ void InjectTestFocus() {
 //   <t> warp <x> <y>      to client (x, y) in one relative move
 //   <t> shot <name>       save the next frame as $<ID>_SHOT_DIR/<name>.bmp
 //                         (tools/smoke.py compares it with a reference)
-// '#' starts a comment.
+//   <t> wait <timeout> <x>,<y>=<rrggbb>... [tol <n>] [press <key> <every>]
+//                         stop the script's clock until every listed pixel
+//                         of the presented frame (back buffer pixels, as in
+//                         the shots) is that colour, within n per channel
+//                         (default 24), and every <x>,<y>!=<rrggbb> one is
+//                         not (a dialog's text absent, say); meanwhile press
+//                         <key> every <every> seconds (to skip videos, say;
+//                         frames within 0.3 s of a press don't count, so a
+//                         press that opened something is seen). Later times count
+//                         on from <t> once it matches. After <timeout>
+//                         seconds (times <ID>_TEST_WAIT_SCALE) it gives up,
+//                         warns "timed out" (a smoke failure) and goes on.
+//   <t> exit              end the process (status 0) once any shot is
+//                         saved: the run need not wait out its time
+// '#' starts a comment. Each match and timeout is logged with the
+// script's line number and how long it waited, to tune scripts by.
 struct TestEvent {
   double t;
   SDL_Event e;
@@ -1082,7 +1111,12 @@ void InjectTestInput() {
       WarnF("TEST_INPUT: cannot open %s\n", path);
       return;
     }
-    char line[256];
+    char line[512];
+    int lineno = 0;
+    // The latest release (click's button up, key up) of the lines so far:
+    // a wait starts no earlier, or it would hold back the release of the
+    // click before it (games act on the release).
+    double last_release = 0;
     auto motion = [](double t, float dx, float dy) {
       SDL_Event e{};
       e.type = SDL_EVENT_MOUSE_MOTION;
@@ -1092,6 +1126,7 @@ void InjectTestInput() {
       return TestEvent{t, e};
     };
     while (std::fgets(line, sizeof line, f)) {
+      lineno++;
       if (char* h = std::strchr(line, '#')) *h = 0;
       double t;
       char cmd[32] = {}, a[64] = {}, b[64] = {};
@@ -1149,6 +1184,7 @@ void InjectTestInput() {
         e.type = SDL_EVENT_MOUSE_BUTTON_UP;
         e.button.down = false;
         q.push_back({t + 0.08, e});
+        last_release = std::max(last_release, t + 0.08);
       } else if (c == "key" && n >= 3) {
         SDL_Scancode sc = SDL_GetScancodeFromName(a);
         if (sc == SDL_SCANCODE_UNKNOWN) {
@@ -1164,6 +1200,57 @@ void InjectTestInput() {
         e.type = SDL_EVENT_KEY_UP;
         e.key.down = false;
         q.push_back({t + (n >= 4 ? std::atof(b) : 0.08), e});
+        last_release = std::max(last_release, t + (n >= 4 ? std::atof(b) : 0.08));
+      } else if (c == "wait" && n >= 4) {
+        TestWait w;
+        w.line = lineno;
+        std::vector<std::string> tok;
+        for (char* p = std::strtok(line, " \t\r\n"); p; p = std::strtok(nullptr, " \t\r\n"))
+          tok.push_back(p);
+        bool ok = tok.size() >= 4;
+        // <ID>_TEST_WAIT_SCALE: timeouts scaled (tools/smoke.py -j N sets N:
+        // with N games loading at once, each loads slower).
+        static const double scale = [] {
+          const char* e = Env("TEST_WAIT_SCALE");
+          double v = e ? std::atof(e) : 1.0;
+          return v > 0 ? v : 1.0;
+        }();
+        if (ok) w.timeout = std::atof(tok[2].c_str()) * scale;
+        for (size_t i = 3; ok && i < tok.size(); i++) {
+          int x, y;
+          unsigned rgb;
+          if (tok[i] == "tol" && i + 1 < tok.size()) {
+            w.tolerance = std::atoi(tok[++i].c_str());
+          } else if (tok[i] == "press" && i + 2 < tok.size()) {
+            w.press = SDL_GetScancodeFromName(tok[i + 1].c_str());
+            w.every = std::atof(tok[i + 2].c_str());
+            ok = w.press != SDL_SCANCODE_UNKNOWN && w.every > 0;
+            i += 2;
+          } else if (std::sscanf(tok[i].c_str(), "%d,%d!=%x", &x, &y, &rgb) == 3) {
+            w.points.push_back({x, y});
+            w.colours.push_back(rgb & 0xFFFFFF);
+            w.unlike.push_back(true);
+          } else if (std::sscanf(tok[i].c_str(), "%d,%d=%x", &x, &y, &rgb) == 3) {
+            w.points.push_back({x, y});
+            w.colours.push_back(rgb & 0xFFFFFF);
+            w.unlike.push_back(false);
+          } else {
+            ok = false;
+          }
+        }
+        if (!ok || w.points.empty() || w.timeout <= 0) {
+          WarnF("TEST_INPUT: bad wait (line %d)\n", lineno);
+          continue;
+        }
+        SDL_Event e{};
+        e.type = kWaitEvent;
+        e.user.code = int32_t(g_waits.size());
+        g_waits.push_back(std::move(w));
+        q.push_back({std::max(t, last_release + 0.001), e});
+      } else if (c == "exit") {
+        SDL_Event e{};
+        e.type = kExitEvent;
+        q.push_back({t, e});
       } else {
         WarnF("TEST_INPUT: bad line: %s", line);
       }
@@ -1173,8 +1260,30 @@ void InjectTestInput() {
                      [](const TestEvent& x, const TestEvent& y) { return x.t < y.t; });
     WarnF("TEST_INPUT: %zu events from %s\n", q.size(), path);
   }
+  // Key-up of a press made while waiting.
+  static double press_up_at = -1;
+  static SDL_Event press_up{};
+  const double now = (SDL_GetTicks() - t0) / 1000.0;
+  auto send_key = [&](SDL_Event e) {
+    SDL_WindowID wid = 0;
+    {
+      std::lock_guard<std::recursive_mutex> l(g_mu);
+      for (auto& [h, w] : g_windows)
+        if (w.sdl && !w.destroyed) wid = SDL_GetWindowID(w.sdl);
+    }
+    if (!wid) return;
+    e.key.windowID = wid;
+    HandleSdlEvent(e);
+  };
+  if (press_up_at >= 0 && now >= press_up_at) {
+    press_up_at = -1;
+    send_key(press_up);
+  }
   if (next >= q.size()) return;
-  double t = (SDL_GetTicks() - t0) / 1000.0;
+  // The script's clock: real time less the time spent in waits.
+  static double paused = 0;
+  static double wait_since = -1, last_press = -1e9;
+  double t = now - paused;
   SDL_WindowID id = 0;
   {
     std::lock_guard<std::recursive_mutex> l(g_mu);
@@ -1190,6 +1299,76 @@ void InjectTestInput() {
       gfx::RequestShot(g_shot_names[size_t(e.user.code)].c_str());
       next++;
       continue;
+    }
+    if (e.type == kExitEvent) {
+      if (gfx::ShotPending()) break;  // after the shot is saved
+      WarnF("TEST_INPUT: exit at %.1f s, %d frames presented\n", now, gfx::FramesPresented());
+      std::fflush(nullptr);
+      std::_Exit(0);
+    }
+    if (e.type == kWaitEvent) {
+      const TestWait& w = g_waits[size_t(e.user.code)];
+      if (wait_since < 0) {
+        wait_since = now;
+        last_press = -1e9;
+        gfx::RequestProbe(w.points);
+      }
+      std::vector<uint32_t> px;
+      bool matched = false;
+      // A frame probed within 0.3 s of a press may not show its effect
+      // yet (the press opening a dialog, say): such results don't count.
+      const bool settled = w.press == SDL_SCANCODE_UNKNOWN || now - last_press >= 0.3;
+      if (gfx::TakeProbe(&px) && settled) {
+        matched = px.size() == w.colours.size();
+        for (size_t i = 0; matched && i < px.size(); i++) {
+          bool same = true;
+          for (int sh = 0; sh < 24; sh += 8)
+            if (std::abs(int((px[i] >> sh) & 255) - int((w.colours[i] >> sh) & 255)) > w.tolerance)
+              same = false;
+          if (same == w.unlike[i]) matched = false;
+        }
+        if (!matched && now - wait_since >= w.timeout) {
+          std::string have;
+          for (size_t i = 0; i < px.size(); i++) {
+            char b[48];
+            std::snprintf(b, sizeof b, " %d,%d=%06x", w.points[i].first, w.points[i].second,
+                          px[i] & 0xFFFFFF);
+            have += b;
+          }
+          WarnF("TEST_INPUT: wait (line %d) timed out after %.1f s; the frame has%s\n", w.line,
+                now - wait_since, have.c_str());
+          matched = true;  // go on: the shot will tell
+        } else if (matched) {
+          WarnF("TEST_INPUT: wait (line %d) matched after %.1f s\n", w.line, now - wait_since);
+        }
+      }
+      if (matched) {
+        paused += (now - wait_since);
+        t = now - paused;
+        wait_since = -1;
+        next++;
+        continue;
+      }
+      // Ask for the next frame's pixels, at most every 100 ms.
+      static double asked = -1e9;
+      if (now - asked >= 0.1) {
+        asked = now;
+        gfx::RequestProbe(w.points);
+      }
+      if (w.press != SDL_SCANCODE_UNKNOWN && now - last_press >= w.every && press_up_at < 0) {
+        last_press = now;
+        SDL_Event k{};
+        k.type = SDL_EVENT_KEY_DOWN;
+        k.key.scancode = w.press;
+        k.key.key = SDL_GetKeyFromScancode(w.press, SDL_KMOD_NONE, false);
+        k.key.down = true;
+        send_key(k);
+        k.type = SDL_EVENT_KEY_UP;
+        k.key.down = false;
+        press_up = k;
+        press_up_at = now + 0.08;
+      }
+      break;
     }
     if (e.type == SDL_EVENT_MOUSE_MOTION) {
       if (moved) break;

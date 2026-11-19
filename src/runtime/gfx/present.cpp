@@ -25,6 +25,12 @@ int frame = 0;  // frames presented (back or front buffer)
 
 std::mutex g_shot_mu;
 std::string g_shot_name;  // RequestShot: saved with the next frame
+// RequestProbe: points to read from the next frame, and what was read.
+std::vector<std::pair<int, int>> g_probe_points;
+bool g_probe_due = false, g_probe_ready = false;
+std::vector<uint32_t> g_probe_pixels;
+
+using ReadFn = std::function<void(const Rect&, uint8_t*, uint32_t)>;
 
 void SaveBmp(int w, int h, const std::vector<uint8_t>& px, const char* name) {
   SDL_Surface* surf =
@@ -39,7 +45,42 @@ void SaveBmp(int w, int h, const std::vector<uint8_t>& px, const char* name) {
 
 // <ID>_SHOT_EVERY / _SHOT_FROM / _SHOT_DIR: counts presented frames (back
 // or front buffer) and saves the due ones, read by `read`.
-void MaybeShoot(int w, int h, const std::function<void(uint8_t*, uint32_t)>& read) {
+// The test aids that need a frame's pixels (TEST_INPUT's named shots and
+// probes), counting the frame; `read_rect` is called only for those due.
+void ShotsAndProbes(int w, int h, const ReadFn& read_rect) {
+  frame++;
+  std::string named;
+  std::vector<std::pair<int, int>> probe;
+  {
+    std::lock_guard<std::mutex> l(g_shot_mu);
+    named.swap(g_shot_name);
+    if (g_probe_due) probe = g_probe_points;
+  }
+  if (!probe.empty()) {
+    std::vector<uint32_t> got;
+    for (auto [x, y] : probe) {
+      uint32_t v = 0xFF000000u;
+      if (x >= 0 && y >= 0 && x < w && y < h) {
+        uint8_t px[4] = {};
+        read_rect({x, y, x + 1, y + 1}, px, 4);
+        v = uint32_t(px[2]) << 16 | uint32_t(px[1]) << 8 | px[0];
+      }
+      got.push_back(v);
+    }
+    std::lock_guard<std::mutex> l(g_shot_mu);
+    g_probe_pixels = std::move(got);
+    g_probe_due = false;
+    g_probe_ready = true;
+  }
+  if (!named.empty()) {
+    std::vector<uint8_t> px(size_t(w) * h * 4);
+    read_rect({0, 0, w, h}, px.data(), uint32_t(w * 4));
+    SaveBmp(w, h, px, named.c_str());
+  }
+}
+
+void MaybeShoot(int w, int h, const ReadFn& read_rect) {
+  auto read = [&](uint8_t* px, uint32_t pitch) { read_rect({0, 0, w, h}, px, pitch); };
   static const int every = [] {
     const char* e = Env("SHOT_EVERY");
     return e ? std::atoi(e) : 0;
@@ -48,17 +89,7 @@ void MaybeShoot(int w, int h, const std::function<void(uint8_t*, uint32_t)>& rea
     const char* e = Env("SHOT_FROM");
     return e ? std::atoi(e) : 0;
   }();
-  frame++;
-  std::string named;
-  {
-    std::lock_guard<std::mutex> l(g_shot_mu);
-    named.swap(g_shot_name);
-  }
-  if (!named.empty()) {
-    std::vector<uint8_t> px(size_t(w) * h * 4);
-    read(px.data(), uint32_t(w * 4));
-    SaveBmp(w, h, px, named.c_str());
-  }
+  ShotsAndProbes(w, h, read_rect);
   if (every > 0 && frame >= from && frame % every == 0) {
     std::vector<uint8_t> px(size_t(w) * h * 4);
     read(px.data(), uint32_t(w * 4));
@@ -76,6 +107,12 @@ void MaybeShoot(int w, int h, const std::function<void(uint8_t*, uint32_t)>& rea
 
 }  // namespace
 
+int FramesPresented() { return frame; }
+
+void TestAidsForFrame(int w, int h, const std::function<void(const Rect&, uint8_t*, uint32_t)>& read) {
+  ShotsAndProbes(w, h, read);
+}
+
 void RequestShot(const char* name) {
   std::lock_guard<std::mutex> l(g_shot_mu);
   g_shot_name = name;
@@ -83,21 +120,36 @@ void RequestShot(const char* name) {
 
 bool ShotPending() {
   std::lock_guard<std::mutex> l(g_shot_mu);
-  return !g_shot_name.empty();
+  return !g_shot_name.empty() || g_probe_due;
+}
+
+void RequestProbe(const std::vector<std::pair<int, int>>& points) {
+  std::lock_guard<std::mutex> l(g_shot_mu);
+  g_probe_points = points;
+  g_probe_due = !points.empty();
+  g_probe_ready = false;
+}
+
+bool TakeProbe(std::vector<uint32_t>* pixels) {
+  std::lock_guard<std::mutex> l(g_shot_mu);
+  if (!g_probe_ready) return false;
+  g_probe_ready = false;
+  *pixels = g_probe_pixels;
+  return true;
 }
 
 // Games that draw on the front buffer (DirectDraw without a back buffer):
 // the same screenshots, of the front buffer.
 void PresentFrontWithDevAids(Device& dev, int w, int h) {
-  MaybeShoot(w, h, [&](uint8_t* px, uint32_t pitch) {
-    dev.ReadBackFront({0, 0, w, h}, px, pitch, Format::X8R8G8B8);
+  MaybeShoot(w, h, [&](const Rect& r, uint8_t* px, uint32_t pitch) {
+    dev.ReadBackFront(r, px, pitch, Format::X8R8G8B8);
   });
   dev.PresentFront();
 }
 
 void PresentWithDevAids(Device& dev, int w, int h) {
-  MaybeShoot(w, h, [&](uint8_t* px, uint32_t pitch) {
-    dev.ReadBack({0, 0, w, h}, px, pitch, Format::X8R8G8B8);
+  MaybeShoot(w, h, [&](const Rect& r, uint8_t* px, uint32_t pitch) {
+    dev.ReadBack(r, px, pitch, Format::X8R8G8B8);
   });
   dev.Present();
   // <ID>_HITCH=ms: report frames that took longer than that.

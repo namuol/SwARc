@@ -9,7 +9,10 @@
 #include <SDL3/SDL.h>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <utility>
+#include <vector>
 
 #include "runtime/gfx/device.h"
 
@@ -24,6 +27,26 @@ void PresentFrontWithDevAids(Device& dev, int w, int h);
 // changes (a still menu on the front buffer) present when ShotPending().
 void RequestShot(const char* name);
 bool ShotPending();
+
+// Test aid (<ID>_TEST_INPUT "wait"): reads the pixels at `points` (back
+// buffer pixels, as in the shots) of the next presented frame. TakeProbe
+// gives them (0xRRGGBB; out of the frame: 0xFF000000) once read, true
+// then and only once per request. A probe due counts as ShotPending, so
+// front ends that present only on change (a still DirectDraw menu)
+// present for it.
+// Frames presented so far (back or front buffer).
+int FramesPresented();
+
+// For front ends that present outside gfx::Device (a game's own Vulkan
+// swapchain): call once per presented w x h frame. Services TEST_INPUT's
+// named shots and probes and counts the frame; `read` (a rect of the
+// frame into dst, BGRX, pitch bytes per row) is called only when one of
+// them is due, so it may be expensive. <ID>_SHOT_EVERY is the front end's.
+void TestAidsForFrame(int w, int h,
+                      const std::function<void(const Rect&, uint8_t*, uint32_t)>& read);
+
+void RequestProbe(const std::vector<std::pair<int, int>>& points);
+bool TakeProbe(std::vector<uint32_t>* pixels);
 
 // The backend every graphics front end uses: <ID>_GFX=d3d9 or gpu; by
 // default SDL_GPU.
