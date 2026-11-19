@@ -32,7 +32,7 @@ All six recomps, one after another (`smoke.py` with every repo, no `-j`):
 | Case | Before | After |
 |---|---|---|
 | sims-1-recomp/lot | ~105 s | 55 s |
-| soldiers-heroes-of-wwii-recomp/menu | 52 s | 15 s (12 s with a reference taken as the menu appears) |
+| soldiers-heroes-of-wwii-recomp/menu | 52 s | 15 s; 8 s with its logo videos hidden (TEST_HIDE) and a new reference |
 | ra2-yr-recomp/skirmish | 86 s | 26 s |
 | ra2-yr-recomp/side-dropdown | 60 s | 15 s |
 | ra2-yr-recomp/map-list | 58 s | 14 s |
@@ -80,7 +80,7 @@ so the wait also requires the dialog's text absent ("!=").
 
 | Case | Before | After |
 |---|---|---|
-| menu | 52 s | 15 s; 12 s with a new reference taken as the menu appears (the menu's camera moves, so the old one needed the shot 3.5 s in) |
+| menu | 52 s | 15 s; 12 s with a new reference taken as the menu appears (the menu's camera moves, so the old one needed the shot 3.5 s in); **8 s** with the logo videos hidden (`<ID>_TEST_HIDE`: the game plays what `resource\video\intro` lists), no keys pressed |
 
 ### dx-ball-2-recomp (waits + exit; the logo plays)
 

@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "runtime/lazy_mem.h"
+#include "runtime/env.h"
 #include "runtime/log.h"
 #include "runtime/platform.h"
 #include "win32/hle.h"
@@ -992,6 +993,33 @@ void FillFindData(uint32_t fd, const std::string& host_dir, const std::string& n
   // cAlternateFileName (8.3) left empty.
 }
 
+// Test hook: <ID>_TEST_HIDE="piece;piece..." leaves out of directory
+// listings every entry whose guest path (lower case, backslashes) contains
+// a piece, e.g. "resource\\video\\intro\\": a game that plays what a folder
+// holds (logo videos) then finds nothing there. Nothing on disk changes.
+bool HiddenForTest(const std::string& guest_path) {
+  static const std::vector<std::string> pieces = [] {
+    std::vector<std::string> v;
+    if (const char* e = Env("TEST_HIDE")) {
+      std::string all = Lower(e);
+      for (char& ch : all)
+        if (ch == '/') ch = '\\';
+      for (size_t a = 0; a <= all.size();) {
+        size_t b = all.find(';', a);
+        if (b == std::string::npos) b = all.size();
+        if (b > a) v.push_back(all.substr(a, b - a));
+        a = b + 1;
+      }
+    }
+    return v;
+  }();
+  if (pieces.empty()) return false;
+  const std::string p = Lower(guest_path);
+  for (const std::string& piece : pieces)
+    if (p.find(piece) != std::string::npos) return true;
+  return false;
+}
+
 // Opens a search for `pattern` (a guest path whose last component may hold
 // wildcards) and fills the first entry; INVALID_HANDLE_VALUE and
 // ERROR_FILE_NOT_FOUND if nothing matches.
@@ -1007,7 +1035,8 @@ uint32_t FindFirst(const std::string& guest_pattern, uint32_t fd, bool wide) {
     if (!d) continue;
     while (dirent* e = readdir(d)) {
       std::string ln = Lower(e->d_name);
-      if (MatchFileMask(mask, e->d_name) && seen.insert(ln).second)
+      if (MatchFileMask(mask, e->d_name) && !HiddenForTest(gdir + "\\" + e->d_name) &&
+          seen.insert(ln).second)
         f->entries.push_back({hdir, e->d_name});
     }
     closedir(d);

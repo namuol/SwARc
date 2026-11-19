@@ -59,7 +59,13 @@ What went wrong while converting, and the rule it gave:
 
 ## Skipping intros
 
-Look for a switch first: The Sims has `-skip_intro` (case `"args"`). Check
+Look for a switch first: The Sims has `-skip_intro` (case `"args"`). Then
+look at how the game finds its intro: Soldiers plays whatever
+`resource\video\intro` holds, so its case hides that folder's entries from
+the game (`"env": {"{prefix}_TEST_HIDE": "resource\\video\\intro\\"}`, a
+listing filter; nothing on disk changes) and goes straight to loading, with
+no keys pressed. (Trace the game's file and video calls with <ID>_TRACE=1
+and <ID>_TRACE_FILTER=File, or the name of the video API.) Check
 the EXE's strings for switches and the game's settings files for an intro
 option (RA2's `[Intro] Play=no` is the intro movie only; Soldiers' profile
 `showIntro` is not its logo videos). Otherwise a key: Escape skips RA2's,
@@ -71,7 +77,8 @@ the moment the menu is up, unless the key does something on the menu:
   can land on the menu when the machine is busy (it did, in a parallel
   run): its logo plays out. Where a stray press is fatal, don't press.
 - Soldiers opens a Quit dialog on Escape at the menu (and the next Escape
-  closes it): the menu wait also has `!=` on the dialog's text.
+  closes it): pressing through its videos needed `!=` on the dialog's text.
+  Hiding the videos (above) made that unnecessary.
 
 Frames presented within 0.3 s of a press don't count towards a match, so a
 press that opened something is seen before the wait ends.

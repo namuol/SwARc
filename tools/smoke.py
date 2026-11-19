@@ -30,7 +30,9 @@ A case fails if:
     part: the sidebar of a match whose start position is random, say;
   - its "check" (a command; "{out}" is the case's result folder, holding
     the frames kept with "shot_every": N) exits non-zero.
-Other case keys: "args" (game arguments, after "--"), "fresh_data": true
+Other case keys: "args" (game arguments, after "--"), "env" (variables for
+the game, "{prefix}" filled in: <PREFIX>_TEST_HIDE hides intro videos a
+game finds by listing their folder), "fresh_data": true
 (new per-user data each run, as $XDG_DATA_HOME) and "data" (a folder
 copied in as that data first: settings that skip a first-run screen).
 A case with no reference saves its shot as the reference (NEW: look at it).
@@ -163,6 +165,11 @@ def run_case(repo, defaults, case, update, scale=1):
         else:
             os.makedirs(data)
         env["XDG_DATA_HOME"] = data
+    # "env": variables for the game, "{prefix}" filled in (e.g.
+    # {"{prefix}_TEST_HIDE": "resource\\video\\intro\\"}: logo videos a game
+    # finds by listing a folder are left out).
+    for k, v in case.get("env", {}).items():
+        env[k.replace("{prefix}", prefix)] = v
     ends = script_exits(inp)
     env.update({f"{prefix}_TEST_INPUT": inp, f"{prefix}_SHOT_DIR": out,
                 f"{prefix}_BACKGROUND": "1", f"{prefix}_TEST_WAIT_SCALE": str(scale)})
