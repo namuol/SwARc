@@ -11,6 +11,7 @@
 #include <cstring>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 #include "ppc/fatal.h"
 #include "xbox360/config.h"
@@ -18,6 +19,7 @@
 #include "xbox360/edram.h"
 #include "xbox360/hle.h"
 #include "xbox360/kernel.h"
+#include "xbox360/render.h"
 
 namespace recomp::xbox360 {
 namespace {
@@ -69,18 +71,21 @@ constexpr uint32_t kSwapSignature = 0x53574150;  // "SWAP"
 constexpr uint32_t kVizQueryStart = 7, kVizQueryEnd = 8;
 // An occlusion query's samples: the word D3D leaves in the z pass or z
 // fail counts of a query's end, and the samples every query passes while
-// nothing is drawn (Xenia's).
+// nothing is measured (Xenia's).
 constexpr uint32_t kQueryEndMark = 0xFFFFFEED, kQuerySamples = 1000;
 
 void SetReg(uint32_t r, uint32_t v) { Wr32(kGpuRegisters + 4 * r, v); }
 
 uint32_t Bswap(uint32_t v) { return v >> 24 | (v >> 8 & 0xFF00) | (v << 8 & 0xFF0000) | v << 24; }
 
-// The GPU's own word accesses: little-endian, after the swap.
+// The GPU's own word accesses: little-endian, after the swap, after the
+// resolves before them.
 uint32_t GpuRead(uint32_t addr) {
+  LandResolves();
   return GpuSwap(Bswap(Rd32(PhysicalToVirtual(addr & ~3u))), addr);
 }
 void GpuWrite(uint32_t addr, uint32_t v) {
+  LandResolves();
   Wr32(PhysicalToVirtual(addr & ~3u), Bswap(GpuSwap(v, addr)));
 }
 
@@ -125,7 +130,10 @@ void WriteRegister(uint32_t r, uint32_t v) {
   if (r - kRegScratchReg0 < 8) {
     // Scratch registers enabled in SCRATCH_UMSK are written back to memory.
     uint32_t n = r - kRegScratchReg0;
-    if (GpuRegister(kRegScratchUmsk) >> n & 1) Wr32(PhysicalToVirtual(GpuRegister(kRegScratchAddr) + 4 * n), v);
+    if (GpuRegister(kRegScratchUmsk) >> n & 1) {
+      LandResolves();
+      Wr32(PhysicalToVirtual(GpuRegister(kRegScratchAddr) + 4 * n), v);
+    }
   } else if (r == kRegCoherStatusHost) {
     // A coherency request: pending until a wait looks at it.
     SetReg(r, v | 0x80000000);
@@ -168,6 +176,7 @@ void Type3(Reader& in, uint32_t packet) {
       return;
     case kPm4Interrupt: {
       uint32_t cpus = in.Next();
+      LandResolves();
       for (uint32_t n = 0; n < 6; n++)
         if (cpus >> n & 1) Interrupt(1, n);
       return;
@@ -181,6 +190,7 @@ void Type3(Reader& in, uint32_t packet) {
       in.Next();
       uint32_t width = in.Next(), height = in.Next();
       in.Skip(count - 4);
+      LandResolves();
       QueueFrame(fetch, width, height);
       g_swaps++;
       g_counter++;
@@ -189,6 +199,7 @@ void Type3(Reader& in, uint32_t packet) {
     case kPm4IndirectBuffer:
     case kPm4IndirectBufferPfd: {
       uint32_t pa = in.Next() & 0x1FFFFFFF, words = in.Next() & 0xFFFFF;
+      LandResolves(pa, pa + 4 * words);
       Reader ib{PhysicalToVirtual(pa), words ? words : 1, 0, words};
       while (ib.remaining) Execute(ib);
       return;
@@ -200,7 +211,12 @@ void Type3(Reader& in, uint32_t packet) {
         if (info & 0x10) {
           value = GpuRead(poll);
         } else {
-          // Caches here are always coherent: a request completes when looked at.
+          // A coherency request completes when looked at. It is for the
+          // GPU's own later reads of the memory resolves wrote, which take
+          // their results from the device or land them first
+          // (LandResolves(lo, hi)), so it lands nothing (a choice; a title
+          // that polled the register from the CPU and then read the
+          // texels without a fence would see them late; console check).
           if (poll == kRegCoherStatusHost && GpuRegister(poll) & 0x80000000) SetReg(poll, 0);
           value = GpuRegister(poll);
         }
@@ -253,29 +269,34 @@ void Type3(Reader& in, uint32_t packet) {
       SetReg(kRegVgtEventInitiator, initiator & 0x3F);
       if (initiator >> 31) value = g_counter.load();
       uint32_t base = GpuRegister(kRegWritebackStart), offset = (addr & ~3u) - base;
-      if (addr > 0x1FFFFFFF && base && offset < GpuRegister(kRegWritebackSize))
+      if (addr > 0x1FFFFFFF && base && offset < GpuRegister(kRegWritebackSize)) {
+        LandResolves();
         Wr32(0x7F000000 + offset, Bswap(GpuSwap(value, addr)));
-      else
+      } else {
         GpuWrite(addr, value);
+      }
       return;
     }
     case kPm4EventWriteExt: {
-      // The screen extent of earlier draws: with no drawing, the largest,
+      // The screen extent of earlier draws: not measured, the largest,
       // in 8-pixel units, as halfwords.
       SetReg(kRegVgtEventInitiator, in.Next() & 0x3F);
       uint32_t va = PhysicalToVirtual(in.Next() & ~3u);
       const uint16_t extents[6] = {0, 8192 >> 3, 0, 8192 >> 3, 0, 1};
+      LandResolves();
       for (uint32_t k = 0; k < 6; k++) Wr16(va + 2 * k, extents[k]);
       return;
     }
     case kPm4EventWriteZpd: {
       // An occlusion query's begin or end: the sample counts at
       // RB_SAMPLE_COUNT_ADDR, eight little-endian words (total, z fail, z
-      // pass, stencil fail, two each, which D3D adds). With no drawing a
-      // query's end reports samples passing, so a title takes what it
-      // queried for visible, as EVENT_WRITE_EXT reports the largest extent.
+      // pass, stencil fail, two each, which D3D adds). Draws are not
+      // measured: a query's end reports samples passing, so a title takes
+      // what it queried for visible, as EVENT_WRITE_EXT reports the
+      // largest extent.
       SetReg(kRegVgtEventInitiator, in.Next() & 0x3F);
       if (uint32_t pa = GpuRegister(kRegRbSampleCountAddr)) {
+        LandResolves();
         uint32_t va = PhysicalToVirtual(pa & 0x1FFFFFFC);
         bool end = false;
         for (uint32_t k = 2; k < 6; k++) end |= Rd32(va + 4 * k) == kQueryEndMark;
@@ -288,16 +309,61 @@ void Type3(Reader& in, uint32_t packet) {
       return;
     }
     case kPm4DrawIndx:
-    case kPm4DrawIndx2:
-      // A draw in copy mode is a resolve; other draws: nothing is drawn yet.
-      in.Skip(count);
+    case kPm4DrawIndx2: {
+      // DRAW_INDX's visibility query word, then VGT_DRAW_INITIATOR: the
+      // primitive type (bits 0-5), the index source (bits 6-7: 0 indices
+      // in memory, 1 in the packet, 2 counted), 32-bit indices (bit 11),
+      // the count (bits 16-31). Indices in memory come with their address
+      // and a word with their count (bits 0-23) and endian swap (30-31);
+      // the packet's follow the initiator, two 16-bit ones a word.
+      // A draw in copy mode is a resolve.
+      uint32_t used = opcode == kPm4DrawIndx ? 2 : 1;
+      if (count < used) Fatal(nullptr, "GPU: a draw packet of %u words", count);
+      if (opcode == kPm4DrawIndx) in.Next();
+      uint32_t initiator = in.Next(), source = initiator >> 6 & 3, base = 0, size = 0;
+      std::vector<uint32_t> immediate;
+      if (source == 0) {
+        if (count < used + 2) Fatal(nullptr, "GPU: an indexed draw packet of %u words", count);
+        base = in.Next();
+        size = in.Next();
+        used += 2;
+      } else if (source == 1) {
+        uint32_t n = initiator >> 16, words = initiator >> 11 & 1 ? n : (n + 1) / 2;
+        if (count < used + words) Fatal(nullptr, "GPU: a draw packet of %u words for %u indices", count, n);
+        for (uint32_t k = 0; k < words; k++) immediate.push_back(in.Next());
+        used += words;
+      }
+      in.Skip(count - used);
       if ((GpuRegister(kRegRbModeControl) & 7) == kEdramModeCopy) Resolve();
+      else Draw(initiator, base, size, source == 1 ? immediate.data() : nullptr);
       return;
+    }
     case kPm4ImLoad:
-    case kPm4ImLoadImmediate:
-      // Shader loads: nothing is drawn yet.
-      in.Skip(count);
+    case kPm4ImLoadImmediate: {
+      // The shader type (0 vertex, 1 pixel) in the first word's low bits,
+      // with IM_LOAD the microcode's physical address above them; then
+      // the start (bits 16-31) and size in words (0-15); IM_LOAD_IMMEDIATE's
+      // words follow in the packet.
+      if (count < 2) Fatal(nullptr, "GPU: a shader load packet of %u words", count);
+      uint32_t first = in.Next(), start_size = in.Next(), type = first & 3, words = start_size & 0xFFFF;
+      if (type > 1) Fatal(nullptr, "GPU: a shader load of type %u", type);
+      if (start_size >> 16)
+        Fatal(nullptr, "GPU: a shader load at instruction %u (not implemented yet)", start_size >> 16);
+      std::vector<uint32_t> code(words);
+      if (opcode == kPm4ImLoad) {
+        uint32_t pa = first & 0x1FFFFFFC;
+        if (pa + 4 * uint64_t(words) > kPhysicalSize) Fatal(nullptr, "GPU: a shader at %x outside physical memory", pa);
+        LandResolves(pa, pa + 4 * words);
+        for (uint32_t k = 0; k < words; k++) code[k] = Rd32(PhysicalToVirtual(pa + 4 * k));
+        in.Skip(count - 2);
+      } else {
+        if (words > count - 2) Fatal(nullptr, "GPU: IM_LOAD_IMMEDIATE of %u words in %u", words, count);
+        for (uint32_t k = 0; k < words; k++) code[k] = in.Next();
+        in.Skip(count - 2 - words);
+      }
+      LoadShader(type == 1, code.data(), words);
       return;
+    }
     case kPm4VizQuery:
       SetReg(kRegVgtEventInitiator, in.Next() & 0x100 ? kVizQueryEnd : kVizQueryStart);
       return;
@@ -320,6 +386,7 @@ void Type3(Reader& in, uint32_t packet) {
       uint32_t addr = in.Next() & 0x3FFFFFFF, offset_type = in.Next(), words = in.Next() & 0xFFF;
       uint32_t type = offset_type >> 16 & 0xFF;
       if (type > 4) Fatal(nullptr, "GPU: LOAD_ALU_CONSTANT of type %u", type);
+      LandResolves(addr & 0x1FFFFFFF, (addr & 0x1FFFFFFF) + 4 * words);
       for (uint32_t k = 0; k < words; k++)
         WriteRegister(kBase[type] + (offset_type & 0x7FF) + k, Rd32(PhysicalToVirtual(addr + 4 * k)));
       return;
@@ -389,6 +456,7 @@ void CommandProcessor(void*) {
     idle = 0;
     Reader in{va, size, rptr, (wptr + size - rptr) % size};
     while (in.remaining) Execute(in);
+    LandResolves();
     std::lock_guard<std::mutex> g(g_ring_lock);
     if (g_ring_dwords != size) continue;  // set up again meanwhile
     g_rptr = wptr;
@@ -431,7 +499,7 @@ uint32_t GpuSwap(uint32_t v, uint32_t endian) {
 
 // Registers whose power-on values titles read: EDRAM timing, BC control
 // and the HSIO aligner (Xenia's), the interrupt status (a vertical blank),
-// the viewport's size.
+// the viewport's size; and the vertex index bound.
 void StartGpu() {
   VideoMode m = CurrentVideoMode();
   SetReg(kRegRbEdramTiming, 0x08100748);
@@ -439,6 +507,9 @@ void StartGpu() {
   SetReg(kRegRbHsioAligner, 0x00BBBBBB);
   SetReg(kRegInterruptStatus, 1);
   SetReg(kRegD1ModeViewportSize, m.width << 16 | m.height);
+  // VGT_MAX_VTX_INDX all 24 bits, so a title that never writes it is not
+  // clamped to vertex 0 (a choice; console check).
+  SetReg(kRegVgtMaxVtxIndx, 0xFFFFFF);
   StartDisplay();
   StartEdram();
   CreateSystemThread(CommandProcessor, nullptr);

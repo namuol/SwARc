@@ -1013,10 +1013,10 @@ static u32 ResolveAt(volatile u32* rb, u32 w, u32 verts, u32 control, u32 dest, 
   return w;
 }
 
-static void Resolves(volatile u32* rb, u32 w, u32 data, u32 pdata) {
-  u32 mem = MmAllocatePhysicalMemoryEx(0, 0x10000, kPageReadWrite, 0, 0, 0x1000), pmem = MmGetPhysicalAddress(mem);
-  u32 scratch = pmem, dest = pmem + 0x4000, depth = pmem + 0x8000;
-  for (u32 k = 0; k < 0x3000; k++) *At(mem + 4 * k) = 0xAAAAAAAA;
+static u32 Resolves(volatile u32* rb, u32 w, u32 data, u32 pdata) {
+  u32 mem = MmAllocatePhysicalMemoryEx(0, 0x14000, kPageReadWrite, 0, 0, 0x1000), pmem = MmGetPhysicalAddress(mem);
+  u32 scratch = pmem, dest = pmem + 0x4000, depth = pmem + 0x8000, twice = pmem + 0x10000;
+  for (u32 k = 0; k < 0x5000; k++) *At(mem + 4 * k) = 0xAAAAAAAA;
   // The rectangles' corners, pixel centres at integers (PA_SU_VTX_CNTL 0):
   // the whole 64x64 target, and 8x8 at (8, 16).
   volatile float* v = (volatile float*)(uintptr_t)(mem + 0xC000);
@@ -1055,13 +1055,29 @@ static void Resolves(volatile u32* rb, u32 w, u32 data, u32 pdata) {
   // The target, red and blue swapped, bytes in words swapped (so this
   // big-endian CPU reads the swapped value).
   w = ResolveAt(rb, w, whole, 0, dest, 1u << 24 | 6 << 7 | 2);
+  // The target to another texture, cleared to C, and then the block (now
+  // C) to it too: the second resolve's 32x32 texels around the block
+  // keep what the first wrote.
+  rb[w++] = Type0(0x231E, 1);
+  rb[w++] = 0x99AABBCC;
+  w = ResolveAt(rb, w, whole, 0x100, twice, 6 << 7);
+  w = ResolveAt(rb, w, block, 0, twice, 6 << 7);
   // The depth target cleared, then copied.
   w = ResolveAt(rb, w, whole, 0x204, scratch, 6 << 7);
   w = ResolveAt(rb, w, whole, 4, depth, 6 << 7 | 2);
+  // A fence, then a wait on SCRATCH_REG1, a register, which holds the
+  // GPU until the texels are checked: they are in memory by the fence,
+  // not only by the end of the commands.
   rb[w++] = Type3(0x58, 3);
   rb[w++] = 0;
   rb[w++] = (pdata + 0x68) | 2;
   rb[w++] = 5;
+  rb[w++] = Type3(0x3C, 5);
+  rb[w++] = 3;
+  rb[w++] = 0x579;
+  rb[w++] = 1;
+  rb[w++] = 0xFFFFFFFF;
+  rb[w++] = 0x100;
   *Reg(0x1C5) = w;
   CHECK(WaitFor(At(data + 0x68), 5));
   // A is 11223344 (8888 as the EDRAM holds it, red in the low byte), B
@@ -1081,6 +1097,16 @@ static void Resolves(volatile u32* rb, u32 w, u32 data, u32 pdata) {
   u32 d = 0;
   for (u32 k = 0; k < 0x1000; k++) d += *At(mem + 0x8000 + 4 * k) == 0xABCDEF01;
   CHECK(d == 4096);
+  // In this one, words as the EDRAM holds them: A, and C in the block.
+  u32 c = 0;
+  a = 0;
+  for (u32 k = 0; k < 0x1000; k++) {
+    u32 t = *At(mem + 0x10000 + 4 * k);
+    a += t == 0x44332211;
+    c += t == 0xCCBBAA99;
+  }
+  CHECK(a == 4096 - 64 && c == 64);
+  *Reg(0x579) = 1;
 
   // The resolved texture as the front buffer, twice: tiled, a 64-texel
   // pitch, 64x64, its words byte-swapped (endian 2) and the swizzle ZYXW,
@@ -1123,6 +1149,1853 @@ static void Resolves(volatile u32* rb, u32 w, u32 data, u32 pdata) {
   u32 h = 0;
   for (u32 k = 0; k < 0x1000; k++) h += *At(wide + 8 * k) == 0x36004C00 && *At(wide + 8 * k + 4) == 0x3C001800;
   CHECK(h == 4096);
+  return w;
+}
+
+// Shader microcode, built from its fields (docs/xenos.md, "Shaders").
+// Control flow comes first, two 48-bit instructions in three words: an
+// exec_end (opcode 2) of `n` instructions from instruction `at` (three
+// words each), those whose bit is set in `fetches` fetches, then a nop.
+static void UcodeExec(u32* w, u32 at, u32 n, u32 fetches) {
+  u32 sequence = 0;
+  for (u32 k = 0; k < n; k++) sequence |= (fetches >> k & 1) << (2 * k);
+  w[0] = at | n << 12 | sequence << 16;
+  w[1] = 2u << 12;
+  w[2] = 0;
+}
+// A vertex fetch of vertex fetch constant `constant` by the vertex index
+// (r0.x) into register `dst`, components as fetched (swizzle xyzw):
+// `format`, `stride` words a vertex, `offset` words into it.
+static void UcodeVfetch(u32* w, u32 dst, u32 constant, u32 format, u32 stride, u32 offset) {
+  w[0] = dst << 12 | constant / 3 << 20 | constant % 3 << 25;
+  w[1] = (0 | 1 << 3 | 2 << 6 | 3 << 9) | format << 16;
+  w[2] = stride | offset << 8;
+}
+// An ALU instruction that exports max(a, a), a being temporary register
+// or float constant `src`, all four components, to export register `dest`
+// (vector opcode 2, no scalar operation: opcode 50 with no mask).
+static void UcodeExport(u32* w, u32 dest, u32 src, int temp) {
+  w[0] = dest | 1 << 15 | 0xFu << 16 | 50u << 26;
+  w[1] = 0;
+  w[2] = src << 16 | src << 8 | 2u << 24 | (temp ? 3u << 30 : 0);
+}
+
+// Byte offset of texel (x, y) of a tiled texture 64 texels wide, texels
+// of 1 << log2 bytes (edram.cpp's Tiled2D).
+static u32 Tiled64(u32 x, u32 y, u32 log2) {
+  u32 outer = ((y >> 5) * 2 + (x >> 5)) << 6, inner = ((y >> 1) & 7) << 3 | (x & 7);
+  u32 oi = (outer | inner) << log2, bank = (y >> 4) & 1, pipe = ((x >> 3) & 3) ^ (((y >> 3) & 1) << 1);
+  return (oi & 15) | (y & 1) << 4 | ((oi >> 4) & 1) << 5 | pipe << 6 | ((oi >> 5) & 7) << 8 | bank << 11 |
+         (oi >> 8) << 12;
+}
+
+static u32 FloatBits(float f) {
+  union {
+    float f;
+    u32 u;
+  } v = {f};
+  return v.u;
+}
+
+// What the draws' tests write: an indirect buffer the ring runs (then a
+// fence), and vertices.
+static struct {
+  volatile u32* rb;
+  u32 w, data, pdata, fence;
+  volatile u32* ib;
+  u32 n, pib;
+  u32 pool, ppool, used;  // vertices
+  u32 corners, small;     // the resolves' rectangles: 64x64, 16x16
+  u32 ps;                 // the pixel shaders' microcode, 0x40 bytes each
+  u32 vs;                 // the vertex shaders' microcode, 0x80 bytes each
+} gq;
+static void Put(u32 v) { gq.ib[gq.n++] = v; }
+static void Set(u32 reg, u32 v) {
+  Put(Type0(reg, 1));
+  Put(v);
+}
+static void SetF(u32 reg, float a, float b, float c, float d) {
+  Put(Type0(reg, 4));
+  Put(FloatBits(a));
+  Put(FloatBits(b));
+  Put(FloatBits(c));
+  Put(FloatBits(d));
+}
+// Runs the buffer and waits for its fence (up to ten seconds: a host
+// GPU in software is slow).
+static void Kick(void) {
+  volatile u32* rb = gq.rb;
+  rb[gq.w++] = Type3(0x3F, 2);
+  rb[gq.w++] = gq.pib;
+  rb[gq.w++] = gq.n;
+  rb[gq.w++] = Type3(0x58, 3);
+  rb[gq.w++] = 0;
+  rb[gq.w++] = (gq.pdata + 0x78) | 2;
+  rb[gq.w++] = ++gq.fence;
+  *Reg(0x1C5) = gq.w;
+  int done = 0;
+  for (int k = 0; k < 10 && !done; k++) done = WaitFor(At(gq.data + 0x78), gq.fence);
+  CHECK(done);
+  gq.n = 0;
+}
+// Vertices x, y (pairs), z and a colour, seven words each: their physical
+// address.
+static u32 Verts(const float* xy, u32 n, float z, const float* c) {
+  u32 pa = gq.ppool + gq.used;
+  for (u32 v = 0; v < n; v++) {
+    const float f[7] = {xy[2 * v], xy[2 * v + 1], z, c[0], c[1], c[2], c[3]};
+    for (u32 k = 0; k < 7; k++) *At(gq.pool + gq.used + 4 * k) = FloatBits(f[k]);
+    gq.used += 28;
+  }
+  return pa;
+}
+static void Fetch0(u32 pa, u32 vertices) {
+  Put(Type0(0x4800, 2));
+  Put(pa | 3);
+  Put(7 * vertices << 2 | 2);
+}
+// A triangle, or a rectangle of corners (x0, y0) and (x1, y1), counted
+// indices.
+static void Tri(const float xy[6], float z, const float* c) {
+  Fetch0(Verts(xy, 3, z, c), 3);
+  Put(Type3(0x36, 1));
+  Put(3 << 16 | 2 << 6 | 4);
+}
+static void Rect(float x0, float y0, float x1, float y1, float z, const float* c) {
+  const float xy[6] = {x0, y0, x1, y0, x0, y1};
+  Fetch0(Verts(xy, 3, z, c), 3);
+  Put(Type3(0x36, 1));
+  Put(3 << 16 | 2 << 6 | 8);
+}
+// A resolve of the 64x64 (or 16x16) target to a texture 64 texels wide,
+// in copy mode, back to drawing colour and depth after it.
+static void Resolve(u32 control, u32 dest, u32 dest_info, int small) {
+  Set(0x2208, 6);
+  gq.n = ResolveAt(gq.ib, gq.n, small ? gq.small : gq.corners, control, dest, dest_info);
+  Set(0x2208, 4);
+}
+// The pixel shader that exports r0 (0), c0 (1), r0 and c0 to colours 0
+// and 1 (2), r0 and depth c0.x (3), r1 (4).
+static void PixelShader(u32 k) {
+  Put(Type3(0x27, 2));  // IM_LOAD
+  Put((gq.ps + 0x40 * k) | 1);
+  Put(k == 2 || k == 3 ? 9 : 6);
+}
+// The vertex shader that exports the position and the colour to
+// interpolator 0 (0), and the colour as the point size, edge flag and
+// kill too (1).
+static void VertexShader(u32 k) {
+  Put(Type3(0x27, 2));
+  Put(gq.vs + 0x80 * k);
+  Put(k ? 18 : 15);
+}
+
+static const float kWhite[4] = {1, 1, 1, 1}, kBlack[4] = {0, 0, 0, 0}, kRed[4] = {1, 0, 0, 1},
+                   kGreen[4] = {0, 1, 0, 1}, kBlue[4] = {0, 0, 1, 1};
+
+// Each colour target format drawn as float constant 0 and its EDRAM words
+// resolved as they are (the target read as 32_FLOAT or 32_32_FLOAT).
+static const struct {
+  u32 info;  // format, exponent bias
+  float c[4];
+  u32 w0, w1;
+} kFormats[] = {
+    {0, {1, 0.2f, 0, 1}, 0xFF0033FF, 0},
+    {1, {1, 0.25f, 0, 1}, 0xFF007FFF, 0},  // gamma: 0.25 to 127/255
+    {2, {1, 0.25f, 0, 1}, 0xC00403FF, 0},
+    {10, {1, 0.25f, 0, 1}, 0xC00403FF, 0},
+    // 7e3: 0.125 a denormal (0x040), 40 above the range (31.875, 0x3FF),
+    // 1 (0x180).
+    {3, {0.125f, 40, 1, 1}, 0xD80FFC40, 0},
+    {12, {0.125f, 40, 1, 1}, 0xD80FFC40, 0},
+    {4, {4, -8, 0, 0}, 0xE0001000, 0},  // fixed point: 4096 a 32767/32 per unit
+    {5, {4, -8, 1, -1}, 0xE0001000, 0xFC000400},
+    {6, {1.5f, -2, 0, 0}, 0xC0003E00, 0},
+    {6 | 1 << 4, {1.5f, -2, 0, 0}, 0xC4004200, 0},  // exponent bias 1: 3, -4
+    {7, {1.5f, -2, 0.25f, 1}, 0xC0003E00, 0x3C003400},
+    {14, {1.5f, 0, 0, 0}, 0x3FC00000, 0},
+    {15, {1.5f, -2, 0, 0}, 0x3FC00000, 0xC0000000},
+};
+
+// A draw of `n` vertices at `pa`, counted indices.
+static void DrawAuto(u32 prim, u32 pa, u32 n) {
+  Fetch0(pa, n);
+  Put(Type3(0x36, 1));
+  Put(n << 16 | 2 << 6 | prim);
+}
+// A draw of `count` 16-bit indices at `indices` (as this big-endian CPU
+// stores them: bytes swapped in halfwords) into `n` vertices at `pa`.
+static void DrawIndexed(u32 prim, u32 pa, u32 n, u32 indices, u32 count) {
+  Fetch0(pa, n);
+  Put(Type3(0x22, 4));
+  Put(0);
+  Put(count << 16 | 0 << 6 | prim);
+  Put(indices);
+  Put(count | 1u << 30);
+}
+// 16-bit indices in the vertex pool: their physical address.
+static u32 Indices16(const uint16_t* v, u32 n) {
+  u32 pa = gq.ppool + gq.used;
+  volatile uint16_t* p = (volatile uint16_t*)(uintptr_t)(gq.pool + gq.used);
+  for (u32 k = 0; k < n; k++) p[k] = v[k];
+  gq.used = (gq.used + 2 * n + 3) & ~3u;
+  return pa;
+}
+// One vertex in a colour.
+static u32 Vert(float x, float y, float r, float g, float b, float a) {
+  const float xy[2] = {x, y}, c[4] = {r, g, b, a};
+  return Verts(xy, 1, 0, c);
+}
+
+// The other primitive types, points and what the pixel shader gets from
+// the rasteriser: 8_8_8_8 targets E at 0x040 and E2 at 0x044, a
+// 16_16_16_16_FLOAT target F at 0x050 and, 4x MSAA, F4 at 0x060.
+static void Primitives(void) {
+  u32 mem = MmAllocatePhysicalMemoryEx(0, 0x40000, kPageReadWrite, 0, 0, 0x1000), pmem = MmGetPhysicalAddress(mem);
+  for (u32 k = 0; k < 0x40000; k += 4) *At(mem + k) = 0xAAAAAAAA;
+  u32 dest_e = pmem, dest_e2 = pmem + 0x4000, dest_f = pmem + 0x8000, dest_f4 = pmem + 0x10000,
+      dest_c = pmem + 0x18000, dest_d = pmem + 0x1C000;
+  Set(0x2000, 64);
+  Set(0x231E, 0);
+  Set(0x2001, 0x040);
+  Resolve(0x100, dest_e, 6 << 7 | 2, 0);
+  Set(0x2001, 0x044);
+  Resolve(0x100, dest_e2, 6 << 7 | 2, 0);
+  Set(0x2001, 0x040);
+  PixelShader(0);
+
+  // A fan, its triangles (v1 v2 v0), (v2 v3 v0): the square (0-16), its
+  // lower left (2, 13) too, which a strip of these leaves out.
+  u32 fan = Vert(0, 0, 1, 1, 1, 1);
+  Vert(16, 0, 1, 1, 1, 1);
+  Vert(16, 16, 1, 1, 1, 1);
+  Vert(0, 16, 1, 1, 1, 1);
+  DrawAuto(5, fan, 4);
+  // A strip of 16-bit indices with a reset index (0xFFFF), back faces
+  // culled, front counter-clockwise: (16 0) (16 16) (32 0) (32 16), its
+  // odd triangle wound as the even one; then (36 0) (36 16) (48 0) alone,
+  // nothing across the reset at (34, 8).
+  u32 strip = Vert(16, 0, 1, 1, 1, 1);
+  Vert(16, 16, 1, 1, 1, 1);
+  Vert(32, 0, 1, 1, 1, 1);
+  Vert(32, 16, 1, 1, 1, 1);
+  Vert(36, 0, 1, 1, 1, 1);
+  Vert(36, 16, 1, 1, 1, 1);
+  Vert(48, 0, 1, 1, 1, 1);
+  const uint16_t strip_indices[8] = {0, 1, 2, 3, 0xFFFF, 4, 5, 6};
+  u32 pstrip = Indices16(strip_indices, 8);
+  Set(0x2103, 0xFFFF);           // VGT_MULTI_PRIM_IB_RESET_INDX
+  Set(0x2205, 1 << 21 | 2);      // multi_prim_ib_ena, back faces culled
+  DrawIndexed(6, strip, 7, pstrip, 8);
+  Set(0x2205, 0);
+  // A quad (0 16) red (16 16) (16 32) blue (0 32), split along (0 16)-(16
+  // 32): above it no blue, below it no red.
+  u32 quad = Vert(0, 16, 0, 0, 0, 1);
+  Vert(16, 16, 1, 0, 0, 1);
+  Vert(16, 32, 0, 0, 0, 1);
+  Vert(0, 32, 0, 0, 1, 1);
+  DrawAuto(13, quad, 4);
+  // Points of PA_SU_POINT_SIZE's size, 4 (half 2: 32 in 12.4), at (8, 50):
+  // pixels 6-9, 48-51.
+  Set(0x2280, 32 << 16 | 32);
+  Set(0x2281, 8 | 32 << 16);  // PA_SU_POINT_MINMAX: half sizes 0.5, 2
+  DrawAuto(1, Vert(8, 50, 1, 1, 1, 1), 1);
+  // The vertex shader's size (its colour's red), clamped: 6 to 4 at
+  // (20, 50), pixels 18-21; 2 at (30, 50), pixels 29-30.
+  VertexShader(1);
+  u32 sized = Vert(20, 50, 6, 1, 0, 1);
+  Vert(30, 50, 2, 1, 0, 1);
+  DrawAuto(1, sized, 2);
+  VertexShader(0);
+  Resolve(0, dest_e, 6 << 7 | 2, 0);
+
+  // E2: lines, a list (16 2)-(40 2), a strip (16 6) (40 6) (40 14), a loop
+  // (44 2) (56 2) (56 12) (44 12), back along x 44.
+  Set(0x2001, 0x044);
+  u32 lines = Vert(16, 2, 1, 1, 1, 1);
+  Vert(40, 2, 1, 1, 1, 1);
+  DrawAuto(2, lines, 2);
+  u32 line_strip = Vert(16, 6, 1, 1, 1, 1);
+  Vert(40, 6, 1, 1, 1, 1);
+  Vert(40, 14, 1, 1, 1, 1);
+  DrawAuto(3, line_strip, 3);
+  u32 loop = Vert(44, 2, 1, 1, 1, 1);
+  Vert(56, 2, 1, 1, 1, 1);
+  Vert(56, 12, 1, 1, 1, 1);
+  Vert(44, 12, 1, 1, 1, 1);
+  DrawAuto(12, loop, 4);
+  // Indices 0 1 5 with VGT_MAX_VTX_INDX 2: the triangle (48 16) (64 16)
+  // (64 32), not (48 32), vertex 5.
+  u32 clamped = Vert(48, 16, 1, 1, 1, 1);
+  Vert(64, 16, 1, 1, 1, 1);
+  Vert(64, 32, 1, 1, 1, 1);
+  Vert(0, 0, 1, 1, 1, 1);
+  Vert(0, 0, 1, 1, 1, 1);
+  Vert(48, 32, 1, 1, 1, 1);
+  const uint16_t clamped_indices[3] = {0, 1, 5};
+  u32 pclamped = Indices16(clamped_indices, 3);
+  Set(0x2100, 2);
+  DrawIndexed(4, clamped, 6, pclamped, 3);
+  Set(0x2100, 0xFFFFFF);
+  // Immediate 16-bit indices 2 0 1 (in the packet, two a word, the low
+  // half first): the triangle (0 16) (16 16) (0 32).
+  u32 immediate = Vert(16, 16, 1, 1, 1, 1);
+  Vert(0, 32, 1, 1, 1, 1);
+  Vert(0, 16, 1, 1, 1, 1);
+  Fetch0(immediate, 3);
+  Put(Type3(0x22, 4));  // DRAW_INDX: query word, initiator, indices
+  Put(0);
+  Put(3 << 16 | 1 << 6 | 4);
+  Put(2 | 0 << 16);
+  Put(1);
+  // Vertex kill (the colour's blue): with all of a triangle's vertices
+  // needed (PA_CL_CLIP_CNTL bit 21 clear), one killed keeps (16 40)-(32
+  // 56), three drop (32 40)-(48 56); with any (bit 21 set), one drops (48
+  // 40)-(64 56).
+  VertexShader(1);
+  u32 kill = Vert(16, 40, 1, 1, 0, 1);
+  Vert(32, 40, 1, 1, 0, 1);
+  Vert(32, 56, 1, 1, 1, 1);
+  Vert(32, 40, 1, 1, 1, 1);
+  Vert(48, 40, 1, 1, 1, 1);
+  Vert(48, 56, 1, 1, 1, 1);
+  DrawAuto(4, kill, 6);
+  u32 kill_or = Vert(48, 40, 1, 1, 0, 1);
+  Vert(64, 40, 1, 1, 0, 1);
+  Vert(64, 56, 1, 1, 1, 1);
+  Set(0x2204, 1 << 16 | 1 << 21);
+  DrawAuto(4, kill_or, 3);
+  Set(0x2204, 1 << 16);
+  VertexShader(0);
+  Resolve(0, dest_e2, 6 << 7 | 2, 0);
+
+  // The pixel parameters (r1, SQ_CONTEXT_MISC bits 8-15) in F: front (4, 4)
+  // and back (28, 4) faces, X negative for the back one; a point sprite
+  // of 8 at (40, 40): at (37, 37) Y negative, the sprite coordinates 1/8.
+  // Then F4 (4x): a sprite of 8 at (20, 20), sample 0 of (17, 17) 3/32
+  // into it.
+  Set(0x2001, 0x050 | 7 << 16);
+  Set(0x231E, 0);
+  Set(0x231F, 0);
+  Resolve(0x100, dest_f, 32 << 7 | 2, 0);
+  Set(0x2180, 1 << 18);  // SQ_PROGRAM_CNTL: param_gen
+  Set(0x2181, 1 << 8);   // SQ_CONTEXT_MISC: param_gen_pos 1
+  PixelShader(4);
+  const float front[6] = {0, 0, 0, 16, 16, 0}, back[6] = {16, 0, 32, 0, 32, 16};
+  Tri(front, 0, kWhite);
+  Tri(back, 0, kWhite);
+  Set(0x2280, 64 << 16 | 64);
+  Set(0x2281, 0xFFFF0000);
+  DrawAuto(1, Vert(40, 40, 1, 1, 1, 1), 1);
+  Resolve(0, dest_f, 32 << 7 | 2, 0);
+  Set(0x2000, 64 | 2 << 16);
+  Set(0x2001, 0x060 | 7 << 16);
+  Resolve(0x100, dest_f4, 32 << 7 | 2, 0);
+  DrawAuto(1, Vert(20, 20, 1, 1, 1, 1), 1);
+  Resolve(0, dest_f4, 32 << 7 | 2, 0);
+  Set(0x2000, 64);
+  Set(0x2180, 0);
+  Set(0x2181, 0);
+  PixelShader(0);
+
+  // A scissor of 8192 (window and screen) with colour at 0x0C0 and depth
+  // right after it at 0x0C4: each holds the surface's rows up to the
+  // other. Depth alone first (depth only), so the depth target is stored
+  // before the colour one; then both, depth 0.5 at (8-16, 8-16): the
+  // colour target's rows must not reach the depth's tiles.
+  Put(Type0(0x2080, 3));
+  Put(0);
+  Put(0x80000000);
+  Put(8192 | 8192 << 16);
+  Set(0x2001, 0x0C0);
+  Set(0x2002, 0x0C4);
+  Set(0x231D, 0xFFFFFF00);
+  Resolve(0x100, dest_c, 6 << 7 | 2, 0);
+  Resolve(0x200 | 4, dest_d, 6 << 7 | 2, 0);
+  Set(0x2200, 2 | 4 | 7 << 4);
+  Set(0x2208, 5);
+  Rect(40, 40, 48, 48, 1, kGreen);
+  Set(0x2208, 4);
+  Rect(8, 8, 16, 16, 0.5f, kGreen);
+  Set(0x2200, 0);
+  Resolve(0, dest_c, 6 << 7 | 2, 0);
+  Resolve(4, dest_d, 6 << 7 | 2, 0);
+  Put(Type0(0x2080, 3));
+  Put(0);
+  Put(0x80000000);
+  Put(64 | 64 << 16);
+  Set(0x2001, 0x600);
+  Set(0x2002, 0x500);
+  Kick();
+
+#define E(x, y) At(mem)[Tiled64(x, y, 2) / 4]
+#define E2(x, y) At(mem + 0x4000)[Tiled64(x, y, 2) / 4]
+  CHECK(E(2, 13) == 0xFFFFFFFF && E(13, 2) == 0xFFFFFFFF);
+  CHECK(E(18, 4) == 0xFFFFFFFF && E(29, 12) == 0xFFFFFFFF && E(38, 4) == 0xFFFFFFFF && E(34, 8) == 0);
+  CHECK((E(13, 19) & 0xFF0000) == 0 && (E(13, 19) & 0xFF) != 0 && (E(3, 29) & 0xFF) == 0 &&
+        (E(3, 29) & 0xFF0000) != 0);
+  CHECK(E(9, 51) == 0xFFFFFFFF && E(6, 48) == 0xFFFFFFFF && E(10, 50) == 0 && E(5, 50) == 0);
+  CHECK(E(21, 51) == 0xFF00FFFF && E(18, 48) == 0xFF00FFFF && E(22, 50) == 0 && E(17, 50) == 0);
+  CHECK(E(29, 50) == 0xFF00FFFF && E(30, 50) == 0xFF00FFFF && E(28, 50) == 0 && E(31, 50) == 0);
+  CHECK(E2(28, 2) == 0xFFFFFFFF && E2(28, 6) == 0xFFFFFFFF && E2(40, 10) == 0xFFFFFFFF);
+  CHECK(E2(44, 7) == 0xFFFFFFFF && E2(56, 7) == 0xFFFFFFFF && E2(50, 2) == 0xFFFFFFFF);
+  CHECK(E2(60, 20) == 0xFFFFFFFF && E2(50, 28) == 0);
+  CHECK(E2(4, 20) == 0xFFFFFFFF);
+  CHECK(E2(20, 42) != 0 && E2(44, 44) == 0 && E2(60, 42) == 0);
+  volatile u32* f = At(mem + 0x8000);
+  volatile u32* f4 = At(mem + 0x10000);
+#define F(t, x, y, k) t[Tiled64(x, y, 3) / 4 + (k)]
+  CHECK(F(f, 4, 4, 0) == 0x44004400 && F(f, 4, 4, 1) == 0);
+  CHECK(F(f, 28, 4, 0) == 0x4400CF00 && F(f, 28, 4, 1) == 0);
+  CHECK(F(f, 37, 37, 0) == 0xD0A050A0 && F(f, 37, 37, 1) == 0x30003000);
+  CHECK(F(f4, 17, 17, 0) == 0xCC404C40 && F(f4, 17, 17, 1) == 0x2E002E00);
+  CHECK(At(mem + 0x18000)[Tiled64(10, 10, 2) / 4] == 0xFF00FF00 &&
+        At(mem + 0x1C000)[Tiled64(10, 10, 2) / 4] == 0x80000000);
+#undef E
+#undef E2
+#undef F
+}
+
+// ---- textures -------------------------------------------------------------
+static u32 Bswap32(u32 v) { return v >> 24 | (v >> 8 & 0xFF00) | (v << 8 & 0xFF0000) | v << 24; }
+// What the CPU stores for the GPU to read `v` with endian swap `e`: the
+// GPU reads words little-endian, then swaps.
+static u32 GuestWord(u32 v, u32 e) {
+  if (e == 1) v = (v << 8 & 0xFF00FF00) | (v >> 8 & 0x00FF00FF);
+  if (e == 2) v = Bswap32(v);
+  if (e == 3) v = v >> 16 | v << 16;
+  return Bswap32(v);
+}
+// Byte offset of block (x, y) of a tiled surface `pitch` blocks wide.
+static u32 TiledAt(u32 x, u32 y, u32 pitch, u32 log2) {
+  u32 outer = ((y >> 5) * (pitch >> 5) + (x >> 5)) << 6, inner = ((y >> 1) & 7) << 3 | (x & 7);
+  u32 oi = (outer | inner) << log2, bank = (y >> 4) & 1, pipe = ((x >> 3) & 3) ^ (((y >> 3) & 1) << 1);
+  return (oi & 15) | (y & 1) << 4 | ((oi >> 4) & 1) << 5 | pipe << 6 | ((oi >> 5) & 7) << 8 | bank << 11 |
+         (oi >> 8) << 12;
+}
+
+// A texture fetch constant (xe_gpu_texture_fetch_t) n, from its fields.
+struct Tex {
+  u32 format, pa, w, h, d;  // d: a 3D texture's depth, a stacked one's layers
+  u32 dim, stacked, tiled, pitch, endian;
+  u32 signs, clamp, swizzle, exp, filter, mip_filter, vol_linear;
+  u32 mip_max, packed, mip_pa;
+};
+static struct Tex MakeTex(u32 format, u32 pa, u32 w, u32 h, u32 d, u32 dim, u32 stacked, u32 tiled, u32 pitch,
+                          u32 endian, u32 signs, u32 clamp, u32 swizzle) {
+  struct Tex t = {0};
+  t.format = format, t.pa = pa, t.w = w, t.h = h, t.d = d, t.dim = dim, t.stacked = stacked, t.tiled = tiled;
+  t.pitch = pitch, t.endian = endian, t.signs = signs, t.clamp = clamp, t.swizzle = swizzle;
+  return t;
+}
+static void TexConst(u32 n, const struct Tex* t) {
+  u32 w2 = t->dim == 2 ? (t->w - 1) | (t->h - 1) << 11 | (t->d - 1) << 22
+                       : (t->w - 1) | (t->h - 1) << 13 | (t->stacked ? t->d - 1 : t->dim == 3 ? 5 : 0) << 26;
+  Put(Type0(0x4800 + 6 * n, 6));
+  Put(2 | t->signs << 2 | t->clamp * 0x49 << 10 | (t->pitch / 32) << 22 | t->tiled << 31);
+  Put(t->format | t->endian << 6 | t->stacked << 10 | (t->pa >> 12) << 12);
+  Put(w2);
+  Put(t->swizzle << 1 | (t->exp & 63) << 13 | t->filter * 0x5 << 19 | t->mip_filter << 23);
+  Put(t->vol_linear * 3 | t->mip_max << 6);
+  Put(t->dim << 9 | t->packed << 11 | (t->mip_pa >> 12) << 12);
+}
+#define XYZW (0 | 1 << 3 | 2 << 6 | 3 << 9)
+
+// An ALU instruction: vector operation `vop` of a, b, c (a register when
+// the operand's temp bit is set, else a float constant; a swizzle each,
+// the component each result component takes) to register or export
+// `dest` (mask), no scalar operation unless `sop` < 50 with its own mask
+// and register.
+struct AluOp {
+  u32 reg, temp, swizzle;  // swizzle: 2 bits a component, the source component
+};
+static u32 Swz(u32 x, u32 y, u32 z, u32 w) {
+  const u32 c[4] = {x, y, z, w};
+  u32 s = 0;
+  for (u32 k = 0; k < 4; k++) s |= ((c[k] - k) & 3) << (2 * k);
+  return s;
+}
+static void UcodeAlu(u32* w, u32 vop, u32 dest, u32 mask, int exp, struct AluOp a, struct AluOp b, struct AluOp c,
+                     u32 sop, u32 sdest, u32 smask) {
+  w[0] = dest | sdest << 8 | (u32)exp << 15 | mask << 16 | smask << 20 | sop << 26;
+  w[1] = c.swizzle | b.swizzle << 8 | a.swizzle << 16;
+  w[2] = c.reg | b.reg << 8 | a.reg << 16 | vop << 24 | c.temp << 29 | b.temp << 30 | a.temp << 31;
+}
+// A texture fetch: operation `op` (1 sample, 24 setTexLOD) of texture
+// constant n at register src (components xyz as swz says) into register
+// dst; `y` and `z` the instruction's filters and flags beyond these.
+static void UcodeTfetch(u32* w, u32 op, u32 dst, u32 src, u32 swz, u32 n, u32 dim, u32 y, u32 z) {
+  w[0] = op | src << 5 | dst << 12 | n << 20 | swz << 26;
+  w[1] = XYZW | 0xFu << 24 | y;
+  w[2] = dim << 14 | z;
+}
+// The filters an instruction leaves to the fetch constant.
+#define TF_CONST (3 << 12 | 3 << 14 | 3 << 16 | 7 << 18)
+
+// A pixel shader sampling texture constant n of dimension `dim` at
+// interpolator 0's xyz, LOD from float constant 0's x where `y` asks for
+// the register LOD, to colour 0: its microcode in the pool.
+static u32 PsTex(u32 n, u32 dim, u32 y, u32 z) {
+  u32 w[15];
+  const struct AluOp c0 = {0, 0, 0}, r2 = {2, 1, 0};
+  UcodeExec(w, 1, 4, 6);
+  UcodeAlu(w + 3, 2, 1, 0xF, 0, c0, c0, c0, 50, 0, 0);  // r1 = c0
+  UcodeTfetch(w + 6, 24, 0, 1, 0, 0, 0, TF_CONST, 0);   // setTexLOD r1.x
+  UcodeTfetch(w + 9, 1, 2, 0, 0 | 1 << 2 | 2 << 4, n, dim, y, z);
+  UcodeAlu(w + 12, 2, 0, 0xF, 1, r2, r2, r2, 50, 0, 0);  // colour 0 = r2
+  u32 pa = gq.ppool + gq.used;
+  for (u32 k = 0; k < 15; k++) *At(gq.pool + gq.used + 4 * k) = w[k];
+  gq.used += 64;
+  return pa;
+}
+static void LoadPs(u32 pa, u32 words) {
+  Put(Type3(0x27, 2));
+  Put(pa | 1);
+  Put(words);
+}
+// One pixel (x, y) of the target drawn with interpolator 0 (u, v, w, 0).
+static void Pixel(u32 x, u32 y, float u, float v, float w) {
+  const float c[4] = {u, v, w, 0};
+  Rect((float)x, (float)y, (float)(x + 1), (float)(y + 1), 0, c);
+}
+
+// Textures sampled into an 8_8_8_8 target at 0x200 (texels as their
+// words) and a 32_32_FLOAT one at 0x210, resolved and read.
+static void Textures(void) {
+  u32 mem = MmAllocatePhysicalMemoryEx(0, 0x100000, kPageReadWrite, 0, 0, 0x1000), pmem = MmGetPhysicalAddress(mem);
+  for (u32 k = 0; k < 0x100000; k += 4) *At(mem + k) = 0;
+  u32 dest = pmem + 0xF0000, dest_f = pmem + 0xF4000;  // 64x64 and 16x16 (8-byte) resolves
+  Set(0x2000, 64);
+  Set(0x2001, 0x200);
+  Set(0x231E, 0x11111111);
+  Resolve(0x100, dest, 6 << 7 | 2, 0);
+  u32 n_pixel = 0;
+#define NEXT (n_pixel++)
+#define PX(k) ((k) % 64), ((k) / 64)
+  // An untiled 8x8 k_8_8_8_8 (pitch 32 texels) with each endian swap:
+  // texel (3, 2) read as V.
+  const u32 v32 = 0xFF302010;
+  u32 p_endian[4];
+  for (u32 e = 0; e < 4; e++) {
+    u32 at = 0x1000 * e;
+    for (u32 y = 0; y < 8; y++)
+      for (u32 x = 0; x < 8; x++) *At(mem + at + 128 * y + 4 * x) = GuestWord(x == 3 && y == 2 ? v32 : 0xFFFFFFFF, e);
+    struct Tex t = MakeTex(6, pmem + at, 8, 8, 1, 1, 0, 0, 32, e, 0, 2, XYZW);
+    TexConst(1 + e, &t);
+    p_endian[e] = NEXT;
+    LoadPs(PsTex(1 + e, 1, TF_CONST, 0), 15);
+    Pixel(PX(p_endian[e]), 3.5f / 8, 2.5f / 8, 0);
+  }
+  // Tiled 32x64: texel (13, 45) at its tiled address (its second row of
+  // 32x32 macro tiles).
+  u32 tiled = 0x28000;
+  *At(mem + tiled + TiledAt(13, 45, 32, 2)) = GuestWord(v32, 2);
+  {
+    struct Tex t = MakeTex(6, pmem + tiled, 32, 64, 1, 1, 0, 1, 32, 2, 0, 2, XYZW);
+    TexConst(5, &t);
+  }
+  u32 p_tiled = NEXT;
+  LoadPs(PsTex(5, 1, TF_CONST, 0), 15);
+  Pixel(PX(p_tiled), 13.5f / 32, 45.5f / 64, 0);
+  // k_5_6_5, bytes swapped in halfwords: texel (5, 1) green (its missing
+  // alpha the swizzle's 1).
+  u32 r565 = 0x5000;
+  *At(mem + r565 + 64 + 8) = GuestWord(0x07E0u << 16, 1);
+  {
+    struct Tex t = MakeTex(4, pmem + r565, 8, 8, 1, 1, 0, 0, 32, 1, 0, 2, 0 | 1 << 3 | 2 << 6 | 5 << 9);
+    TexConst(6, &t);
+  }
+  u32 p_565 = NEXT;
+  LoadPs(PsTex(6, 1, TF_CONST, 0), 15);
+  Pixel(PX(p_565), 5.5f / 8, 1.5f / 8, 0);
+  // DXT1 6x6: block (0, 0) red and blue, indices 0 1 2 3 along its first
+  // row; block (1, 1) all green. DXT4_5 4x4: alpha 255 to 0 in eight
+  // steps, codes 0 1 2 along its first row; colour white.
+  u32 dxt1 = 0x6000, dxt5 = 0x7000;
+  *At(mem + dxt1) = 0xF800 | 0x001Fu << 16;
+  *At(mem + dxt1 + 4) = 0xE4;
+  *At(mem + dxt1 + 256 + 8) = 0x07E0 | 0x07E0u << 16;  // rows of 32 blocks
+  *At(mem + dxt1 + 256 + 12) = 0;
+  *At(mem + dxt5) = 255 | 0 << 8 | 0x88 << 16;
+  *At(mem + dxt5 + 4) = 0;
+  *At(mem + dxt5 + 8) = 0xFFFFFFFF;
+  *At(mem + dxt5 + 12) = 0;
+  {
+    struct Tex t1 = MakeTex(18, pmem + dxt1, 6, 6, 1, 1, 0, 0, 32, 2, 0, 2, XYZW);
+    TexConst(7, &t1);
+    struct Tex t5 = MakeTex(20, pmem + dxt5, 4, 4, 1, 1, 0, 0, 32, 2, 0, 2, XYZW);
+    TexConst(8, &t5);
+  }
+  u32 p_dxt = NEXT;
+  NEXT;
+  NEXT;
+  NEXT;
+  u32 p_dxt5 = NEXT;
+  NEXT;
+  LoadPs(PsTex(7, 1, TF_CONST, 0), 15);
+  Pixel(PX(p_dxt), 1.5f / 6, 0.5f / 6, 0);
+  Pixel(PX(p_dxt + 1), 2.5f / 6, 0.5f / 6, 0);
+  Pixel(PX(p_dxt + 2), 3.5f / 6, 0.5f / 6, 0);
+  Pixel(PX(p_dxt + 3), 5.5f / 6, 5.5f / 6, 0);
+  LoadPs(PsTex(8, 1, TF_CONST, 0), 15);
+  Pixel(PX(p_dxt5), 2.5f / 4, 0.5f / 4, 0);
+  Pixel(PX(p_dxt5 + 1), 1.5f / 4, 0.5f / 4, 0);
+  // Packed mips: 16x16 tiled, levels 0-2 in packed tails (the base's at
+  // (16, 0) of its tile, the mips' at (8, 0) and (4, 0) of theirs), each
+  // level one colour; sampled at register LODs 0, 1, 2.
+  u32 base = 0x8000, mips = 0x9000;
+  const u32 level_colour[3] = {0xFF0000FF, 0xFF00FF00, 0xFFFF0000};
+  for (u32 y = 0; y < 16; y++)
+    for (u32 x = 0; x < 16; x++) *At(mem + base + TiledAt(16 + x, y, 32, 2)) = GuestWord(level_colour[0], 2);
+  for (u32 lv = 1; lv < 3; lv++)
+    for (u32 y = 0; y < (16u >> lv); y++)
+      for (u32 x = 0; x < (16u >> lv); x++)
+        *At(mem + mips + TiledAt((16u >> lv) + x, y, 32, 2)) = GuestWord(level_colour[lv], 2);
+  {
+    struct Tex t = MakeTex(6, pmem + base, 16, 16, 1, 1, 0, 1, 32, 2, 0, 2, XYZW);
+    t.mip_max = 2;
+    t.packed = 1;
+    t.mip_pa = pmem + mips;
+    TexConst(9, &t);
+  }
+  u32 p_mip = NEXT;
+  NEXT;
+  NEXT;
+  LoadPs(PsTex(9, 1, TF_CONST | 1 << 29, 0), 15);
+  for (u32 lv = 0; lv < 3; lv++) {
+    SetF(0x4400, (float)lv, 0, 0, 0);
+    Pixel(PX(p_mip + lv), 0.5f, 0.5f, 0);
+  }
+  // Address modes: a 4x4 whose texel x has red 16 (x + 1), at u 1.375:
+  // repeat x 1, mirror 2, clamp to edge 3, clamp to halfway (as edge) 3.
+  u32 modes = 0xA000;
+  for (u32 x = 0; x < 4; x++) *At(mem + modes + 4 * x) = GuestWord(0xFF000000 | 16 * (x + 1), 2);
+  u32 p_mode = NEXT;
+  NEXT;
+  NEXT;
+  NEXT;
+  const u32 clamps[4] = {0, 1, 2, 4};
+  for (u32 k = 0; k < 4; k++) {
+    struct Tex t = MakeTex(6, pmem + modes, 4, 4, 1, 1, 0, 0, 32, 2, 0, clamps[k], XYZW);
+    TexConst(10, &t);
+    LoadPs(PsTex(10, 1, TF_CONST, 0), 15);
+    Pixel(PX(p_mode + k), 1.375f, 0.125f, 0);
+  }
+  // Filters: a 2x1, red 0 and 200, at u 0.375: point 0; linear (the
+  // constant's) 50; linear by the instruction over a point constant 50.
+  u32 filt = 0xB000;
+  *At(mem + filt) = GuestWord(0xFF000000, 2);
+  *At(mem + filt + 4) = GuestWord(0xFF0000C8, 2);
+  u32 p_filter = NEXT;
+  NEXT;
+  NEXT;
+  for (u32 k = 0; k < 3; k++) {
+    struct Tex t = MakeTex(6, pmem + filt, 2, 1, 1, 1, 0, 0, 32, 2, 0, 2, XYZW); t.filter = k == 1;
+    TexConst(11, &t);
+    LoadPs(PsTex(11, 1, k == 2 ? (1 << 12 | 1 << 14 | 3 << 16 | 7 << 18) : TF_CONST, 0), 15);
+    Pixel(PX(p_filter + k), 0.375f, 0.5f, 0);
+  }
+  // A texel (192, 128, 64, 254): X biased (192 to 129); swizzle WZYX;
+  // exponent bias -1 (halved).
+  u32 one = 0xC000;
+  *At(mem + one) = GuestWord(0xFE4080C0, 2);
+  u32 p_bias = NEXT;
+  NEXT;
+  NEXT;
+  {
+    struct Tex t = MakeTex(6, pmem + one, 1, 1, 1, 1, 0, 0, 32, 2, 2, 2, XYZW);
+    TexConst(12, &t);
+    LoadPs(PsTex(12, 1, TF_CONST, 0), 15);
+    Pixel(PX(p_bias), 0.5f, 0.5f, 0);
+    t.signs = 0;
+    t.swizzle = 3 | 2 << 3 | 1 << 6 | 0 << 9;
+    TexConst(12, &t);
+    Pixel(PX(p_bias + 1), 0.5f, 0.5f, 0);
+    t.swizzle = XYZW;
+    t.exp = (u32)-1;
+    TexConst(12, &t);
+    Pixel(PX(p_bias + 2), 0.5f, 0.5f, 0);
+  }
+  // A cube (4x4 faces 4 KiB apart, face f red 40 (f + 1)), sampled
+  // through the cube instruction's sequence: cube r1, r0.zzxy; rcp of
+  // |r1.z|; mad r1.xy, r1.xy, that, 1.5; tfetchCube r1.yxw.
+  u32 cube = 0x10000;
+  for (u32 f = 0; f < 6; f++)
+    for (u32 y = 0; y < 4; y++)
+      for (u32 x = 0; x < 4; x++)
+        *At(mem + cube + 0x1000 * f + 128 * y + 4 * x) = GuestWord(0xFF000000 | 40 * (f + 1), 2);
+  {
+    struct Tex t = MakeTex(6, pmem + cube, 4, 4, 1, 3, 0, 0, 32, 2, 0, 2, XYZW);
+    TexConst(13, &t);
+  }
+  {
+    u32 w[18];
+    const struct AluOp r0zzxy = {0, 1, Swz(2, 2, 0, 1)}, r0yxzz = {0, 1, Swz(1, 0, 2, 2)}, r1 = {1, 1, Swz(0, 1, 2, 3)},
+                       r1abs_z = {1 | 0x80, 1, Swz(0, 0, 0, 2)}, r2x = {2, 1, Swz(0, 0, 0, 0)},
+                       c1 = {1, 0, Swz(0, 1, 2, 3)}, r3 = {3, 1, Swz(0, 1, 2, 3)};
+    UcodeExec(w, 1, 5, 8);
+    UcodeAlu(w + 3, 18, 1, 0xF, 0, r0zzxy, r0yxzz, r0zzxy, 50, 0, 0);       // cube r1
+    UcodeAlu(w + 6, 0, 0, 0, 0, r1, r1, r1abs_z, 19, 2, 1);                // r2.x = rcp |r1.z|
+    UcodeAlu(w + 9, 11, 1, 3, 0, r1, r2x, c1, 50, 0, 0);                   // mad r1.xy
+    UcodeTfetch(w + 12, 1, 3, 1, 1 | 0 << 2 | 3 << 4, 13, 3, TF_CONST, 0);  // tfetchCube r3, r1.yxw
+    UcodeAlu(w + 15, 2, 0, 0xF, 1, r3, r3, r3, 50, 0, 0);
+    u32 pa = gq.ppool + gq.used;
+    for (u32 k = 0; k < 18; k++) *At(gq.pool + gq.used + 4 * k) = w[k];
+    gq.used += 80;
+    LoadPs(pa, 18);
+  }
+  SetF(0x4404, 1.5f, 1.5f, 1.5f, 1.5f);  // c1
+  const float dirs[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+  u32 p_cube = n_pixel;
+  for (u32 f = 0; f < 6; f++) {
+    NEXT;
+    Pixel(PX(p_cube + f), dirs[f][0], dirs[f][1], dirs[f][2]);
+  }
+  // A 3D 4x4x4 (slices 4 KiB apart, slice z red 40 (z + 1)) and a stacked
+  // 4x4 of 4 layers alike: slices and layers at W (z + 0.5) / 4; the
+  // stacked one filtered between layers at W 1/4: halfway between layers
+  // 0 and 1, red 60.
+  u32 vol = 0x18000, stack = 0x1C000;
+  for (u32 z = 0; z < 4; z++)
+    for (u32 y = 0; y < 4; y++)
+      for (u32 x = 0; x < 4; x++) {
+        *At(mem + vol + 0x1000 * z + 128 * y + 4 * x) = GuestWord(0xFF000000 | 40 * (z + 1), 2);
+        *At(mem + stack + 0x1000 * z + 128 * y + 4 * x) = GuestWord(0xFF000000 | 40 * (z + 1), 2);
+      }
+  u32 p_vol = n_pixel;
+  n_pixel += 9;
+  {
+    struct Tex t3 = MakeTex(6, pmem + vol, 4, 4, 4, 2, 0, 0, 32, 2, 0, 2, XYZW);
+    TexConst(14, &t3);
+    struct Tex ts = MakeTex(6, pmem + stack, 4, 4, 4, 1, 1, 0, 32, 2, 0, 2, XYZW);
+    TexConst(15, &ts);
+    ts.vol_linear = 1;
+    TexConst(16, &ts);
+  }
+  LoadPs(PsTex(14, 2, TF_CONST, 0), 15);
+  for (u32 z = 0; z < 4; z++) Pixel(PX(p_vol + z), 0.5f, 0.5f, (z + 0.5f) / 4);
+  LoadPs(PsTex(15, 2, TF_CONST, 0), 15);
+  for (u32 z = 0; z < 4; z++) Pixel(PX(p_vol + 4 + z), 0.5f, 0.5f, (z + 0.5f) / 4);
+  LoadPs(PsTex(16, 2, TF_CONST, 0), 15);
+  Pixel(PX(p_vol + 8), 0.5f, 0.5f, 0.25f);
+  // An unbound constant (type 0): zeros.
+  Put(Type0(0x4800 + 6 * 17, 1));
+  Put(0);
+  u32 p_unbound = NEXT;
+  LoadPs(PsTex(17, 1, TF_CONST, 0), 15);
+  Pixel(PX(p_unbound), 0.5f, 0.5f, 0);
+  // A pixel shader exporting float constant 255, the last of its 256
+  // (4 KiB of them).
+  u32 p_c255 = NEXT;
+  {
+    u32 w[6];
+    const struct AluOp c255 = {255, 0, 0};
+    UcodeExec(w, 1, 1, 0);
+    UcodeAlu(w + 3, 2, 0, 0xF, 1, c255, c255, c255, 50, 0, 0);
+    u32 pa = gq.ppool + gq.used;
+    for (u32 k = 0; k < 6; k++) *At(gq.pool + gq.used + 4 * k) = w[k];
+    gq.used += 32;
+    SetF(0x4000 + 4 * (256 + 255), 0.2f, 0.4f, 0.6f, 1);
+    LoadPs(pa, 6);
+    Pixel(PX(p_c255), 0, 0, 0);
+  }
+  // The vertex shader sampling the endian-2 texture (its texel (3, 2), V)
+  // into interpolator 0.
+  {
+    u32 w[18];
+    const struct AluOp r1 = {1, 1, 0}, r3 = {3, 1, 0};
+    UcodeExec(w, 1, 5, 7);
+    UcodeVfetch(w + 3, 1, 0, 57, 7, 0);
+    UcodeVfetch(w + 6, 2, 0, 38, 7, 3);
+    UcodeTfetch(w + 9, 1, 3, 2, 0 | 1 << 2 | 2 << 4, 3, 1, TF_CONST, 0);
+    UcodeAlu(w + 12, 2, 62, 0xF, 1, r1, r1, r1, 50, 0, 0);
+    UcodeAlu(w + 15, 2, 0, 0xF, 1, r3, r3, r3, 50, 0, 0);
+    u32 pa = gq.ppool + gq.used;
+    for (u32 k = 0; k < 18; k++) *At(gq.pool + gq.used + 4 * k) = w[k];
+    gq.used += 80;
+    Put(Type3(0x27, 2));
+    Put(pa);
+    Put(18);
+  }
+  PixelShader(0);
+  u32 p_vertex = NEXT;
+  Pixel(PX(p_vertex), 3.5f / 8, 2.5f / 8, 0);
+  VertexShader(0);
+  // A resolve's destination sampled before and after the resolve in one
+  // frame: a 64x64 tiled 8_8_8_8 (as the resolve writes it) holding A at
+  // (5, 5), then target 0x220 cleared to C resolved over it.
+  u32 rtt = 0x20000;
+  *At(mem + rtt + TiledAt(5, 5, 64, 2)) = 0xFFA0A0A0;
+  {
+    struct Tex t = MakeTex(6, pmem + rtt, 64, 64, 1, 1, 0, 1, 64, 2, 0, 2, XYZW);
+    TexConst(18, &t);
+  }
+  u32 p_rtt = NEXT;
+  NEXT;
+  LoadPs(PsTex(18, 1, TF_CONST, 0), 15);
+  Pixel(PX(p_rtt), 5.5f / 64, 5.5f / 64, 0);
+  Set(0x2001, 0x220);
+  Set(0x231E, 0xFF0C0B0A);
+  Resolve(0x100, pmem + 0x30000, 6 << 7 | 2, 0);
+  Resolve(0, pmem + rtt, 6 << 7 | 2, 0);
+  Set(0x2001, 0x200);
+  Pixel(PX(p_rtt + 1), 5.5f / 64, 5.5f / 64, 0);
+  // A 1x1 rewritten by the CPU: sampled, then (after a swap) sampled again.
+  u32 cpu = 0x25000;
+  *At(mem + cpu) = GuestWord(0xFF111111, 2);
+  {
+    struct Tex t = MakeTex(6, pmem + cpu, 1, 1, 1, 1, 0, 0, 32, 2, 0, 2, XYZW);
+    TexConst(19, &t);
+  }
+  u32 p_cpu = NEXT;
+  NEXT;
+  LoadPs(PsTex(19, 1, TF_CONST, 0), 15);
+  Pixel(PX(p_cpu), 0.5f, 0.5f, 0);
+  Kick();
+  *At(mem + cpu) = GuestWord(0xFF222222, 2);
+  {
+    u32 fetch[6] = {1u << 31 | 2 << 22, (mem + 0xF0000) | 2 << 6 | 6, 63 | 63 << 13,
+                    (0 | 1 << 3 | 2 << 6 | 3 << 9) << 1, 0, 0},
+        front = mem + 0xF0000, format = 6, color_space = 0, width = 64, height = 64;
+    VdSwap10(&gq.rb[gq.w], fetch, 0, 0, 0, &front, &format, &color_space, &width, &height);
+    gq.w += 64;
+  }
+  LoadPs(PsTex(19, 1, TF_CONST, 0), 15);
+  Pixel(PX(p_cpu + 1), 0.5f, 0.5f, 0);
+
+  // Signed and depth into the 32_32_FLOAT target: X, Y signed of (0x81,
+  // 0x40, 0, 0x7F): -1 and 64/127; a k_24_8 texel 0xC00000: (d + d >> 23)
+  // / 2^24, 0.75 + 2^-24.
+  Set(0x2001, 0x210 | 15 << 16);
+  Set(0x231E, 0);
+  Set(0x231F, 0);
+  Resolve(0x100, dest_f, 37 << 7 | 2, 1);
+  u32 sgn = 0x26000, dep = 0x27000;
+  *At(mem + sgn) = GuestWord(0x7F004081, 2);
+  *At(mem + dep) = GuestWord(0xC0000000, 2);
+  {
+    struct Tex ts = MakeTex(6, pmem + sgn, 1, 1, 1, 1, 0, 0, 32, 2, 1 | 1 << 2, 2, XYZW);
+    TexConst(20, &ts);
+    struct Tex td = MakeTex(22, pmem + dep, 1, 1, 1, 1, 0, 0, 32, 2, 0, 2, XYZW);
+    TexConst(21, &td);
+  }
+  LoadPs(PsTex(20, 1, TF_CONST, 0), 15);
+  Pixel(0, 0, 0.5f, 0.5f, 0);
+  LoadPs(PsTex(21, 1, TF_CONST, 0), 15);
+  Pixel(1, 0, 0.5f, 0.5f, 0);
+  Resolve(0, dest_f, 37 << 7 | 2, 1);
+  Set(0x2001, 0x200);
+  Resolve(0, dest, 6 << 7 | 2, 0);
+  PixelShader(0);
+  Kick();
+
+  volatile u32* t = At(mem + 0xF0000);
+#define TX(k) t[TiledAt(PX(k), 64, 2) / 4]
+  for (u32 e = 0; e < 4; e++)
+    if (TX(p_endian[e]) != v32) DbgPrint("FAIL line %d: endian %u: %08x\n", __LINE__, e, TX(p_endian[e]));
+  CHECK(TX(p_tiled) == v32 && TX(p_565) == 0xFF00FF00);
+  CHECK(TX(p_dxt) == 0xFFFF0000 && TX(p_dxt + 1) == 0xFF5500AA && TX(p_dxt + 2) == 0xFFAA0055 &&
+        TX(p_dxt + 3) == 0xFF00FF00);
+  CHECK(TX(p_dxt5) == 0xDAFFFFFF && TX(p_dxt5 + 1) == 0x00FFFFFF);
+  CHECK(TX(p_mip) == level_colour[0] && TX(p_mip + 1) == level_colour[1] && TX(p_mip + 2) == level_colour[2]);
+  CHECK(TX(p_mode) == 0xFF000020 && TX(p_mode + 1) == 0xFF000030 && TX(p_mode + 2) == 0xFF000040 &&
+        TX(p_mode + 3) == 0xFF000040);
+  CHECK(TX(p_filter) == 0xFF000000 && TX(p_filter + 1) == 0xFF000032 && TX(p_filter + 2) == 0xFF000032);
+  CHECK(TX(p_bias) == 0xFE408081 && TX(p_bias + 1) == 0xC08040FE && TX(p_bias + 2) == 0x7F204060);
+  for (u32 f = 0; f < 6; f++)
+    if (TX(p_cube + f) != (0xFF000000 | 40 * (f + 1)))
+      DbgPrint("FAIL line %d: cube face %u: %08x\n", __LINE__, f, TX(p_cube + f));
+  for (u32 z = 0; z < 8; z++)
+    if (TX(p_vol + z) != (0xFF000000 | 40 * (z % 4 + 1)))
+      DbgPrint("FAIL line %d: %s %u: %08x\n", __LINE__, z < 4 ? "3D slice" : "stacked layer", z % 4, TX(p_vol + z));
+  CHECK(TX(p_vol + 8) == 0xFF00003C);
+  CHECK(TX(p_unbound) == 0);
+  CHECK(TX(p_c255) == 0xFF996633);
+  CHECK(TX(p_vertex) == v32);
+  CHECK(TX(p_rtt) == 0xFFA0A0A0 && TX(p_rtt + 1) == 0xFF0C0B0A);
+  CHECK(TX(p_cpu) == 0xFF111111 && TX(p_cpu + 1) == 0xFF222222);
+  volatile u32* tf = At(mem + 0xF4000);
+  float g;
+  u32 gbits = tf[TiledAt(0, 0, 64, 3) / 4 + 1];
+  memcpy(&g, &gbits, 4);
+  CHECK(tf[TiledAt(0, 0, 64, 3) / 4] == 0xBF800000 && g > 64.0f / 127 - 1e-4f && g < 64.0f / 127 + 1e-4f);
+  CHECK(tf[TiledAt(1, 0, 64, 3) / 4] == 0x3F400001);
+  MmFreePhysicalMemory(0, mem);
+#undef TX
+#undef NEXT
+#undef PX
+}
+
+// A mark of the GPU checks for the test program (title_main.cpp): since
+// the last mark, resolves landed `landings` times, `reads` of them for
+// the GPU's reads of memory a resolve wrote, and draws loaded `loads`
+// host targets; Mark(-1, ...) only sets one. MarkStencil checks too that
+// loads drew `load_bits` stencil bits (unless negative) and stores
+// `store_bits`. From an idle GPU (after Kick).
+static void MarkStencil(int landings, u32 reads, u32 loads, int load_bits, u32 store_bits) {
+  uint16_t vibration[2] = {
+      (uint16_t)(landings < 0 ? 0x8000 : 0x8000 | (u32)landings << 10 | reads << 5 | loads),
+      (uint16_t)(load_bits < 0 ? 0 : 0x8000 | store_bits << 8 | (u32)load_bits)};
+  XamInputSetState(0, 0, vibration);
+  vibration[0] = vibration[1] = 0;
+  XamInputSetState(0, 0, vibration);
+}
+static void Mark(int landings, u32 reads, u32 loads) { MarkStencil(landings, reads, loads, -1, 0); }
+
+// Resolves into textures the cache holds, sampled before and after: those
+// whose level 0 is the copy's destination, in a format that decodes its
+// words as they are, take its texels on the device; others decode the
+// memory again once it has landed. Draws land resolves only where they
+// read what one wrote. Resolve clears that cover a target keep it from
+// loading again, with its stencil known.
+static void InPlace(void) {
+  u32 mem = MmAllocatePhysicalMemoryEx(0, 0x100000, kPageReadWrite, 0, 0, 0x1000), pmem = MmGetPhysicalAddress(mem);
+  for (u32 k = 0; k < 0x100000; k += 4) *At(mem + k) = 0;
+  gq.used = 0;
+  // Each clearing resolve copies to a 16 KiB area of its own (an overlap
+  // with another still on the device would land it).
+  u32 out = pmem, out_f = pmem + 0x4000, slot = pmem + 0x80000;
+#define SCRATCH (slot += 0x4000)
+  u32 n_pixel = 0, n_float = 0;
+#define NEXT (n_pixel++)
+#define PX(k) ((k) % 64), ((k) / 64)
+#define FNEXT (n_float++)
+#define FX(k) ((k) % 16), ((k) / 16)
+  // The output targets: 8_8_8_8 at 0x200 (cleared, all of it: kept), and
+  // 32_32_FLOAT at 0x210.
+  Set(0x2000, 64);
+  Set(0x2001, 0x200);
+  Set(0x231E, 0);
+  Set(0x231F, 0);
+  Resolve(0x100, SCRATCH, 6 << 7 | 2, 0);
+  Set(0x2001, 0x210 | 15 << 16);
+  Resolve(0x100, SCRATCH, 6 << 7 | 2, 1);
+  Set(0x2001, 0x200);
+  Kick();
+  gq.used = 0;
+  Mark(-1, 0, 0);
+
+  // Two resolves of 8_8_8_8 target 0x300 into a 64x64 texture, the 16x16
+  // corner in A, then all of it in B: sampled in place, nothing lands but
+  // the fence's and the second resolve's (over the first's range).
+  u32 t1 = pmem + 0x20000;
+  {
+    struct Tex t = MakeTex(6, t1, 64, 64, 1, 1, 0, 1, 64, 2, 0, 2, XYZW);
+    TexConst(1, &t);
+  }
+  u32 p_two = NEXT;
+  NEXT, NEXT, NEXT, NEXT;
+  LoadPs(PsTex(1, 1, TF_CONST, 0), 15);
+  Pixel(PX(p_two), 5.5f / 64, 5.5f / 64, 0);
+  Set(0x2001, 0x300);
+  Set(0x231E, 0xFF0000FF);
+  Resolve(0x100, SCRATCH, 6 << 7 | 2, 0);
+  Resolve(0, t1, 6 << 7 | 2, 1);
+  Set(0x2001, 0x200);
+  Pixel(PX(p_two + 1), 5.5f / 64, 5.5f / 64, 0);
+  Pixel(PX(p_two + 2), 20.5f / 64, 20.5f / 64, 0);
+  Set(0x2001, 0x300);
+  Set(0x231E, 0xFF00FF00);
+  Resolve(0x100, SCRATCH, 6 << 7 | 2, 0);
+  Resolve(0, t1, 6 << 7 | 2, 0);
+  Set(0x2001, 0x200);
+  Pixel(PX(p_two + 3), 20.5f / 64, 20.5f / 64, 0);
+  Pixel(PX(p_two + 4), 5.5f / 64, 5.5f / 64, 0);
+  Kick();
+  gq.used = 0;
+  Mark(2, 0, 0);
+
+  // 4x MSAA: pixel (0, 0) of 8_8_8_8 target 0x380 with samples 0 and 1 in
+  // (1, 0.5, 0.25, 1), 2 and 3 cleared to (0, 0, 0, 1); resolved averaged
+  // with exponent bias -1 (0x80102040; (1, 0) 0x80000000), and red and
+  // blue swapped too (0x80402010), into textures sampled before; then a
+  // coherency request (COHER_STATUS_HOST, which WAIT_REG_MEM sees done)
+  // and another resolve: the fence lands them all at once, the samples
+  // after the request are the resolves'.
+  u32 t2 = pmem + 0x24000, t3 = pmem + 0x28000;
+  {
+    struct Tex t = MakeTex(6, t2, 64, 64, 1, 1, 0, 1, 64, 2, 0, 2, XYZW);
+    TexConst(2, &t);
+    t.pa = t3;
+    TexConst(3, &t);
+  }
+  u32 p_avg = NEXT;
+  NEXT, NEXT, NEXT, NEXT;
+  LoadPs(PsTex(2, 1, TF_CONST, 0), 15);
+  Pixel(PX(p_avg), 0.5f / 64, 0.5f / 64, 0);
+  LoadPs(PsTex(3, 1, TF_CONST, 0), 15);
+  Pixel(PX(p_avg + 1), 0.5f / 64, 0.5f / 64, 0);
+  Set(0x2000, 64 | 2 << 16);
+  Set(0x2001, 0x380);
+  Set(0x231E, 0xFF000000);
+  Resolve(0x100, SCRATCH, 6 << 7 | 2, 0);
+  PixelShader(0);
+  const float c_avg[4] = {1, 0.5f, 0.25f, 1};
+  Rect(-0.5f, -0.5f, 0, 0.5f, 0, c_avg);
+  Resolve(6 << 4, t2, 63u << 16 | 6 << 7 | 2, 1);
+  Resolve(6 << 4, t3, 1u << 24 | 63u << 16 | 6 << 7 | 2, 1);
+  Set(0x0A31, 0x10);
+  Put(Type3(0x3C, 5));
+  Put(3);
+  Put(0x0A31);
+  Put(0);
+  Put(0xFFFFFFFF);
+  Put(0x100);
+  Resolve(0, SCRATCH, 6 << 7 | 2, 1);
+  Set(0x2000, 64);
+  Set(0x2001, 0x200);
+  LoadPs(PsTex(2, 1, TF_CONST, 0), 15);
+  Pixel(PX(p_avg + 2), 0.5f / 64, 0.5f / 64, 0);
+  Pixel(PX(p_avg + 3), 1.5f / 64, 0.5f / 64, 0);
+  LoadPs(PsTex(3, 1, TF_CONST, 0), 15);
+  Pixel(PX(p_avg + 4), 0.5f / 64, 0.5f / 64, 0);
+  Kick();
+  gq.used = 0;
+  Mark(1, 0, 1);
+
+  // Each texture format a resolve writes, 16x16 at a 64-texel pitch, the
+  // endian swaps in turn: one level (in place) and, at the same address,
+  // with a second level (decoded again, after its first sample lands the
+  // resolves), from 16_16_16_16_FLOAT target 0x320 cleared to (0.25,
+  // 0.5, 0.75, 1) (the depth formats from depth target 0x340, depth
+  // 0.75 + 2^-24, stencil 0x55): both sampled into the 32_32_FLOAT target,
+  // X and Y then Z and W, alike. 16_16_16_16 into a texture of 8_8_8_8
+  // and 8_8_8_8 with another endian swap: refused, decoded again.
+  static const u32 kWrites[17][3] = {
+      // texture format, the resolve's, endian swap
+      {6, 6, 0},   {14, 14, 1}, {50, 50, 2}, {7, 7, 3},   {54, 54, 0}, {25, 25, 1}, {26, 26, 2}, {31, 31, 3},
+      {28, 31, 0}, {32, 32, 1}, {29, 32, 2}, {36, 36, 3}, {37, 37, 0}, {22, 22, 1}, {23, 22, 2}, {6, 26, 2},
+      {6, 6, 3},
+  };
+  u32 p_fmt = FNEXT, ps_fmt[4];
+  for (u32 c = 0; c < 4; c++) ps_fmt[c] = PsTex(4 + c, 1, TF_CONST, 0);
+  for (u32 k = 1; k < 17 * 4; k++) FNEXT;
+  Set(0x2001, 0x210 | 15 << 16);
+  for (int after = 0; after < 2; after++) {
+    if (after) {
+      Set(0x2001, 0x320 | 7 << 16);
+      Set(0x231E, 0x38003400);
+      Set(0x231F, 0x3C003A00);
+      Resolve(0x100, SCRATCH, 6 << 7 | 2, 0);
+      Set(0x2002, 0x340);
+      Set(0x231D, 0xC0000055);
+      Resolve(0x200 | 4, SCRATCH, 6 << 7 | 2, 0);
+      for (u32 k = 0; k < 17; k++) {
+        u32 at = t1 + 0x10000 + 0x2000 * k, e = k == 16 ? 2 : kWrites[k][2];
+        Resolve(kWrites[k][0] == 22 || kWrites[k][0] == 23 ? 4 : 0, at, kWrites[k][1] << 7 | e, 1);
+      }
+      Set(0x2001, 0x210 | 15 << 16);
+    }
+    for (u32 k = 0; k < 17; k++) {
+      u32 at = t1 + 0x10000 + 0x2000 * k;
+      struct Tex t = MakeTex(kWrites[k][0], at, 16, 16, 1, 1, 0, 1, 64, kWrites[k][2], 0, 2, XYZW);
+      TexConst(4, &t);
+      t.swizzle = 2 | 3 << 3 | 0 << 6 | 1 << 9;
+      TexConst(5, &t);
+      t.mip_max = 1;
+      t.mip_pa = pmem + 0xC0000 + 0x1000 * k;
+      t.swizzle = XYZW;
+      TexConst(6, &t);
+      t.swizzle = 2 | 3 << 3 | 0 << 6 | 1 << 9;
+      TexConst(7, &t);
+      for (u32 c = 0; c < 4; c++) {
+        LoadPs(ps_fmt[c], 15);
+        Pixel(FX(p_fmt + 4 * k + c), 5.5f / 16, 5.5f / 16, 0);
+      }
+    }
+  }
+  // A 64x64 8_8_8_8 at a 128-texel pitch, all of target 0x320 resolved
+  // there at a 64-texel pitch: refused, decoded again (texel (40, 40),
+  // past what the copy wrote, as before: 0), alike with a second level.
+  u32 tp = pmem + 0x70000, p_pitch = FNEXT;
+  FNEXT;
+  for (int after = 0; after < 2; after++) {
+    if (after) {
+      Set(0x2001, 0x320 | 7 << 16);
+      Resolve(0, tp, 6 << 7 | 2, 0);
+      Set(0x2001, 0x210 | 15 << 16);
+    }
+    struct Tex t = MakeTex(6, tp, 64, 64, 1, 1, 0, 1, 128, 2, 0, 2, XYZW);
+    TexConst(4, &t);
+    t.mip_max = 1;
+    t.mip_pa = pmem + 0xD8000;
+    TexConst(6, &t);
+    LoadPs(ps_fmt[0], 15);
+    Pixel(FX(p_pitch), 40.5f / 64, 40.5f / 64, 0);
+    LoadPs(ps_fmt[2], 15);
+    Pixel(FX(p_pitch + 1), 40.5f / 64, 40.5f / 64, 0);
+  }
+  // A 2_10_10_10 texel decoded on the CPU, red 820: 16-bit unorm 52530
+  // (820 / 1023 rounded to nearest; in floats it rounds up).
+  u32 t10 = pmem + 0x5C000;
+  *At(mem + 0x5C000) = GuestWord(820, 2);
+  {
+    struct Tex t = MakeTex(7, t10, 1, 1, 1, 1, 0, 0, 32, 2, 0, 2, XYZW);
+    TexConst(8, &t);
+  }
+  u32 p_10 = FNEXT;
+  LoadPs(PsTex(8, 1, TF_CONST, 0), 15);
+  Pixel(FX(p_10), 0.5f, 0.5f, 0);
+  Kick();
+  gq.used = 0;
+  Mark(2, 2, 1);
+  Resolve(0, out_f, 37 << 7 | 2, 1);
+  Set(0x2001, 0x200);
+  Kick();
+  gq.used = 0;
+  Mark(1, 0, 0);
+  volatile u32* tf = At(mem + 0x4000);
+#define TF(k, c) tf[TiledAt(FX(k), 64, 3) / 4 + (c)]
+  for (u32 k = 0; k < 17; k++)
+    for (u32 c = 0; c < 4; c++)
+      if (TF(p_fmt + 4 * k + c, 0) != TF(p_fmt + 4 * k + (c ^ 2), 0) ||
+          TF(p_fmt + 4 * k + c, 1) != TF(p_fmt + 4 * k + (c ^ 2), 1))
+        DbgPrint("FAIL line %d: format %u, %s: %08x %08x / %08x %08x\n", __LINE__, kWrites[k][0],
+                 c & 1 ? "Z W" : "X Y", TF(p_fmt + 4 * k + c, 0), TF(p_fmt + 4 * k + c, 1),
+                 TF(p_fmt + 4 * k + (c ^ 2), 0), TF(p_fmt + 4 * k + (c ^ 2), 1));
+  // The values: 8_8_8_8 (0.25 0.5 0.75 1 packed: 64 128 191 255),
+  // 16_16_16_16_FLOAT and 32_FLOAT as they are, k_24_8.
+  float f8;
+  u32 b8 = TF(p_fmt, 0);
+  memcpy(&f8, &b8, 4);
+  CHECK(f8 > 63.5f / 255 && f8 < 64.5f / 255 && TF(p_fmt + 1, 1) == FloatBits(1));
+  CHECK(TF(p_pitch, 0) == 0 && TF(p_pitch + 1, 0) == 0);
+  CHECK(TF(p_fmt + 4 * 9, 0) == FloatBits(0.25f) && TF(p_fmt + 4 * 9 + 1, 0) == FloatBits(0.75f));
+  CHECK(TF(p_fmt + 4 * 11, 0) == FloatBits(0.25f) && TF(p_fmt + 4 * 13, 0) == 0x3F400001);
+
+  // A texture updated in place, landed, then rewritten by the CPU: the
+  // next frame samples the CPU's texel.
+  *At(mem + 0x20000 + TiledAt(5, 5, 64, 2)) = 0xFF333333;
+  {
+    u32 fetch[6] = {1u << 31 | 2 << 22, (mem + 0xF0000) | 2 << 6 | 6, 63 | 63 << 13,
+                    (0 | 1 << 3 | 2 << 6 | 3 << 9) << 1, 0, 0},
+        front = mem + 0xF0000, format = 6, color_space = 0, width = 64, height = 64;
+    VdSwap10(&gq.rb[gq.w], fetch, 0, 0, 0, &front, &format, &color_space, &width, &height);
+    gq.w += 64;
+  }
+  u32 p_cpu = NEXT;
+  LoadPs(PsTex(1, 1, TF_CONST, 0), 15);
+  Pixel(PX(p_cpu), 5.5f / 64, 5.5f / 64, 0);
+
+  // A point whose vertex is a resolve's texels: 32_FLOAT target 0x360
+  // cleared to 8 and resolved (16x16) into the vertex buffer: x, y, z 8,
+  // colour (8, 8, 8, 8): pixel (8, 8) white. Its fetch lands the resolve.
+  u32 vb = pmem + 0xE0000;
+  Set(0x2001, 0x360 | 14 << 16);
+  Set(0x231E, FloatBits(8));
+  Resolve(0x100, SCRATCH, 6 << 7 | 2, 0);
+  Resolve(0, vb, 36 << 7 | 2, 1);
+  Set(0x2001, 0x200);
+  PixelShader(0);
+  Set(0x2280, 8 << 16 | 8);
+  DrawAuto(1, vb, 1);
+  Kick();
+  gq.used = 0;
+  Mark(1, 1, 0);
+
+  // Clears: target 0x3A0 drawn, then cleared in its corner (16x16), and
+  // drawn again: it loads; target 0x3C0 drawn, then all of 0x3A0 cleared
+  // (kept, no load) and both drawn again: neither loads.
+  u32 cl = pmem + 0x60000, cl2 = pmem + 0x64000;
+  Set(0x2001, 0x3A0);
+  Rect(0, 0, 64, 64, 0, kRed);
+  Set(0x2001, 0x3C0);
+  Rect(0, 0, 64, 64, 0, kGreen);
+  Kick();
+  gq.used = 0;
+  Mark(-1, 0, 0);
+  Set(0x2001, 0x3A0);
+  Set(0x231E, 0xFFFF0000);
+  Resolve(0x100, SCRATCH, 6 << 7 | 2, 1);
+  Rect(40, 40, 48, 48, 0, kWhite);
+  Kick();
+  gq.used = 0;
+  Mark(1, 0, 1);
+  Set(0x231E, 0xFF00FF00 | 0x80);
+  Resolve(0x100, SCRATCH, 6 << 7 | 2, 0);
+  Rect(40, 40, 48, 48, 0, kWhite);
+  Set(0x2001, 0x3C0);
+  Rect(0, 0, 8, 8, 0, kBlue);
+  Kick();
+  gq.used = 0;
+  Mark(1, 0, 0);
+  Set(0x2001, 0x3A0);
+  Resolve(0, cl, 6 << 7 | 2, 0);
+  Set(0x2001, 0x3C0);
+  Resolve(0, cl2, 6 << 7 | 2, 0);
+  Set(0x2001, 0x200);
+
+  // Depth target 0x3E0 (D24S8) with target 0x200 (no colour written):
+  // drawn (depth 0.75, always), cleared all (depth 1, stencil 0x5A: kept,
+  // known), drawn at depth 0.5 where less (8-24) without stencil, resolved
+  // (stencil known: 0x8000005A there, 0xFFFFFF5A around); then 0x33
+  // replaced at (32-40) where the stencil passes, resolved: per bit again.
+  u32 dd = pmem + 0x68000, dd2 = pmem + 0x6C000;
+  Set(0x2104, 0);
+  Set(0x2002, 0x3E0);
+  Set(0x2200, 2 | 4 | 7 << 4);
+  Rect(0, 0, 64, 64, 0.75f, kBlack);
+  Set(0x231D, 0xFFFFFF5A);
+  Resolve(0x200 | 4, SCRATCH, 6 << 7 | 2, 0);
+  Set(0x2200, 2 | 4 | 1 << 4);
+  Rect(8, 8, 24, 24, 0.5f, kBlack);
+  Set(0x2200, 0);
+  Resolve(4, dd, 6 << 7 | 2, 0);
+  Set(0x210D, 0xFFFF33);
+  Set(0x2200, 1 | 7 << 8 | 2 << 14);
+  Rect(32, 32, 40, 40, 0, kBlack);
+  Set(0x2200, 0);
+  Resolve(4, dd2, 6 << 7 | 2, 0);
+  Set(0x2002, 0x500);
+  Set(0x2104, 0xF);
+
+  Resolve(0, out, 6 << 7 | 2, 0);
+  Kick();
+  gq.used = 0;
+  volatile u32* t = At(mem);
+#define TX(k) t[TiledAt(PX(k), 64, 2) / 4]
+  CHECK(TX(p_two) == 0 && TX(p_two + 1) == 0xFF0000FF && TX(p_two + 2) == 0);
+  CHECK(TX(p_two + 3) == 0xFF00FF00 && TX(p_two + 4) == 0xFF00FF00);
+  CHECK(TX(p_avg) == 0 && TX(p_avg + 1) == 0);
+  CHECK(TX(p_avg + 2) == 0x80102040 && TX(p_avg + 3) == 0x80000000 && TX(p_avg + 4) == 0x80402010);
+  CHECK(*At(mem + 0x24000) == 0x80102040 && *At(mem + 0x28000) == 0x80402010);
+  CHECK(TX(p_cpu) == 0xFF333333);
+  CHECK(t[TiledAt(8, 8, 64, 2) / 4] == 0xFFFFFFFF);
+  float f10;
+  u32 b10 = TF(p_10, 0);
+  memcpy(&f10, &b10, 4);
+  CHECK(f10 > 52529.5f / 65535 && f10 < 52530.5f / 65535);
+  volatile u32* c1 = At(mem + 0x60000);
+  volatile u32* c2 = At(mem + 0x64000);
+  CHECK(c1[TiledAt(4, 4, 64, 2) / 4] == (0xFF00FF00 | 0x80) && c1[TiledAt(44, 44, 64, 2) / 4] == 0xFFFFFFFF);
+  CHECK(c2[TiledAt(4, 4, 64, 2) / 4] == 0xFFFF0000 && c2[TiledAt(20, 20, 64, 2) / 4] == 0xFF00FF00);
+  volatile u32* d1 = At(mem + 0x68000);
+  volatile u32* d2 = At(mem + 0x6C000);
+  CHECK(d1[TiledAt(16, 16, 64, 2) / 4] == 0x8000005A && d1[TiledAt(40, 4, 64, 2) / 4] == 0xFFFFFF5A);
+  CHECK(d2[TiledAt(36, 36, 64, 2) / 4] == 0xFFFFFF33 && d2[TiledAt(16, 16, 64, 2) / 4] == 0x8000005A);
+  // EVENT_WRITE_EXT after a resolve, then a wait (SCRATCH_REG1) that holds
+  // the GPU: the extents' words are written, and the resolve's texels are
+  // in memory before them (texel (1, 0) of target 0x200, 0xFF0000FF).
+  *At(mem + 0x57000) = 0xAAAAAAAA;
+  Set(0x0579, 0);
+  Resolve(0, pmem + 0x56000, 6 << 7 | 2, 1);
+  Put(Type3(0x5A, 2));
+  Put(0);
+  Put(pmem + 0x57000);
+  Put(Type3(0x3C, 5));
+  Put(3);
+  Put(0x579);
+  Put(1);
+  Put(0xFFFFFFFF);
+  Put(0x100);
+  gq.rb[gq.w++] = Type3(0x3F, 2);
+  gq.rb[gq.w++] = gq.pib;
+  gq.rb[gq.w++] = gq.n;
+  *Reg(0x1C5) = gq.w;
+  CHECK(WaitFor(At(mem + 0x57000), 0x400));
+  CHECK(*At(mem + 0x56000 + TiledAt(1, 0, 64, 2)) == 0xFF0000FF);
+  *Reg(0x579) = 1;
+  gq.n = 0;
+  Kick();
+  MmFreePhysicalMemory(0, mem);
+#undef TX
+#undef TF
+#undef NEXT
+#undef PX
+#undef FNEXT
+#undef FX
+#undef SCRATCH
+}
+
+// Depth targets' stencil on the host: loaded from the EDRAM's words only
+// when a draw tests it (where the EDRAM's tiles are known to hold one
+// value, with the depth, drawing no stencil bit), and stored only where a
+// draw wrote it (else the EDRAM's words keep their stencil bytes). Two
+// surfaces over depth tiles 0x780-0x787, each loading what the other
+// left: A, 4x MSAA 40 pixels wide (a tile's 80 samples a row: its clears
+// cover whole tiles), colour at 0x7D0; B, 2x MSAA 64 pixels wide (part of
+// each tile), colour at 0x7C0. A pixel (x, y) is depth sample (2x, 2y) of
+// A's, (x, 2y) of B's.
+static void StencilLoads(void) {
+  u32 mem = MmAllocatePhysicalMemoryEx(0, 0x80000, kPageReadWrite, 0, 0, 0x1000), pmem = MmGetPhysicalAddress(mem);
+  for (u32 k = 0; k < 0x80000; k += 4) *At(mem + k) = 0;
+  gq.used = 0;
+  u32 slot = pmem + 0x40000;
+#define SCRATCH (slot += 0x4000)
+#define OUT(k) (pmem + 0x4000 * (k))
+  const u32 surface_a = 40 | 2 << 16, surface_b = 64 | 1 << 16;
+  // (a) A's depth cleared to stencil 0xA5, B's colour to 0; B white where
+  // the stencil is 0xA5 (8-16, 8-16), and where it is 0xA4 (24-32): its
+  // depth loads tiles known to hold 0xA5, with no stencil bit.
+  Set(0x2000, surface_a);
+  Set(0x2002, 0x780);
+  Set(0x231D, 0xFFFFFFA5);
+  Resolve(0x200 | 4, SCRATCH, 6 << 7 | 2, 0);
+  Set(0x2000, surface_b);
+  Set(0x2001, 0x7C0);
+  Set(0x231E, 0);
+  Resolve(0x100, SCRATCH, 6 << 7 | 2, 0);
+  Kick();
+  gq.used = 0;
+  Mark(-1, 0, 0);
+  PixelShader(0);
+  Set(0x2200, 1 | 2 << 8);
+  Set(0x210D, 0xA5 | 0xFF << 8);
+  Rect(8, 8, 16, 16, 0, kWhite);
+  Set(0x210D, 0xA4 | 0xFF << 8);
+  Rect(24, 8, 32, 16, 0, kWhite);
+  Set(0x2200, 0);
+  Resolve(0, OUT(0), 6 << 7 | 2, 0);
+  Kick();
+  gq.used = 0;
+  MarkStencil(1, 0, 2, 0, 0);
+  // (b) B's stencil replaced by 0x3C at rows 32-48 (its pixels 0-64),
+  // stored a bit at a time (8); A's colour cleared, its depth loaded
+  // without its stencil, which A's first stencil test loads a bit at a
+  // time (8); red where the stencil is 0xA5, green where 0x3C (A's pixels
+  // 32-40 are past B's 64 columns: red). A's store keeps the EDRAM's
+  // stencil bytes (none).
+  Set(0x2200, 1 | 7 << 8 | 2 << 14);
+  Set(0x210D, 0x3C | 0xFF << 16);
+  Rect(0, 32, 64, 48, 0, kBlack);
+  Set(0x2200, 0);
+  Set(0x2000, surface_a);
+  Set(0x2001, 0x7D0);
+  Resolve(0x100, SCRATCH, 6 << 7 | 2, 0);
+  Set(0x2200, 1 | 2 << 8);
+  Set(0x210D, 0xA5 | 0xFF << 8);
+  Rect(0, 0, 40, 64, 0, kRed);
+  Set(0x210D, 0x3C | 0xFF << 8);
+  Rect(0, 0, 40, 64, 0, kGreen);
+  Set(0x2200, 0);
+  Resolve(0, OUT(1), 6 << 7 | 2, 0);
+  Kick();
+  gq.used = 0;
+  MarkStencil(1, 0, 2, 8, 8);
+  // (c) A's depth cleared to 0xA5 again (all its tiles known); colour
+  // target 0x780 of B in 0x33 at rows 0-8, over them: B's depth loads,
+  // and its stencil test draws each bit (8); white where the stencil is
+  // 0x33 (rows 0-8), in 0x7C0. No store draws any (none written).
+  Set(0x231D, 0xFFFFFFA5);
+  Resolve(0x200 | 4, SCRATCH, 6 << 7 | 2, 0);
+  Set(0x2000, surface_b);
+  Set(0x2001, 0x780);
+  const float c_33[4] = {0.2f, 0.2f, 0.2f, 0.2f};
+  Rect(0, 0, 64, 8, 0, c_33);
+  Set(0x2001, 0x7C0);
+  Set(0x2200, 1 | 2 << 8);
+  Set(0x210D, 0x33 | 0xFF << 8);
+  Rect(0, 0, 64, 16, 0, kWhite);
+  Set(0x2200, 0);
+  Resolve(0, OUT(2), 6 << 7 | 2, 0);
+  Kick();
+  gq.used = 0;
+  MarkStencil(1, 0, 2, 8, 0);
+  // (d) B's depth cleared to 0x5A: its 64 columns, part of each tile; A's
+  // stencil test loads each bit (8): blue where the stencil is 0x5A,
+  // white where 0xA5 (A's pixels 32-40, below the 0x33 rows).
+  Set(0x231D, 0xFFFFFF5A);
+  Resolve(0x200 | 4, SCRATCH, 6 << 7 | 2, 0);
+  Set(0x2000, surface_a);
+  Set(0x2001, 0x7D0);
+  Set(0x2200, 1 | 2 << 8);
+  Set(0x210D, 0x5A | 0xFF << 8);
+  Rect(0, 0, 40, 64, 0, kBlue);
+  Set(0x210D, 0xA5 | 0xFF << 8);
+  Rect(0, 0, 40, 64, 0, kWhite);
+  Set(0x2200, 0);
+  Resolve(0, OUT(3), 6 << 7 | 2, 0);
+  Kick();
+  gq.used = 0;
+  MarkStencil(1, 0, 1, 8, 0);
+  // (e) A's depth cleared (depth 1, stencil 0xA5), 0x3C replaced at its
+  // rows 32-48, stored. Then B, without a stencil test: its depth loads
+  // with no stencil bit, depth 0.5 drawn at (8-24, 8-24), stored with
+  // none either, A's depth resolved: B's depth over A's stencil bytes
+  // (A's pixel (8, 12): 0x800000A5; (8, 40): 0xFFFFFF3C). A's stencil
+  // tests then load its stencil (8): green where 0x3C, red where 0xA5.
+  Set(0x231D, 0xFFFFFFA5);
+  Resolve(0x200 | 4, SCRATCH, 6 << 7 | 2, 0);
+  Set(0x2200, 1 | 7 << 8 | 2 << 14);
+  Set(0x210D, 0x3C | 0xFF << 16);
+  Rect(0, 32, 40, 48, 0, kBlack);
+  Set(0x2200, 0);
+  Resolve(0, SCRATCH, 6 << 7 | 2, 0);
+  Kick();
+  gq.used = 0;
+  Mark(-1, 0, 0);
+  Set(0x2000, surface_b);
+  Set(0x2001, 0x7C0);
+  Set(0x2200, 2 | 4 | 7 << 4);
+  Rect(8, 8, 24, 24, 0.5f, kBlack);
+  Set(0x2200, 0);
+  Set(0x2000, surface_a);
+  Resolve(4, OUT(4), 6 << 7 | 2, 0);
+  Kick();
+  gq.used = 0;
+  MarkStencil(1, 0, 1, 0, 0);
+  Set(0x2001, 0x7D0);
+  Set(0x2200, 1 | 2 << 8);
+  Set(0x210D, 0x3C | 0xFF << 8);
+  Rect(0, 0, 40, 64, 0, kGreen);
+  Set(0x210D, 0xA5 | 0xFF << 8);
+  Rect(0, 0, 40, 64, 0, kRed);
+  Set(0x2200, 0);
+  Resolve(0, OUT(5), 6 << 7 | 2, 0);
+  Kick();
+  gq.used = 0;
+  MarkStencil(1, 0, 1, 8, 0);
+  // (f) B's depth loads without its stencil; depth 0.25 drawn at (32-48,
+  // 8-24); then blue where the stencil is 0xA5 and the depth less than
+  // 0.375: the test loads the stencil (8), the depth as drawn (not at
+  // 32-48, nor at rows 32-48 where the stencil is 0x3C).
+  Set(0x2000, surface_b);
+  Set(0x2001, 0x7C0);
+  Set(0x2200, 2 | 4 | 7 << 4);
+  Rect(32, 8, 48, 24, 0.25f, kBlack);
+  Set(0x2200, 1 | 2 | 1 << 4 | 2 << 8);
+  Rect(0, 0, 64, 64, 0.375f, kBlue);
+  Set(0x2200, 0);
+  Resolve(0, OUT(6), 6 << 7 | 2, 0);
+  Kick();
+  gq.used = 0;
+  MarkStencil(1, 0, 1, 8, 0);
+  // (g) A's depth loads without its stencil; 0x77 replaced at its rows
+  // 0-16 (the test loads the stencil first: 8); stored a bit at a time
+  // (8) by the resolve of A's depth (0xFFFFFF77 at (6, 6); B's depth 0.5
+  // over 0xA5 at (6, 20)). B's test then loads it (8): white where it is
+  // 0x77, at B's rows 0-16.
+  Set(0x2000, surface_a);
+  Set(0x2001, 0x7D0);
+  Set(0x2200, 1 | 7 << 8 | 2 << 14);
+  Set(0x210D, 0x77 | 0xFF << 16);
+  Rect(0, 0, 40, 16, 0, kBlack);
+  Set(0x2200, 0);
+  Resolve(4, OUT(7), 6 << 7 | 2, 0);
+  Kick();
+  gq.used = 0;
+  MarkStencil(1, 0, 1, 8, 8);
+  Set(0x2000, surface_b);
+  Set(0x2001, 0x7C0);
+  Set(0x2200, 1 | 2 << 8);
+  Set(0x210D, 0x77 | 0xFF << 8);
+  Rect(0, 0, 64, 64, 0, kWhite);
+  Set(0x2200, 0);
+  Resolve(0, OUT(8), 6 << 7 | 2, 0);
+  Kick();
+  gq.used = 0;
+  MarkStencil(1, 0, 1, 8, 0);
+  // (h) C, 64 pixels wide without MSAA (sample (x, y) of pixel (x, y)),
+  // colour at 0x7E0, the window's rows 0-32: white where the stencil is
+  // 0x77 (its rows 0-32), the test loading it (8); then the window's
+  // rows 0-64: the rows added load with their stencil at once (8), white
+  // where it is 0xA5 (rows 32-64). Its colour and depth load twice each.
+  Set(0x2000, 64);
+  Set(0x2001, 0x7E0);
+  Set(0x2082, 64 | 32 << 16);
+  Set(0x2200, 1 | 2 << 8);
+  Set(0x210D, 0x77 | 0xFF << 8);
+  Rect(0, 0, 64, 32, 0, kWhite);
+  Set(0x2082, 64 | 64 << 16);
+  Set(0x210D, 0xA5 | 0xFF << 8);
+  Rect(0, 32, 64, 64, 0, kWhite);
+  Set(0x2200, 0);
+  Resolve(0, OUT(9), 6 << 7 | 2, 0);
+  Kick();
+  gq.used = 0;
+  MarkStencil(1, 0, 4, 16, 0);
+  // (i) A's depth loads (its Z test on, Always) without its stencil;
+  // white where the stencil test is on but Always and Keep (as if off: no
+  // stencil bit); then red where the stencil is 0xA5 (A's rows 16-32),
+  // which loads it (8).
+  Set(0x2000, surface_a);
+  Set(0x2001, 0x7D0);
+  Set(0x2200, 1 | 2 | 7 << 4 | 7 << 8);
+  Set(0x210D, 0xFFFF00);
+  Rect(0, 0, 40, 64, 0, kWhite);
+  Set(0x2200, 0);
+  Resolve(0, SCRATCH, 6 << 7 | 2, 0);
+  Kick();
+  gq.used = 0;
+  MarkStencil(1, 0, 1, 0, 0);
+  Set(0x2200, 1 | 2 << 8);
+  Set(0x210D, 0xA5 | 0xFF << 8);
+  Rect(0, 0, 40, 64, 0, kRed);
+  Set(0x2200, 0);
+  Resolve(0, OUT(10), 6 << 7 | 2, 0);
+  Set(0x2000, 64);
+  Set(0x2001, 0x200);
+  Set(0x2002, 0x500);
+  Kick();
+  gq.used = 0;
+  MarkStencil(1, 0, 0, 8, 0);
+  volatile u32* t = At(mem);
+#define T(k, x, y) t[0x1000 * (k) + Tiled64(x, y, 2) / 4]
+  CHECK(T(0, 12, 12) == 0xFFFFFFFF && T(0, 28, 12) == 0 && T(0, 4, 4) == 0);
+  CHECK(T(1, 8, 8) == 0xFF0000FF && T(1, 8, 40) == 0xFF00FF00 && T(1, 36, 40) == 0xFF0000FF);
+  CHECK(T(2, 40, 4) == 0xFFFFFFFF && T(2, 40, 12) == 0);
+  CHECK(T(3, 8, 20) == 0xFFFF0000 && T(3, 36, 20) == 0xFFFFFFFF);
+  CHECK(T(4, 8, 12) == 0x800000A5 && T(4, 8, 40) == 0xFFFFFF3C);
+  CHECK(T(5, 8, 8) == 0xFF0000FF && T(5, 8, 40) == 0xFF00FF00);
+  CHECK(T(6, 16, 16) == 0xFFFF0000 && T(6, 56, 56) == 0xFFFF0000 && T(6, 40, 16) != 0xFFFF0000 &&
+        T(6, 16, 40) != 0xFFFF0000);
+  CHECK(T(7, 6, 6) == 0xFFFFFF77 && T(7, 6, 20) == 0x800000A5);
+  CHECK(T(8, 12, 6) == 0xFFFFFFFF && T(8, 12, 20) != 0xFFFFFFFF);
+  CHECK(T(9, 20, 16) == 0xFFFFFFFF && T(9, 20, 48) == 0xFFFFFFFF);
+  CHECK(T(10, 6, 6) == 0xFFFFFFFF && T(10, 6, 40) == 0xFFFFFFFF && T(10, 20, 24) == 0xFF0000FF);
+  MmFreePhysicalMemory(0, mem);
+#undef T
+#undef OUT
+#undef SCRATCH
+}
+
+// Draws into colour and depth targets, resolved and read back: a vertex
+// shader that fetches a position (x, y, z) and a colour and exports them,
+// pixel shaders that export the colour interpolated or float constants.
+// Screen-space vertices, as a driver's clears give them (no viewport
+// scale or offset, XY and Z divided by W already, no clipping), pixel
+// centres at integers.
+static void Draws(volatile u32* rb, u32 w, u32 data, u32 pdata) {
+  u32 mem = MmAllocatePhysicalMemoryEx(0, 0x80000, kPageReadWrite, 0, 0, 0x1000), pmem = MmGetPhysicalAddress(mem);
+  gq.rb = rb;
+  gq.w = w;
+  gq.data = data;
+  gq.pdata = pdata;
+  gq.ib = At(mem);
+  gq.pib = pmem;
+  gq.pool = mem + 0x8000;
+  gq.ppool = pmem + 0x8000;
+  gq.ps = pmem + 0xF000;
+  for (u32 k = 0x10000; k < 0x80000; k += 4) *At(mem + k) = 0xAAAAAAAA;
+  // The shaders: the vertex shader in the packet, the pixel shaders in
+  // memory.
+  u32 vs[2][18], ps[5][9];
+  for (u32 k = 0; k < 2; k++) {
+    UcodeExec(vs[k], 1, 4 + k, 3);
+    UcodeVfetch(vs[k] + 3, 1, 0, 57, 7, 0);  // r1: x, y, z (32_32_32_FLOAT)
+    UcodeVfetch(vs[k] + 6, 2, 0, 38, 7, 3);  // r2: the colour (32_32_32_32_FLOAT)
+    UcodeExport(vs[k] + 9, 62, 1, 1);        // the position
+    UcodeExport(vs[k] + 12, 0, 2, 1);        // interpolator 0
+    UcodeExport(vs[k] + 15, 63, 2, 1);       // point size, edge flag, kill (the second)
+    for (u32 j = 0; j < 18; j++) *At(mem + 0xF400 + 0x80 * k + 4 * j) = vs[k][j];
+  }
+  gq.vs = pmem + 0xF400;
+  UcodeExec(ps[0], 1, 1, 0);
+  UcodeExport(ps[0] + 3, 0, 0, 1);  // colour 0: r0 (interpolator 0)
+  UcodeExec(ps[1], 1, 1, 0);
+  UcodeExport(ps[1] + 3, 0, 0, 0);  // colour 0: c0
+  UcodeExec(ps[2], 1, 2, 0);
+  UcodeExport(ps[2] + 3, 0, 0, 1);
+  UcodeExport(ps[2] + 6, 1, 0, 0);  // colour 1: c0
+  UcodeExec(ps[3], 1, 2, 0);
+  UcodeExport(ps[3] + 3, 0, 0, 1);
+  UcodeExport(ps[3] + 6, 61, 0, 0);  // depth: c0
+  UcodeExec(ps[4], 1, 1, 0);
+  UcodeExport(ps[4] + 3, 0, 1, 1);  // colour 0: r1
+  for (u32 k = 0; k < 5; k++)
+    for (u32 j = 0; j < 9; j++) *At(mem + 0xF000 + 0x40 * k + 4 * j) = ps[k][j];
+  // The resolves' rectangles.
+  const float corners[12] = {0, 0, 64, 0, 64, 64, 0, 0, 16, 0, 16, 16};
+  for (u32 k = 0; k < 12; k++) *At(mem + 0xE000 + 4 * k) = FloatBits(corners[k]);
+  gq.corners = pmem + 0xE000;
+  gq.small = pmem + 0xE018;
+
+  // A 64-pixel pitch without MSAA, colour target 0 at tile 0x300 (8888);
+  // scissors open, no window offset; D3D's pixel centres; no blending,
+  // all components written; no depth or stencil; no clipping.
+  Put(Type0(0x2000, 2));
+  Put(64);
+  Put(0x300);
+  Put(Type0(0x200E, 2));
+  Put(0);
+  Put(8192 | 8192 << 16);
+  Put(Type0(0x2080, 3));
+  Put(0);
+  Put(0x80000000);
+  Put(64 | 64 << 16);
+  Put(Type0(0x2101, 2));    // VGT_MIN_VTX_INDX, VGT_INDX_OFFSET
+  Put(0);
+  Put(0);
+  Set(0x2104, 0xF);         // RB_COLOR_MASK
+  Set(0x2200, 0);           // RB_DEPTHCONTROL
+  Set(0x2201, 0x00010001);  // RB_BLENDCONTROL0, 1
+  Set(0x2209, 0x00010001);
+  Set(0x2202, 0);           // RB_COLORCONTROL
+  Set(0x2204, 1 << 16);     // PA_CL_CLIP_CNTL: no clipping
+  Set(0x2205, 0);           // PA_SU_SC_MODE_CNTL
+  Set(0x2206, 0x300);       // PA_CL_VTE_CNTL: XY and Z divided by W
+  Set(0x2302, 0);
+  Put(Type3(0x2B, 2 + 15));  // IM_LOAD_IMMEDIATE
+  Put(0);
+  Put(15);
+  for (u32 k = 0; k < 15; k++) Put(vs[0][k]);
+
+  // ---- 8_8_8_8, triangles and rectangles, store and load around resolves.
+  // The target cleared to 0x11223344 (copied to the second texture, which
+  // the last resolve writes again). Then an upper-right triangle in red 1
+  // green 0.2 (0xFF0033FF as the EDRAM holds it); a triangle in green that
+  // 16-bit indices 6-8 reach with an index offset of 3 (at 6-8 one they
+  // would reach without it); a rectangle at (8.25, 16.25)-(16.25, 24.25)
+  // (offset 3 too) in float constant 0, 0x33FF0000; resolved to the first
+  // texture, the target cleared to 0x55667788; the rectangle again, to the
+  // second.
+  u32 dest1 = pmem + 0x10000, dest2 = pmem + 0x14000;
+  Set(0x2208, 4);
+  Set(0x231E, 0x11223344);
+  Resolve(0x100, dest2, 6 << 7 | 2, 0);
+  const float tri[6] = {0, 0, 32, 0, 32, 32}, rect[6] = {8.25f, 16.25f, 16.25f, 16.25f, 8.25f, 24.25f},
+              decoy[6] = {40, 0, 60, 0, 60, 20}, green[6] = {40, 40, 60, 40, 60, 60};
+  const float c_tri[4] = {1, 0.2f, 0, 1};
+  u32 vb = Verts(tri, 3, 0, c_tri);
+  Verts(rect, 3, 0, kBlack);
+  Verts(decoy, 3, 0, kRed);
+  Verts(green, 3, 0, kGreen);
+  volatile uint16_t* indices = (volatile uint16_t*)(uintptr_t)(gq.pool + gq.used);
+  u32 pindices = gq.ppool + gq.used;
+  gq.used += 8;
+  indices[0] = 6;
+  indices[1] = 7;
+  indices[2] = 8;
+  PixelShader(0);
+  SetF(0x4400, 0, 0, 1, 0.2f);  // pixel constant 0
+  Fetch0(vb, 12);
+  Put(Type3(0x36, 1));  // DRAW_INDX_2
+  Put(3 << 16 | 2 << 6 | 4);
+  Set(0x2102, 3);
+  Put(Type3(0x22, 4));  // DRAW_INDX: query word, initiator, indices, count and swap
+  Put(0);
+  Put(3 << 16 | 0 << 6 | 4);
+  Put(pindices);
+  Put(3 | 1u << 30);
+  PixelShader(1);
+  u32 rectangle = gq.n;
+  Put(Type3(0x36, 1));
+  Put(3 << 16 | 2 << 6 | 8);
+  Set(0x231E, 0x55667788);
+  Resolve(0x100, dest1, 6 << 7 | 2, 0);
+  Fetch0(vb, 12);
+  Put(gq.ib[rectangle]);
+  Put(gq.ib[rectangle + 1]);
+  Resolve(0, dest2, 6 << 7 | 2, 0);
+  Set(0x2102, 0);
+  Kick();
+  // Endian 2 without the red/blue swap: the words as the EDRAM holds
+  // them. The triangle covers (28, 2), not (2, 28) (window Y down); the
+  // rectangle, half a pixel on, x 9-16 and y 17-24, its fourth corner
+  // (16, 24) too; the indexed triangle (58, 42), not (58, 2).
+  volatile u32* t1 = At(mem + 0x10000);
+  volatile u32* t2 = At(mem + 0x14000);
+#define T1(x, y) t1[Tiled64(x, y, 2) / 4]
+#define T2(x, y) t2[Tiled64(x, y, 2) / 4]
+  CHECK(T1(28, 2) == 0xFF0033FF && T1(2, 28) == 0x11223344);
+  CHECK(T1(9, 17) == 0x33FF0000 && T1(16, 24) == 0x33FF0000);
+  CHECK(T1(8, 20) == 0x11223344 && T1(12, 16) == 0x11223344 && T1(17, 20) == 0x11223344 &&
+        T1(12, 25) == 0x11223344);
+  CHECK(T1(58, 42) == 0xFF00FF00 && T1(58, 2) == 0x11223344);
+  // After the clear only the rectangle drawn again.
+  CHECK(T2(9, 17) == 0x33FF0000 && T2(16, 24) == 0x33FF0000);
+  CHECK(T2(28, 2) == 0x55667788 && T2(58, 42) == 0x55667788 && T2(8, 20) == 0x55667788);
+
+  // ---- depth, stencil and render state: colour target 0 at 0x600, depth
+  // (D24S8) at 0x500, both cleared (depth to 1, stencil 0).
+  u32 dest_c = pmem + 0x18000, dest_d = pmem + 0x1C000, dest_d2 = pmem + 0x20000, dest_c1 = pmem + 0x24000;
+  Set(0x2001, 0x600);
+  Set(0x2002, 0x500);
+  Set(0x2003, 0x610);  // colour target 1
+  Set(0x231D, 0xFFFFFF00);
+  Set(0x231E, 0);
+  Resolve(0x100, dest_c, 6 << 7 | 2, 0);
+  Resolve(0x100 | 1, dest_c1, 6 << 7 | 2, 0);
+  Resolve(0x200 | 4, dest_d, 6 << 7 | 2, 0);
+  PixelShader(0);
+  // A (8-24): depth 0.5, less, written; stencil 0x5A replaced; red.
+  Set(0x210D, 0xFFFF5A);  // RB_STENCILREFMASK: reference, read and write masks
+  Set(0x2200, 1 | 2 | 4 | 1 << 4 | 7 << 8 | 2 << 14);
+  Rect(8, 8, 24, 24, 0.5f, kRed);
+  // A colour target at the depth target's tiles, rows 40-47 in 0x33: the
+  // depth target is stored first, then loaded again (with these words).
+  Set(0x2200, 0);
+  Set(0x2001, 0x500);
+  const float c_33[4] = {0.2f, 0.2f, 0.2f, 0.2f};
+  Rect(0, 40, 64, 48, 0, c_33);
+  Set(0x2001, 0x600);
+  // B (0-32): where the stencil is 0x5A, depth 0.25 less, written; green.
+  Set(0x2200, 1 | 2 | 4 | 1 << 4 | 2 << 8);
+  Rect(0, 0, 32, 32, 0.25f, kGreen);
+  // F (4-28): depth 0.375, less, written; blue where it passes.
+  Set(0x2200, 1 | 2 | 4 | 1 << 4 | 7 << 8);
+  Rect(4, 4, 28, 28, 0.375f, kBlue);
+  // Depth only (EDRAM mode 5): depth 0.125 at (36-44, 4-12), no colour.
+  Set(0x2200, 2 | 4 | 7 << 4);
+  Set(0x2208, 5);
+  Rect(36, 4, 44, 12, 0.125f, kWhite);
+  Set(0x2208, 4);
+  // The pixel shader's depth, 0.625 (float constant 0), at (48-56, 4-12).
+  PixelShader(3);
+  SetF(0x4400, 0.625f, 0, 0, 0);
+  Rect(48, 4, 56, 12, 0, kWhite);
+  PixelShader(0);
+  Set(0x2200, 0);
+  // Blending: the constant colour plus the target (0) at (36-44, 16-24),
+  // 0.25 0.75 0 1 (0xFF00BF40); the constant's alpha 0.25 times the
+  // colour at (48-56, 16-24) (0x40404040).
+  Set(0x2201, 12 | 1 << 8 | 12 << 16 | 1 << 24);
+  SetF(0x2105, 0.25f, 0.75f, 0, 1);  // RB_BLEND_RED-ALPHA
+  Rect(36, 16, 44, 24, 0, kWhite);
+  Set(0x2201, 14 | 14 << 16);
+  SetF(0x2105, 0, 0, 0, 0.25f);
+  Rect(48, 16, 56, 24, 0, kWhite);
+  Set(0x2201, 0x00010001);
+  // The alpha test, greater than 0.6: alpha 0.5 at (36-44, 28-36) fails,
+  // 0.8 at (48-56, 28-36) passes (0xCCFFFFFF).
+  Set(0x2202, 8 | 4);
+  Set(0x210E, FloatBits(0.6f));  // RB_ALPHA_REF
+  const float c_half[4] = {1, 1, 1, 0.5f}, c_08[4] = {1, 1, 1, 0.8f};
+  Rect(36, 28, 44, 36, 0, c_half);
+  Rect(48, 28, 56, 36, 0, c_08);
+  Set(0x2202, 0);
+  // Culling: triangles clockwise as the window shows them (and one
+  // counter-clockwise) at x 0, 16, 32, 48, y 40-56. Back faces culled,
+  // front counter-clockwise: the clockwise one goes, the other stays;
+  // front clockwise: it stays; front faces culled, front counter-
+  // clockwise: it stays.
+  const float cw0[6] = {0, 40, 16, 40, 16, 56}, ccw1[6] = {16, 40, 32, 56, 32, 40}, cw2[6] = {32, 40, 48, 40, 48, 56},
+              cw3[6] = {48, 40, 64, 40, 64, 56};
+  Set(0x2205, 2);
+  Tri(cw0, 0, kWhite);
+  Tri(ccw1, 0, kWhite);
+  Set(0x2205, 2 | 4);
+  Tri(cw2, 0, kWhite);
+  Set(0x2205, 1);
+  Tri(cw3, 0, kWhite);
+  Set(0x2205, 0);
+  // The colour mask: red and blue at (0-8, 56-64).
+  Set(0x2104, 5);
+  Rect(0, 56, 8, 64, 0, kWhite);
+  Set(0x2104, 0xF);
+  // D24FS8 at 0x520: depth 0.75 at (16-24, 56-64); a colour target at its
+  // tiles (rows 0-7) has it stored; then, loaded again, a white rectangle
+  // where the depth equals 0.75.
+  Set(0x231D, 0);
+  Set(0x2002, 0x520 | 1 << 16);
+  Resolve(0x200 | 4, dest_d2, 6 << 7 | 2, 0);
+  Set(0x2200, 2 | 4 | 7 << 4);
+  Rect(16, 56, 24, 64, 0.75f, kBlack);
+  // And the pixel shader's depth 0.75 + 5 ulp at (32-40, 56-64): its 20e4
+  // rounded to the nearest even (0xE80001).
+  const union {
+    u32 u;
+    float f;
+  } z5 = {0x3F400005};
+  PixelShader(3);
+  SetF(0x4400, z5.f, 0, 0, 0);
+  Rect(32, 56, 40, 64, 0, kBlack);
+  PixelShader(0);
+  Set(0x2200, 0);
+  Set(0x2001, 0x520);
+  Rect(0, 0, 8, 8, 0, kWhite);
+  Set(0x2001, 0x600);
+  Set(0x2200, 2 | 2 << 4);
+  Rect(16, 56, 24, 64, 0.75f, kWhite);
+  Set(0x2200, 0);
+  // Two colour targets: the interpolated red to 0, float constant 0 (blue)
+  // to 1, at (24-32, 56-64), both written (RB_COLOR_MASK has four bits a
+  // target).
+  PixelShader(2);
+  SetF(0x4400, 0, 0, 1, 1);
+  Set(0x2104, 0xFF);
+  Rect(24, 56, 32, 64, 0, kRed);
+  Set(0x2104, 0xF);
+  PixelShader(0);
+  Resolve(0, dest_c, 6 << 7 | 2, 0);
+  Resolve(1, dest_c1, 6 << 7 | 2, 0);
+  Resolve(4, dest_d2, 6 << 7 | 2, 0);
+  Set(0x2002, 0x500);
+  Resolve(4, dest_d, 6 << 7 | 2, 0);
+  Kick();
+  volatile u32* tc = At(mem + 0x18000);
+  volatile u32* td = At(mem + 0x1C000);
+  volatile u32* td2 = At(mem + 0x20000);
+  volatile u32* tc1 = At(mem + 0x24000);
+#define TC(x, y) tc[Tiled64(x, y, 2) / 4]
+#define TD(x, y) td[Tiled64(x, y, 2) / 4]
+  // B over A where the (loaded) stencil is 0x5A; F around it, not inside
+  // (0.375 is not less than 0.25); nothing outside.
+  CHECK(TC(16, 16) == 0xFF00FF00 && TC(6, 6) == 0xFFFF0000 && TC(30, 30) == 0);
+  // 24-bit depth over stencil: 0.25 (0x400000, rounded to the nearest
+  // even), 0.375 (0x600000), 1, depth only 0.125 (0x200000), the pixel
+  // shader's 0.625 (0x9FFFFF).
+  CHECK(TD(16, 16) == 0x4000005A && TD(6, 6) == 0x60000000 && TD(30, 30) == 0xFFFFFF00);
+  CHECK(TD(40, 8) == 0x20000000 && TC(40, 8) == 0);
+  CHECK(TD(52, 8) == 0x9FFFFF00 && TC(52, 8) == 0xFFFFFFFF);
+  // The colour target drawn at the depth's tiles: its sample 16 is depth
+  // sample 56 (a depth tile's halves are swapped).
+  CHECK(TD(56, 44) == 0x33333333 && TD(16, 20) == 0x4000005A);
+  CHECK(TC(40, 20) == 0xFF00BF40 && TC(52, 20) == 0x40404040);
+  CHECK(TC(40, 32) == 0 && TC(52, 32) == 0xCCFFFFFF);
+  CHECK(TC(12, 43) == 0 && TC(28, 43) == 0xFFFFFFFF && TC(44, 43) == 0xFFFFFFFF && TC(60, 43) == 0xFFFFFFFF);
+  CHECK(TC(4, 60) == 0x00FF00FF);
+  // D24FS8: 0.75 as 20e4 (0xE80000), equal after its load; 0.75 + 5 ulp.
+  CHECK(td2[Tiled64(20, 60, 2) / 4] == 0xE8000000 && TC(20, 60) == 0xFFFFFFFF);
+  CHECK(td2[Tiled64(36, 60, 2) / 4] == 0xE8000100);
+  CHECK(TC(28, 60) == 0xFF0000FF && tc1[Tiled64(28, 60, 2) / 4] == 0xFFFF0000);
+
+  // ---- each colour format at 0x400, its words resolved as they are.
+  u32 n_formats = sizeof kFormats / sizeof kFormats[0];
+  PixelShader(1);
+  for (u32 k = 0; k < n_formats; k++) {
+    u32 format = kFormats[k].info & 0xF, wide = format == 5 || format == 7 || format == 15;
+    Set(0x2001, 0x400 | kFormats[k].info << 16);
+    SetF(0x4400, kFormats[k].c[0], kFormats[k].c[1], kFormats[k].c[2], kFormats[k].c[3]);
+    Rect(0, 0, 16, 16, 0, kWhite);
+    Set(0x2001, 0x400 | (wide ? 15 : 14) << 16);
+    Resolve(0, pmem + 0x28000 + 0x2000 * k, (wide ? 37 : 36) << 7 | 2, 1);
+  }
+  Set(0x2001, 0x600);
+  PixelShader(0);
+  Kick();
+  for (u32 k = 0; k < n_formats; k++) {
+    u32 format = kFormats[k].info & 0xF, wide = format == 5 || format == 7 || format == 15;
+    u32 at = mem + 0x28000 + 0x2000 * k + Tiled64(4, 4, wide ? 3 : 2);
+    if (*At(at) != kFormats[k].w0 || (wide && *At(at + 4) != kFormats[k].w1))
+      DbgPrint("FAIL line %d: colour format %u (row %u): %08x %08x\n", __LINE__, kFormats[k].info, k, *At(at),
+               *At(at + 4));
+  }
+
+  // ---- MSAA: 4x at 0x700 and 2x at 0x720, cleared, a white rectangle from
+  // (9, 9), its edges half a pixel on through samples: of pixel (9, 12)
+  // the right ones covered, of (12, 9) the lower. Resolved: samples 0 and
+  // 2 (4x) or 1 (2x), and the average.
+  for (u32 m = 0; m < 2; m++) {
+    u32 base = pmem + 0x48000 + 0xC000 * m;
+    Set(0x2000, 64 | (m ? 1 : 2) << 16);
+    Set(0x2001, m ? 0x720 : 0x700);
+    Resolve(0x100, base, 6 << 7 | 2, 0);
+    Rect(9, 9, 20, 20, 0, kWhite);
+    Resolve(0, base, 6 << 7 | 2, 0);
+    Resolve((m ? 1 : 2) << 4, base + 0x4000, 6 << 7 | 2, 0);
+    Resolve((m ? 4 : 6) << 4, base + 0x8000, 6 << 7 | 2, 0);
+  }
+  Set(0x2000, 64);
+  Set(0x2001, 0x600);
+  Kick();
+  volatile u32* m4 = At(mem + 0x48000);
+  volatile u32* m2 = At(mem + 0x54000);
+#define M(t, k, x, y) t[0x1000 * (k) + Tiled64(x, y, 2) / 4]
+  CHECK(M(m4, 0, 9, 12) == 0 && M(m4, 1, 9, 12) == 0xFFFFFFFF && M(m4, 2, 9, 12) == 0x80808080);
+  CHECK(M(m4, 0, 12, 9) == 0 && M(m4, 1, 12, 9) == 0 && M(m4, 2, 12, 9) == 0x80808080);
+  CHECK(M(m4, 0, 12, 12) == 0xFFFFFFFF && M(m4, 2, 12, 12) == 0xFFFFFFFF && M(m4, 0, 8, 12) == 0);
+  CHECK(M(m2, 0, 12, 9) == 0 && M(m2, 1, 12, 9) == 0xFFFFFFFF && M(m2, 2, 12, 9) == 0x80808080);
+  CHECK(M(m2, 0, 10, 12) == 0xFFFFFFFF && M(m2, 1, 10, 12) == 0xFFFFFFFF && M(m2, 0, 8, 12) == 0);
+#undef T1
+#undef T2
+#undef TC
+#undef TD
+#undef M
+  Primitives();
+  Textures();
+  InPlace();
+  StencilLoads();
 }
 
 // Waits up to a second for *p == v.
@@ -1212,7 +3085,8 @@ static void Gpu(void) {
   CHECK(WaitFor(At(data + 0x64), 9) && WaitFor(At(data), w) && *Reg(0x1C4) == w);
   CHECK(query[0] == 0xE8030000 && query[4] == 0xE8030000 && query[1] == 0 && query[3] == 0 && query[7] == 0);
   CHECK(query[8] == 0 && query[12] == 0 && query[15] == 0);
-  Resolves(rb, w, data, pdata);
+  w = Resolves(rb, w, data, pdata);
+  Draws(rb, w, data, pdata);
 }
 
 // A thread that waits on an event and counts itself through.
