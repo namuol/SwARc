@@ -260,7 +260,7 @@ int main(int argc, char** argv) {
   // Bytes of .text that some lifted function decodes (for --sweep-gaps).
   std::map<const lifter::Module*, std::vector<bool>> covered;
   for (const auto& m : p.modules) covered[&m].assign(m.text_hi - m.text_lo, false);
-  size_t from_gaps = 0, gap_rejected = 0;
+  size_t from_gaps = 0, gap_rejected = 0, from_tables = 0;
   std::set<uint64_t> gap_entries;
   for (int sweep = 0;; sweep++) {
   while (!work.empty()) {
@@ -312,6 +312,16 @@ int main(int argc, char** argv) {
         f = {};
         lifter::BuildFunction(p, dec, e, &f);
       }
+    }
+    // Every case target is also a weak entry: an indirect jump that lands
+    // on it through another table than its own (the CRT's memcpy indexes
+    // the slots before a table, which belong to the table before it) or
+    // from another copy of the function goes through the dispatcher and
+    // finds it. Inside this function its jmp still goes to the label.
+    for (const auto& [va, in] : f.insns) {
+      auto jt = p.jumptables.find(va);
+      if (jt == p.jumptables.end()) continue;
+      for (uint64_t t : jt->second) candidate(p.TextOf(t), t, &from_tables);
     }
     // A gap's code that does not look like compiled user code (undecodable
     // bytes, privileged or obsolete instructions) is data: dropped.
@@ -427,9 +437,9 @@ int main(int argc, char** argv) {
   }
   for (const auto& [va, n] : symbol_tables) extended_tables += p.jumptables[va].size() > n;
   std::printf("functions: %zu (%zu from Ghidra/exports, %zu discovered: "
-              "%zu via code pointers, %zu via data pointers, %zu from gaps; %zu weak)\n",
+              "%zu via code pointers, %zu via data pointers, %zu from gaps, %zu case targets; %zu weak)\n",
               p.entries.size(), initial, p.entries.size() - initial,
-              from_code_ptrs, from_data_ptrs, from_gaps, p.weak.size());
+              from_code_ptrs, from_data_ptrs, from_gaps, from_tables, p.weak.size());
   std::printf("jump tables: %zu from Ghidra (%zu extended), %zu recovered\n",
               p.jumptables.size() - recovered_tables, extended_tables, recovered_tables);
 
