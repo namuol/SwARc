@@ -578,21 +578,46 @@ bool RecoverJumpTable32Loose(const Program& p, const Function& f, const Insn& jm
   const uint32_t table = static_cast<uint32_t>(m.mem.disp.value);
   if (p.TextOf(table) != mod || table < jmp.va) return false;
   uint32_t cap = 1024;
+  bool masked = false;  // the index is reg & (2^k - 1): exactly 2^k cases
+  bool bounded = false;  // a mask or a cmp caps the count
   const Insn* in = &jmp;
   for (int steps = 0; steps < 24 && (in = Before(f, in->va)); steps++) {
-    if (in->d.mnemonic == ZYDIS_MNEMONIC_CMP && in->ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
-        in->ops[1].imm.value.u < 1024) {
-      cap = static_cast<uint32_t>(in->ops[1].imm.value.u) + 1;
+    const auto& o0 = in->ops[0];
+    const auto& o1 = in->ops[1];
+    if (in->d.mnemonic == ZYDIS_MNEMONIC_AND && o0.type == ZYDIS_OPERAND_TYPE_REGISTER &&
+        Full(o0.reg.value) == Full(m.mem.index) && o1.type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+        o1.imm.value.u < 1024 && ((o1.imm.value.u + 1) & o1.imm.value.u) == 0) {
+      cap = static_cast<uint32_t>(o1.imm.value.u) + 1;
+      masked = bounded = true;
+      break;
+    }
+    if (o0.type == ZYDIS_OPERAND_TYPE_REGISTER && Full(o0.reg.value) == Full(m.mem.index) &&
+        WritesReg(*in, m.mem.index) && in->d.mnemonic != ZYDIS_MNEMONIC_CMP)
+      break;  // the index set otherwise: no mask to find
+    if (in->d.mnemonic == ZYDIS_MNEMONIC_CMP && o1.type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+        o1.imm.value.u < 1024) {
+      cap = static_cast<uint32_t>(o1.imm.value.u) + 1;
+      bounded = true;
       break;
     }
   }
-  constexpr uint32_t kWindow = 0x20000;  // how far before its table a case may lie
+  (void)masked;
+  constexpr uint32_t kWindow = 0x20000;  // how far from its table a case may lie
   targets->clear();
   for (uint32_t i = 0; i < cap; i++) {
     const uint64_t a = table + 4ull * i;
     if (p.TextOf(a) != mod || p.TextOf(a + 3) != mod) break;
     const uint64_t t = p.mem.read<uint32_t>(a);
-    if (p.TextOf(t) != mod || t >= table || table - t > kWindow) break;
+    // Cases lie near their table, usually before it (the function's code,
+    // then its tables); hand-written routines (the CRT's memcpy) put code
+    // after their tables too.
+    const uint64_t dist = t < table ? table - t : t - table;
+    if (p.TextOf(t) != mod || dist > kWindow) {
+      // Within a bound, an entry the code never selects (index 0 of a
+      // table indexed 1..3 can overlap the jmp's own bytes) is skipped.
+      if (bounded) continue;
+      break;
+    }
     if (std::find(targets->begin(), targets->end(), t) == targets->end()) targets->push_back(t);
   }
   return !targets->empty();
