@@ -253,6 +253,58 @@ sk_c3: movl $3, %eax
 sk_def: movl $-1, %eax
   ret
 
+// A negated index (a backward copy's count) reads the slots before the
+// table; the bytes at and after the table are the cases' code.
+  PAD
+negated:
+  movl 4(%esp), %ecx
+  negl %ecx
+ng_jmp:
+  jmp *A(ng_tbl)(,%ecx,4)
+  .p2align 2, 0xcc
+  .long A(ng_c3), A(ng_c2), A(ng_c1)
+ng_tbl:
+ng_c1: movl $1, %eax
+  ret
+ng_c2: movl $2, %eax
+  ret
+ng_c3: movl $3, %eax
+  ret
+
+// An index counted down past zero (sub 4, then jae away: the last 1..3
+// bytes of a copy) reaches the 4 slots before its table, where the code
+// after the jmp continues; those slots are another switch's table. Its
+// cases, reached through the second jmp, are function entries too.
+  PAD
+sub_prev:
+  movl 4(%esp), %eax
+  cmpl $3, %eax
+  ja sp_def
+sp_jmp:
+  jmp *A(sp_tbl)(,%eax,4)
+sp_c0: movl $0, %eax
+  ret
+sp_c1: movl $1, %eax
+  ret
+sp_c2: movl $2, %eax
+  ret
+sp_c3: movl $3, %eax
+  ret
+sp_def: movl $-1, %eax
+  ret
+  PAD
+sub_down:
+  movl 4(%esp), %ecx
+  subl $4, %ecx
+  jae sd_def
+sd_jmp:
+  jmp *A(sd_tbl)(,%ecx,4)
+  .p2align 2, 0xcc
+sp_tbl: .long A(sp_c0), A(sp_c1), A(sp_c2), A(sp_c3)
+sd_tbl:
+sd_def: movl $-1, %eax
+  ret
+
 // A switch the symbols list short (4 of its 5 cases, and the default): the
 // lifter adds the case they miss and keeps all they list.
   PAD
@@ -302,6 +354,7 @@ text_end:
   .section .lift_entries, "", @progbits
   .long A(xor_after), A(xor_before), A(no_xor), A(reg_bound), A(adjacent)
   .long A(byte_bound), A(extend), A(masked), A(cases_after), A(skip0)
+  .long A(negated), A(sub_prev), A(sub_down)
 
   .section .lift_tables, "", @progbits
   .long A(ex_jmp), 5, A(ex_c0), A(ex_c1), A(ex_c2), A(ex_c3), A(ex_def)
@@ -318,6 +371,10 @@ text_end:
   .long TABLE, A(mk_jmp), 4, A(mk_c0), A(mk_c1), A(mk_c2), A(mk_c3)
   .long TABLE, A(ca_jmp), 3, A(ca_c0), A(ca_c1), A(ca_c2)
   .long TABLE, A(sk_jmp), 3, A(sk_c1), A(sk_c2), A(sk_c3)
+  .long TABLE, A(ng_jmp), 3, A(ng_c1), A(ng_c2), A(ng_c3)
+  .long TABLE, A(sp_jmp), 4, A(sp_c0), A(sp_c1), A(sp_c2), A(sp_c3)
+  .long TABLE, A(sd_jmp), 4, A(sp_c0), A(sp_c1), A(sp_c2), A(sp_c3)
+  .long ENTRY, A(sp_c2), 0
   .long TABLE, A(ex_jmp), 6, A(ex_c0), A(ex_c1), A(ex_c2), A(ex_c3), A(ex_c4), A(ex_def)
   .long NO_ENTRY | NO_SWEEP, A(unreferenced), 0
   .long ENTRY | SWEEP, A(unreferenced), 0
