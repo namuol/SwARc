@@ -255,6 +255,8 @@ int main(int argc, char** argv) {
           candidate(&m, p.mem.read<uint32_t>(a), &from_data_ptrs);
     }
   size_t recovered_tables = 0, extended_tables = 0;
+  std::map<uint64_t, size_t> symbol_tables;  // jmp -> cases the symbols list
+  for (const auto& [va, ts] : p.jumptables) symbol_tables[va] = ts.size();
   // Bytes of .text that some lifted function decodes (for --sweep-gaps).
   std::map<const lifter::Module*, std::vector<bool>> covered;
   for (const auto& m : p.modules) covered[&m].assign(m.text_hi - m.text_lo, false);
@@ -268,53 +270,47 @@ int main(int argc, char** argv) {
     lifter::Function f;
     lifter::BuildFunction(p, dec, e, &f);
     // Switch tables Ghidra did not export: recover them and rebuild, as
-    // their targets may hold further switches.
-    for (bool more = true; more;) {
-      more = false;
+    // their targets may hold further switches. A table recovered while
+    // the function was only partly known can be read too far (the next
+    // switch's table is only recognised once the code addressing it is),
+    // so within this function's rounds the latest recovery replaces the
+    // earlier ones; what the table held before this function (from the
+    // symbols or another function reaching the same jmp) is always kept.
+    std::map<uint64_t, std::vector<uint64_t>> prior;
+    for (int round = 0, more = 1; more; round++) {
+      more = 0;
       for (const auto& [va, in] : f.insns) {
         std::vector<uint64_t> targets;
         if (!lifter::RecoverJumpTable(p, f, in, &targets)) continue;
         auto known = p.jumptables.find(va);
+        if (!prior.count(va))
+          prior[va] = known == p.jumptables.end() ? std::vector<uint64_t>{} : known->second;
+        std::vector<uint64_t> merged = prior[va];
+        for (uint64_t t : targets)
+          if (std::find(merged.begin(), merged.end(), t) == merged.end()) merged.push_back(t);
         if (known == p.jumptables.end()) {
-          p.jumptables[va] = std::move(targets);
+          p.jumptables[va] = std::move(merged);
           recovered_tables++;
-          more = true;
+          more = 1;
           continue;
         }
-        // A table from the symbols can stop short of the cases the code
-        // bounds it to: add the targets it is missing.
-        bool grew = false;
-        for (uint64_t t : targets)
-          if (std::find(known->second.begin(), known->second.end(), t) == known->second.end()) {
-            known->second.push_back(t);
-            grew = true;
-          }
-        if (grew) {
-          extended_tables++;
-          more = true;
+        // Past a few rounds, tables only grow: no rebuild can undo another.
+        if (round >= 8) {
+          bool grew = false;
+          for (uint64_t t : merged)
+            if (std::find(known->second.begin(), known->second.end(), t) == known->second.end()) {
+              known->second.push_back(t);
+              grew = true;
+            }
+          more |= grew;
+        } else if (known->second != merged) {
+          known->second = std::move(merged);
+          more = 1;
         }
       }
       if (more) {
         f = {};
         lifter::BuildFunction(p, dec, e, &f);
-      }
-    }
-    for (const auto& [va, in] : f.insns) {
-      const lifter::Module* im = p.TextOf(va);
-      if (!im) continue;
-      auto& cv = covered[im];
-      for (uint64_t b = va; b < in.next() && b < im->text_hi; b++) cv[b - im->text_lo] = true;
-    }
-    for (const auto& [jva, ts] : p.jumptables) {
-      (void)ts;
-      auto jt = f.insns.find(jva);
-      if (jt == f.insns.end() || jt->second.ops[0].type != ZYDIS_OPERAND_TYPE_MEMORY) continue;
-      const uint64_t t0 = static_cast<uint32_t>(jt->second.ops[0].mem.disp.value);
-      const lifter::Module* tm = p.TextOf(t0);
-      if (!tm) continue;
-      for (uint64_t a = t0; a + 4 <= tm->text_hi; a += 4) {
-        if (p.TextOf(p.mem.read<uint32_t>(a)) != tm) break;
-        for (int k = 0; k < 4; k++) covered[tm][a + k - tm->text_lo] = true;
       }
     }
     // A gap's code that does not look like compiled user code (undecodable
@@ -345,10 +341,35 @@ int main(int argc, char** argv) {
         if (bogus) break;
       }
       if (bogus) {
+        // Only its first instruction counts as seen: the data can run
+        // straight into code nothing refers to, which a later sweep starts
+        // at once the bytes before it are rejected one by one.
         p.entries.erase(e);
         p.weak.erase(e);
         gap_rejected++;
+        const lifter::Module* im = p.TextOf(e);
+        auto first = f.insns.find(e);
+        const uint64_t end = first == f.insns.end() ? e + 1 : first->second.next();
+        for (uint64_t b = e; b < end && b < im->text_hi; b++) covered[im][b - im->text_lo] = true;
         continue;
+      }
+    }
+    for (const auto& [va, in] : f.insns) {
+      const lifter::Module* im = p.TextOf(va);
+      if (!im) continue;
+      auto& cv = covered[im];
+      for (uint64_t b = va; b < in.next() && b < im->text_hi; b++) cv[b - im->text_lo] = true;
+    }
+    for (const auto& [jva, ts] : p.jumptables) {
+      (void)ts;
+      auto jt = f.insns.find(jva);
+      if (jt == f.insns.end() || jt->second.ops[0].type != ZYDIS_OPERAND_TYPE_MEMORY) continue;
+      const uint64_t t0 = static_cast<uint32_t>(jt->second.ops[0].mem.disp.value);
+      const lifter::Module* tm = p.TextOf(t0);
+      if (!tm) continue;
+      for (uint64_t a = t0; a + 4 <= tm->text_hi; a += 4) {
+        if (p.TextOf(p.mem.read<uint32_t>(a)) != tm) break;
+        for (int k = 0; k < 4; k++) covered[tm][a + k - tm->text_lo] = true;
       }
     }
     for (const auto* s : {&f.direct_calls, &f.tail_calls, &f.setjmp_returns})
@@ -404,6 +425,7 @@ int main(int argc, char** argv) {
   }
   if (from_gaps == before_sweep) break;
   }
+  for (const auto& [va, n] : symbol_tables) extended_tables += p.jumptables[va].size() > n;
   std::printf("functions: %zu (%zu from Ghidra/exports, %zu discovered: "
               "%zu via code pointers, %zu via data pointers, %zu from gaps; %zu weak)\n",
               p.entries.size(), initial, p.entries.size() - initial,

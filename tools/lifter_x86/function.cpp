@@ -561,12 +561,23 @@ bool RecoverJumpTable32Exact(const Program& p, const Function& f, const Insn& jm
 }
 
 // A jmp [TABLE+reg*4] whose bound the exact pattern above cannot prove
-// (the index reloaded from a spill, compared in another register, ...):
-// MSVC puts the table in .text right after the function's code, so its
-// entries are read while they point back into code shortly before it,
-// at most as many as a cmp with ja just before the jmp bounds, if there is
-// one. A wrong extra target only adds lifted code (as a stray data
-// pointer does); a missing one would be a fatal jump at run time.
+// (the index reloaded from a spill, compared in another register, masked,
+// ...): its entries are read while they point to code near the table.
+// MSVC puts a function's tables in .text right after its code, so cases
+// usually lie before the table; hand-written routines (the CRT's memcpy)
+// put code after their tables too. The count is what a bound just before
+// the jmp gives, if there is one: `and r, 2^k-1` on the index (exactly
+// 2^k cases), else a cmp (`cmp r, N`, or `cmp r, r2` with r2 set by
+// `mov r2, N` in the function). Within a bound, an entry that is no code
+// pointer is one the code never selects (index 0 of a table indexed 1..3
+// can overlap the jmp's own bytes) and is skipped; without one, the read
+// stops there. Except under a mask, the read never runs into what the
+// function itself shows is something else: another table one of its
+// instructions addresses (the next switch's jump or byte index table,
+// laid out right after this one), or its own code (skipped within a cmp
+// bound, the end of the table without one). A wrong extra target only
+// adds lifted code (as a stray data pointer does); a missing one would be
+// a fatal jump at run time.
 bool RecoverJumpTable32Loose(const Program& p, const Function& f, const Insn& jmp,
                              std::vector<uint64_t>* targets) {
   const auto& m = jmp.ops[0];
@@ -577,44 +588,90 @@ bool RecoverJumpTable32Loose(const Program& p, const Function& f, const Insn& jm
   const Module* mod = p.TextOf(jmp.va);
   const uint32_t table = static_cast<uint32_t>(m.mem.disp.value);
   if (p.TextOf(table) != mod || table < jmp.va) return false;
+  // The value a `mov r, imm` gives r, if the last write to r before `va`
+  // (in address order, within f) is one: the largest such mov, as one of
+  // several paths may set it.
+  auto constant_before = [&](uint64_t va, ZydisRegister r, uint32_t* value) {
+    bool nearest = true, found = false;
+    for (auto it = f.insns.lower_bound(va); it != f.insns.begin();) {
+      const Insn& w = (--it)->second;
+      if (!w.ok || !WritesReg(w, r)) continue;
+      const bool mov_imm = w.d.mnemonic == ZYDIS_MNEMONIC_MOV &&
+                           w.ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                           w.ops[0].size == 32 && Full(w.ops[0].reg.value) == Full(r) &&
+                           w.ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE;
+      if (nearest && !mov_imm) return false;
+      nearest = false;
+      if (mov_imm && (!found || w.ops[1].imm.value.u > *value)) {
+        *value = static_cast<uint32_t>(w.ops[1].imm.value.u);
+        found = true;
+      }
+    }
+    return found;
+  };
   uint32_t cap = 1024;
-  bool masked = false;  // the index is reg & (2^k - 1): exactly 2^k cases
+  bool masked = false;   // the index is reg & (2^k - 1): exactly 2^k cases
   bool bounded = false;  // a mask or a cmp caps the count
+  bool index_set = false;  // the index was written since: a mask no longer bounds it
   const Insn* in = &jmp;
   for (int steps = 0; steps < 24 && (in = Before(f, in->va)); steps++) {
     const auto& o0 = in->ops[0];
     const auto& o1 = in->ops[1];
-    if (in->d.mnemonic == ZYDIS_MNEMONIC_AND && o0.type == ZYDIS_OPERAND_TYPE_REGISTER &&
-        Full(o0.reg.value) == Full(m.mem.index) && o1.type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
-        o1.imm.value.u < 1024 && ((o1.imm.value.u + 1) & o1.imm.value.u) == 0) {
+    const bool on_index =
+        o0.type == ZYDIS_OPERAND_TYPE_REGISTER && Full(o0.reg.value) == Full(m.mem.index);
+    if (!index_set && in->d.mnemonic == ZYDIS_MNEMONIC_AND && on_index &&
+        o1.type == ZYDIS_OPERAND_TYPE_IMMEDIATE && o1.imm.value.u < 1024 &&
+        ((o1.imm.value.u + 1) & o1.imm.value.u) == 0) {
       cap = static_cast<uint32_t>(o1.imm.value.u) + 1;
       masked = bounded = true;
       break;
     }
-    if (o0.type == ZYDIS_OPERAND_TYPE_REGISTER && Full(o0.reg.value) == Full(m.mem.index) &&
-        WritesReg(*in, m.mem.index) && in->d.mnemonic != ZYDIS_MNEMONIC_CMP)
-      break;  // the index set otherwise: no mask to find
-    if (in->d.mnemonic == ZYDIS_MNEMONIC_CMP && o1.type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
-        o1.imm.value.u < 1024) {
-      cap = static_cast<uint32_t>(o1.imm.value.u) + 1;
+    // Set otherwise (a reload from a spill, ...): no mask to find, but a
+    // cmp before it still bounds the value reloaded.
+    if (on_index && WritesReg(*in, m.mem.index) && in->d.mnemonic != ZYDIS_MNEMONIC_CMP)
+      index_set = true;
+    if (in->d.mnemonic != ZYDIS_MNEMONIC_CMP) continue;
+    uint32_t n = 0;
+    if (o1.type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+      n = static_cast<uint32_t>(o1.imm.value.u);
+    } else if (o1.type != ZYDIS_OPERAND_TYPE_REGISTER || o1.size != 32 ||
+               !constant_before(in->va, o1.reg.value, &n)) {
+      continue;
+    }
+    if (n < 1024) {
+      cap = n + 1;
       bounded = true;
       break;
     }
   }
-  (void)masked;
+  // Where the table must end: another table (or byte index table) one of
+  // the function's instructions addresses; and its own code after the
+  // table, unless a bound says how far the table goes.
+  uint64_t limit = mod->text_hi;
+  for (const auto& [va, w] : f.insns) {
+    if (va > table && !bounded) limit = std::min(limit, va);
+    if (!w.ok) continue;
+    for (int i = 0; i < w.d.operand_count_visible; i++) {
+      const auto& o = w.ops[i];
+      if (o.type != ZYDIS_OPERAND_TYPE_MEMORY || !o.mem.disp.has_displacement) continue;
+      const uint32_t d = static_cast<uint32_t>(o.mem.disp.value);
+      if (d > table && p.TextOf(d) == mod) limit = std::min<uint64_t>(limit, d);
+    }
+  }
+  if (masked) limit = mod->text_hi;
+  // Whether [a, a+4) overlaps an instruction of f.
+  auto in_code = [&](uint64_t a) {
+    auto it = f.insns.upper_bound(a + 3);
+    return it != f.insns.begin() && std::prev(it)->second.next() > a;
+  };
   constexpr uint32_t kWindow = 0x20000;  // how far from its table a case may lie
   targets->clear();
   for (uint32_t i = 0; i < cap; i++) {
     const uint64_t a = table + 4ull * i;
-    if (p.TextOf(a) != mod || p.TextOf(a + 3) != mod) break;
+    if (a + 4 > limit || p.TextOf(a) != mod || p.TextOf(a + 3) != mod) break;
     const uint64_t t = p.mem.read<uint32_t>(a);
-    // Cases lie near their table, usually before it (the function's code,
-    // then its tables); hand-written routines (the CRT's memcpy) put code
-    // after their tables too.
     const uint64_t dist = t < table ? table - t : t - table;
-    if (p.TextOf(t) != mod || dist > kWindow) {
-      // Within a bound, an entry the code never selects (index 0 of a
-      // table indexed 1..3 can overlap the jmp's own bytes) is skipped.
+    if (p.TextOf(t) != mod || dist > kWindow || (!masked && in_code(a))) {
       if (bounded) continue;
       break;
     }
