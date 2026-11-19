@@ -3,6 +3,7 @@
 #include "win32/hle.h"
 
 #include <algorithm>
+#include <cctype>
 #include <map>
 #include <set>
 #include <vector>
@@ -54,6 +55,11 @@ std::string NormaliseDll(std::string dll) {
   // The UCRT's API sets (api-ms-win-crt-runtime-l1-1-0.dll, ...) are all
   // ucrtbase.dll, as Windows' API set map resolves them.
   if (dll.rfind("api-ms-win-crt-", 0) == 0) return "ucrtbase.dll";
+  // D3DX 9's numbered builds (d3dx9_24 ... d3dx9_43) keep each export's
+  // signature and behaviour: one HLE, d3dx9_35.dll, serves them all.
+  if (dll.size() == 12 && dll.rfind("d3dx9_", 0) == 0 && std::isdigit(uint8_t(dll[6])) &&
+      std::isdigit(uint8_t(dll[7])) && dll.compare(8, 4, ".dll") == 0)
+    return "d3dx9_35.dll";
   return dll;
 }
 

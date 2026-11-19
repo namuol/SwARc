@@ -104,6 +104,11 @@ add_library(recomp_d3d9 SHARED src/win32/d3d9.cpp
   src/win32/d3d9_draw.cpp src/win32/d3d9_resource.cpp
   src/win32/d3dx9.cpp)
 target_link_libraries(recomp_d3d9 PUBLIC recomp_win32 recomp_gfx recomp_hlsl)
+# JPEG textures (D3DX) decode with ffmpeg when it is there.
+if(FFMPEG_FOUND)
+  target_link_libraries(recomp_d3d9 PRIVATE PkgConfig::FFMPEG)
+  target_compile_definitions(recomp_d3d9 PRIVATE RECOMP_D3DX_JPEG=1)
+endif()
 # D3DX's maths rounds like the original only without contraction into FMA.
 set_source_files_properties(src/win32/d3dx9.cpp TARGET_DIRECTORY recomp_d3d9
   PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")

@@ -1,6 +1,6 @@
 // d3dx9_35: the D3DX 9 functions games import, on the d3d9 HLE.
 //
-// Textures from files in memory: DDS (2D and cube; DXT1-5, the common RGB,
+// Textures from files in memory: PNG (SDL), JPEG (ffmpeg, when found), DDS (2D and cube; DXT1-5, the common RGB,
 // luminance and alpha layouts, and D3DFORMAT FourCCs). Missing mip levels
 // are generated with a box filter for uncompressed formats. Anything
 // else (other image formats, resizing, format conversion) is fatal and
@@ -10,6 +10,14 @@
 // returns it in a shader function Create*Shader recognise
 // (d3d9::TranslatedFunction), with an ID3DXConstantTable of the registers
 // the translation placed the uniforms in.
+
+#include <SDL3/SDL.h>
+#if RECOMP_D3DX_JPEG
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libswscale/swscale.h>
+}
+#endif
 
 #include <algorithm>
 #include <array>
@@ -63,7 +71,88 @@ struct Image {
   bool cube = false;
   const uint8_t* data = nullptr;  // faces, each with its mip chain
   uint32_t size = 0;
+  uint32_t file_format = 4;       // D3DXIMAGE_FILEFORMAT: DDS 4, PNG 3
+  std::vector<uint8_t> owned;     // decoded pixels, when not the file's own
 };
+
+#if RECOMP_D3DX_JPEG
+// A JPEG, decoded (ffmpeg's MJPEG decoder, swscale to BGRA) to one level
+// of D3DFMT_X8R8G8B8, as D3DX loads them.
+bool ParseJpeg(const uint8_t* p, uint32_t size, Image* img, std::string* why) {
+  if (size < 4 || p[0] != 0xFF || p[1] != 0xD8 || p[2] != 0xFF) return false;
+  const AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_MJPEG);
+  AVCodecContext* ctx = codec ? avcodec_alloc_context3(codec) : nullptr;
+  AVPacket* pkt = av_packet_alloc();
+  AVFrame* frame = av_frame_alloc();
+  std::vector<uint8_t> padded(size + AV_INPUT_BUFFER_PADDING_SIZE, 0);
+  std::memcpy(padded.data(), p, size);
+  bool ok = ctx && pkt && frame && avcodec_open2(ctx, codec, nullptr) == 0;
+  if (ok) {
+    pkt->data = padded.data();
+    pkt->size = int(size);
+    ok = avcodec_send_packet(ctx, pkt) == 0 && avcodec_send_packet(ctx, nullptr) == 0 &&
+         avcodec_receive_frame(ctx, frame) == 0;
+  }
+  if (ok) {
+    const int w = frame->width, h = frame->height;
+    SwsContext* sws = sws_getContext(w, h, AVPixelFormat(frame->format), w, h, AV_PIX_FMT_BGRA,
+                                     SWS_BICUBIC | SWS_ACCURATE_RND | SWS_FULL_CHR_H_INT,
+                                     nullptr, nullptr, nullptr);
+    ok = sws != nullptr;
+    if (ok) {
+      img->owned.assign(size_t(w) * h * 4, 0);
+      uint8_t* dst[4] = {img->owned.data(), nullptr, nullptr, nullptr};
+      int stride[4] = {w * 4, 0, 0, 0};
+      sws_scale(sws, frame->data, frame->linesize, 0, h, dst, stride);
+      sws_freeContext(sws);
+      for (size_t i = 3; i < img->owned.size(); i += 4) img->owned[i] = 0xFF;
+      img->width = uint32_t(w);
+      img->height = uint32_t(h);
+      img->levels = 1;
+      img->format = D3DFMT_X8R8G8B8;
+      img->file_format = 1;  // D3DXIFF_JPG
+      img->data = img->owned.data();
+      img->size = uint32_t(img->owned.size());
+    }
+  }
+  if (!ok) *why = "JPEG: ffmpeg could not decode it";
+  av_frame_free(&frame);
+  av_packet_free(&pkt);
+  avcodec_free_context(&ctx);
+  return ok;
+}
+#endif
+
+// A PNG, decoded (SDL) to one level of D3DFMT_A8R8G8B8, or X8R8G8B8 when
+// it has no alpha channel, as D3DX loads them.
+bool ParsePng(const uint8_t* p, uint32_t size, Image* img, std::string* why) {
+  if (size < 8 || std::memcmp(p, "\x89PNG\r\n\x1a\n", 8) != 0) return false;
+  SDL_Surface* s = SDL_LoadPNG_IO(SDL_IOFromConstMem(p, size), true);
+  if (!s) {
+    *why = std::string("PNG: ") + SDL_GetError();
+    return false;
+  }
+  const bool alpha = SDL_ISPIXELFORMAT_ALPHA(s->format);
+  SDL_Surface* a = SDL_ConvertSurface(s, SDL_PIXELFORMAT_ARGB8888);
+  SDL_DestroySurface(s);
+  if (!a) {
+    *why = std::string("PNG: ") + SDL_GetError();
+    return false;
+  }
+  img->width = uint32_t(a->w);
+  img->height = uint32_t(a->h);
+  img->levels = 1;
+  img->format = alpha ? D3DFMT_A8R8G8B8 : D3DFMT_X8R8G8B8;
+  img->file_format = 3;
+  img->owned.resize(size_t(a->w) * a->h * 4);
+  for (int y = 0; y < a->h; y++)
+    std::memcpy(img->owned.data() + size_t(y) * a->w * 4,
+                static_cast<const uint8_t*>(a->pixels) + size_t(y) * a->pitch, size_t(a->w) * 4);
+  SDL_DestroySurface(a);
+  img->data = img->owned.data();
+  img->size = uint32_t(img->owned.size());
+  return true;
+}
 
 // The D3DFORMAT of a DDS pixel format, or 0.
 uint32_t DdsFormat(const DdsHeader& h) {
@@ -179,20 +268,27 @@ uint32_t CreateFromMemory(Ctx& c, bool cube, uint32_t device, uint32_t src, uint
   const uint8_t* p = reinterpret_cast<const uint8_t*>(GPtr(src));
   Image img;
   std::string why;
-  if (!ParseDds(p, size, &img, &why)) {
+  bool parsed = ParsePng(p, size, &img, &why);
+#if RECOMP_D3DX_JPEG
+  if (!parsed) parsed = ParseJpeg(p, size, &img, &why);
+#endif
+  if (!parsed && !ParseDds(p, size, &img, &why)) {
     char magic[5] = {};
     std::memcpy(magic, p, std::min<uint32_t>(4, size));
     for (char& ch : magic)
       if (ch && (ch < 32 || ch > 126)) ch = '.';
-    FatalF("d3dx9: texture from memory: %s (%u bytes, starts \"%s\"): not supported yet",
-           why.c_str(), size, magic);
+    char hex[40] = {};
+    for (uint32_t i = 0; i < std::min<uint32_t>(12, size); i++)
+      std::snprintf(hex + 3 * i, 4, "%02X ", p[i]);
+    FatalF("d3dx9: texture from memory: %s (%u bytes, starts \"%s\": %s): not supported yet",
+           why.c_str(), size, magic, hex);
   }
   if (img.cube != cube)
     FatalF("d3dx9: a %s DDS for a %s texture", img.cube ? "cube" : "2D",
            cube ? "cube" : "2D");
   if (info) {
     *G<D3DXIMAGE_INFO>(info) = {img.width, img.height, 1, img.levels, img.format,
-                                cube ? D3DRTYPE_CUBETEXTURE : D3DRTYPE_TEXTURE, D3DXIFF_DDS};
+                                cube ? D3DRTYPE_CUBETEXTURE : D3DRTYPE_TEXTURE, img.file_format};
   }
   auto from_file = [](uint32_t v) {
     return v == 0 || v == D3DX_DEFAULT || v == D3DX_DEFAULT_NONPOW2 || v == D3DX_FROM_FILE;
@@ -205,6 +301,12 @@ uint32_t CreateFromMemory(Ctx& c, bool cube, uint32_t device, uint32_t src, uint
            img.height, w, h);
   uint32_t fmt = (format == D3DFMT_UNKNOWN || format == D3DX_DEFAULT ||
                   format == D3DFMT_FROM_FILE) ? img.format : format;
+  // Decoded images are ARGB with an opaque alpha where they have none:
+  // X8R8G8B8 and A8R8G8B8 are the same bytes.
+  if (!img.owned.empty() &&
+      ((fmt == D3DFMT_A8R8G8B8 && img.format == D3DFMT_X8R8G8B8) ||
+       (fmt == D3DFMT_X8R8G8B8 && img.format == D3DFMT_A8R8G8B8)))
+    img.format = fmt;
   if (fmt != img.format)
     FatalF("d3dx9: converting format %X to %X not supported yet", img.format, fmt);
   gfx::Format f = FormatFromD3D(fmt);
@@ -319,6 +421,49 @@ HLE("d3dx9_35.dll", D3DXMatrixMultiply, 3) {
       r[i * 4 + j] = a[i * 4] * b[j] + a[i * 4 + 1] * b[4 + j] + a[i * 4 + 2] * b[8 + j] +
                      a[i * 4 + 3] * b[12 + j];
   WriteMatrix(Arg(c, 0), r);
+  return Arg(c, 0);
+}
+
+// Float arguments arrive as their bits.
+float ArgF(Ctx& c, int i) {
+  uint32_t v = Arg(c, i);
+  float x;
+  std::memcpy(&x, &v, 4);
+  return x;
+}
+
+// (pOut, sx, sy, sz)
+HLE("d3dx9_35.dll", D3DXMatrixScaling, 4) {
+  Mat m = {ArgF(c, 1), 0, 0, 0, 0, ArgF(c, 2), 0, 0, 0, 0, ArgF(c, 3), 0, 0, 0, 0, 1};
+  WriteMatrix(Arg(c, 0), m);
+  return Arg(c, 0);
+}
+
+// (pOut, x, y, z)
+HLE("d3dx9_35.dll", D3DXMatrixTranslation, 4) {
+  Mat m = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, ArgF(c, 1), ArgF(c, 2), ArgF(c, 3), 1};
+  WriteMatrix(Arg(c, 0), m);
+  return Arg(c, 0);
+}
+
+// (pOut, angle): rotation about z, row-vector convention (as D3DX).
+HLE("d3dx9_35.dll", D3DXMatrixRotationZ, 2) {
+  const float a = ArgF(c, 1), s = std::sin(a), co = std::cos(a);
+  Mat m = {co, s, 0, 0, -s, co, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  WriteMatrix(Arg(c, 0), m);
+  return Arg(c, 0);
+}
+
+// (pOut D3DXVECTOR4*, pV D3DXVECTOR3*, pM): (x, y, z, 1) * M.
+HLE("d3dx9_35.dll", D3DXVec3Transform, 3) {
+  Vec3 v = ReadVec3(Arg(c, 1));
+  Mat m = ReadMatrix(Arg(c, 2));
+  for (int j = 0; j < 4; j++) {
+    float r = v.x * m[j] + v.y * m[4 + j] + v.z * m[8 + j] + m[12 + j];
+    uint32_t bits;
+    std::memcpy(&bits, &r, 4);
+    Wr32(Arg(c, 0) + 4 * uint32_t(j), bits);
+  }
   return Arg(c, 0);
 }
 
