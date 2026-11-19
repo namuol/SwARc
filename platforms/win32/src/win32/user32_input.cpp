@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -416,6 +417,21 @@ HLE("user32.dll", LoadImageA, 6) {
   WarnF("LoadImageA: bitmap resource %X not read; returning a handle\n", name);
   return next += 0x10;
 }
+// LoadCursorFromFileA(path): a .cur or .ani file. Like LoadImageA's
+// files, an opaque handle (games that hide the pointer draw their own),
+// and the file must exist.
+HLE("user32.dll", LoadCursorFromFileA, 1) {
+  static std::atomic<uint32_t> next{0x00040000};
+  struct stat st;
+  std::string path = HostPath(GStr(Arg(c, 0)));
+  if (stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) {
+    SetLastError(2);  // ERROR_FILE_NOT_FOUND
+    return 0;
+  }
+  return next += 0x10;
+}
+HLE("user32.dll", DestroyCursor, 1) { return 1; }
+
 HLE("user32.dll", SetCursor, 1) {
   static uint32_t cur = 0;
   uint32_t old = cur;

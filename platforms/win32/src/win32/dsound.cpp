@@ -342,7 +342,7 @@ void WriteFormat(uint32_t va, uint32_t size, const Format& f) {
 // device, the primary sound driver (NULL GUID, as DirectSound reports it
 // first), which is what DirectSoundCreate8 opens. The callback is
 // BOOL CALLBACK (LPGUID, LPCSTR description, LPCSTR module, LPVOID ctx).
-HLE_NAMED("dsound.dll", "#2", DirectSoundEnumerateA, 2) {
+uint64_t EnumerateA(Ctx& c) {
   gaddr desc = HeapAllocProcess(64, true);
   PutStr(desc, "Primary Sound Driver");
   gaddr module = desc + 32;  // "": the primary driver has no module name
@@ -351,9 +351,10 @@ HLE_NAMED("dsound.dll", "#2", DirectSoundEnumerateA, 2) {
   return DS_OK;
 }
 
-// DirectSoundCreate (ordinal 1), the DirectX 3-7 entry: IDirectSound is
-// a prefix of IDirectSound8, so the same object serves it.
-HLE_NAMED("dsound.dll", "#1", DirectSoundCreate, 3) {
+// DirectSoundCreate (ordinal 1, IDirectSound) and DirectSoundCreate8
+// (ordinal 11): the same object, as IDirectSound8 starts with
+// IDirectSound's methods.
+uint64_t Create(Ctx& c) {
   if (!Arg(c, 1)) return DSERR_INVALIDPARAM;
   Wr32(Arg(c, 1), 0);
   if (Arg(c, 2)) return DSERR_NOAGGREGATION;
@@ -362,14 +363,15 @@ HLE_NAMED("dsound.dll", "#1", DirectSoundCreate, 3) {
   return DS_OK;
 }
 
-HLE_NAMED("dsound.dll", "#11", DirectSoundCreate8, 3) {
-  if (!Arg(c, 1)) return DSERR_INVALIDPARAM;
-  Wr32(Arg(c, 1), 0);
-  if (Arg(c, 2)) return DSERR_NOAGGREGATION;
-  if (!M().Open(48000)) return DSERR_NODRIVER;
-  Wr32(Arg(c, 1), com::Publish(std::make_shared<DirectSound>(), DirectSoundVtable()));
-  return DS_OK;
+// Imports bind by ordinal; GetProcAddress asks by name.
+HLE_NAMED("dsound.dll", "#2", DirectSoundEnumerateA, 2) { return EnumerateA(c); }
+HLE_NAMED("dsound.dll", "DirectSoundEnumerateA", DirectSoundEnumerateA_n, 2) {
+  return EnumerateA(c);
 }
+HLE_NAMED("dsound.dll", "#1", DirectSoundCreate, 3) { return Create(c); }
+HLE_NAMED("dsound.dll", "DirectSoundCreate", DirectSoundCreate_n, 3) { return Create(c); }
+HLE_NAMED("dsound.dll", "#11", DirectSoundCreate8, 3) { return Create(c); }
+HLE_NAMED("dsound.dll", "DirectSoundCreate8", DirectSoundCreate8_n, 3) { return Create(c); }
 
 // CoCreateInstance of CLSID_DirectSound or CLSID_DirectSound8: an object
 // not yet initialised; the creator calls IDirectSound::Initialize(guid)

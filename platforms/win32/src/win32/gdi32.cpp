@@ -70,6 +70,18 @@ HLE("gdi32.dll", GetStockObject, 1) { return 0x00E00000u | (Arg(c, 0) & 0xFF); }
 HLE("gdi32.dll", CreateHatchBrush, 2) { return NewGdi(); }
 
 
+// SetMapMode(hdc, mode): only MM_TEXT (1), one logical unit per pixel,
+// which every DC starts in; the previous mode is always MM_TEXT.
+HLE("gdi32.dll", SetMapMode, 2) {
+  if (Arg(c, 1) != 1) WarnF("SetMapMode(%u): only MM_TEXT is supported\n", Arg(c, 1));
+  return 1;
+}
+
+// GetSystemPaletteEntries(hdc, start, count, entries): the display is not
+// palette-based (no RC_PALETTE in RASTERCAPS), and for such a device
+// Windows returns 0 and fills nothing.
+HLE("gdi32.dll", GetSystemPaletteEntries, 4) { return 0; }
+
 HLE("gdi32.dll", GetDeviceCaps, 2) {
   switch (Arg(c, 1)) {
     case 8: return uint32_t(g_display_w);   // HORZRES

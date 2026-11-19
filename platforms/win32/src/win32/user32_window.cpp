@@ -28,6 +28,7 @@
 
 #include "runtime/display.h"
 #include "runtime/log.h"
+#include "runtime/platform.h"
 #include "win32/hle.h"
 #include "win32/input_state.h"
 #include "win32/kernel32_state.h"
@@ -968,7 +969,23 @@ void EnsureSdlVideo() {
     const float d = m->pixel_density > 0 ? m->pixel_density : 1.0f;
     g_desktop_density = d;
     g_display_w = g_desktop_w = int(std::lround(float(m->w) * d));
-    g_display_h = g_desktop_h = int(std::lround(float(m->h) * d));
+    // Less the strip a fullscreen window does not get on a display with a
+    // camera housing (a notched Mac's): the menu bar's height, where the
+    // usable bounds start (one point more than the safe area's top inset:
+    // 33 against 32 points on a 16-inch MacBook Pro, whose fullscreen
+    // windows are 1084 points tall of 1117). A game that fills the desktop
+    // then gets a window, and a swap chain, of the size its fullscreen
+    // surface has; otherwise every present is suboptimal, and a game that
+    // rebuilds its swap chain on that rebuilds it every frame.
+    int inset = 0;
+    SDL_Rect full{}, usable{};
+    const SDL_DisplayID primary = SDL_GetPrimaryDisplay();
+    if (platform::PrimaryDisplayTopInset() > 0 && SDL_GetDisplayBounds(primary, &full) &&
+        SDL_GetDisplayUsableBounds(primary, &usable) && usable.y > full.y)
+      inset = int(std::lround(float(usable.y - full.y) * d));
+    g_display_h = g_desktop_h = int(std::lround(float(m->h) * d)) - inset;
+    std::fprintf(stderr, "user32: desktop %dx%d pixels (display %dx%d points at %gx, top inset %d)\n",
+                 g_desktop_w, g_desktop_h, m->w, m->h, double(d), inset);
     if (m->refresh_rate > 0) g_desktop_hz = int(std::lround(m->refresh_rate));
   }
   // Test hook: <ID>_DESKTOP=WxH (pixels) is the desktop the game sees, so
@@ -1460,6 +1477,34 @@ HLE("user32.dll", RegisterClassExA, 1) {
   return RegisterWndClass(wc + 4);
 }
 
+// GetClassInfoA(hinstance, name, WNDCLASSA*): what was registered (icons,
+// cursor, brush and menu are not kept, so they read back as 0). Returns
+// the class atom, or 0 and ERROR_CLASS_DOES_NOT_EXIST.
+HLE("user32.dll", GetClassInfoA, 3) {
+  EnsureSystemClasses();
+  uint32_t name = Arg(c, 1), wc = Arg(c, 2);
+  std::lock_guard<std::recursive_mutex> l(g_mu);
+  const WndClass* k = nullptr;
+  if (name < 0x10000) {
+    for (auto& [n, cls] : g_classes)
+      if (cls.atom == name) k = &cls;
+  } else {
+    auto it = g_classes.find(ClassKey(name));
+    if (it != g_classes.end()) k = &it->second;
+  }
+  if (!k) {
+    SetLastError(1411);  // ERROR_CLASS_DOES_NOT_EXIST
+    return 0;
+  }
+  std::memset(GPtr(wc), 0, 40);
+  Wr32(wc + 0, k->style);
+  Wr32(wc + 4, k->wndproc);
+  Wr32(wc + 12, k->wnd_extra);
+  Wr32(wc + 16, Arg(c, 0));
+  Wr32(wc + 36, name);
+  return k->atom;
+}
+
 HLE("user32.dll", UnregisterClassA, 2) {
   std::string n = ClassKey(Arg(c, 0));
   std::lock_guard<std::recursive_mutex> l(g_mu);
@@ -1922,6 +1967,78 @@ HLE("user32.dll", OffsetRect, 3) {
   return 1;
 }
 
+// The rest of the RECT helpers. A rect is {left, top, right, bottom},
+// signed; it is empty when right <= left or bottom <= top.
+namespace {
+struct Rc {
+  int32_t l, t, r, b;
+  bool Empty() const { return r <= l || b <= t; }
+};
+Rc ReadRc(uint32_t p) {
+  return {int32_t(Rd32(p)), int32_t(Rd32(p + 4)), int32_t(Rd32(p + 8)), int32_t(Rd32(p + 12))};
+}
+void WriteRc(uint32_t p, const Rc& r) {
+  Wr32(p + 0, uint32_t(r.l));
+  Wr32(p + 4, uint32_t(r.t));
+  Wr32(p + 8, uint32_t(r.r));
+  Wr32(p + 12, uint32_t(r.b));
+}
+}  // namespace
+
+HLE("user32.dll", SetRect, 5) {
+  if (!Arg(c, 0)) return 0;
+  WriteRc(Arg(c, 0), {int32_t(Arg(c, 1)), int32_t(Arg(c, 2)), int32_t(Arg(c, 3)),
+                      int32_t(Arg(c, 4))});
+  return 1;
+}
+
+HLE("user32.dll", InflateRect, 3) {
+  if (!Arg(c, 0)) return 0;
+  Rc r = ReadRc(Arg(c, 0));
+  int32_t dx = int32_t(Arg(c, 1)), dy = int32_t(Arg(c, 2));
+  WriteRc(Arg(c, 0), {r.l - dx, r.t - dy, r.r + dx, r.b + dy});
+  return 1;
+}
+
+HLE("user32.dll", IsRectEmpty, 1) { return !Arg(c, 0) || ReadRc(Arg(c, 0)).Empty(); }
+
+// PtInRect(rect, POINT by value): left and top inside, right and bottom out.
+HLE("user32.dll", PtInRect, 3) {
+  if (!Arg(c, 0)) return 0;
+  Rc r = ReadRc(Arg(c, 0));
+  int32_t x = int32_t(Arg(c, 1)), y = int32_t(Arg(c, 2));
+  return x >= r.l && x < r.r && y >= r.t && y < r.b;
+}
+
+// IntersectRect(dst, a, b): an empty result is stored as all zeros.
+HLE("user32.dll", IntersectRect, 3) {
+  if (!Arg(c, 0) || !Arg(c, 1) || !Arg(c, 2)) return 0;
+  Rc a = ReadRc(Arg(c, 1)), b = ReadRc(Arg(c, 2));
+  Rc d{std::max(a.l, b.l), std::max(a.t, b.t), std::min(a.r, b.r), std::min(a.b, b.b)};
+  if (a.Empty() || b.Empty() || d.Empty()) {
+    WriteRc(Arg(c, 0), {0, 0, 0, 0});
+    return 0;
+  }
+  WriteRc(Arg(c, 0), d);
+  return 1;
+}
+
+// UnionRect(dst, a, b): an empty source is ignored; both empty gives zeros.
+HLE("user32.dll", UnionRect, 3) {
+  if (!Arg(c, 0) || !Arg(c, 1) || !Arg(c, 2)) return 0;
+  Rc a = ReadRc(Arg(c, 1)), b = ReadRc(Arg(c, 2));
+  Rc d;
+  if (a.Empty() && b.Empty()) {
+    WriteRc(Arg(c, 0), {0, 0, 0, 0});
+    return 0;
+  }
+  if (a.Empty()) d = b;
+  else if (b.Empty()) d = a;
+  else d = {std::min(a.l, b.l), std::min(a.t, b.t), std::max(a.r, b.r), std::max(a.b, b.b)};
+  WriteRc(Arg(c, 0), d);
+  return 1;
+}
+
 HLE("user32.dll", IsZoomed, 1) {
   std::lock_guard<std::recursive_mutex> l(g_mu);
   Window* w = Win(Arg(c, 0));
@@ -2046,6 +2163,29 @@ HLE("user32.dll", FindWindowA, 2) {
   return 0;
 }
 
+// FindWindowExA(parent, child after, class, title): the children of
+// `parent` (top-level windows when it is 0 or HWND_MESSAGE), in creation
+// order, starting after `child after`. A class given as an atom matches
+// nothing (class atoms are not kept).
+HLE("user32.dll", FindWindowExA, 4) {
+  uint32_t parent = Arg(c, 0), after = Arg(c, 1), pcls = Arg(c, 2), ptitle = Arg(c, 3);
+  if (pcls && pcls < 0x10000) return 0;
+  std::string cls = pcls ? Lower(GStr(pcls)) : "";
+  std::string title = ptitle ? GStr(ptitle) : "";
+  bool top = parent == 0 || parent == 0xFFFFFFFD;
+  std::lock_guard<std::recursive_mutex> l(g_mu);
+  auto it = after ? g_windows.upper_bound(after) : g_windows.begin();
+  for (; it != g_windows.end(); ++it) {
+    const Window& w = it->second;
+    if (w.destroyed) continue;
+    if (top ? (w.style & WS_CHILD) != 0 : w.parent != parent) continue;
+    if (pcls && w.cls != cls) continue;
+    if (ptitle && w.title != title) continue;
+    return it->first;
+  }
+  return 0;
+}
+
 HLE("user32.dll", SetWindowTextA, 2) {
   std::string t = GStr(Arg(c, 1));
   SDL_Window* s = nullptr;
@@ -2057,6 +2197,23 @@ HLE("user32.dll", SetWindowTextA, 2) {
     s = w->sdl;
   }
   if (s) SDL_SetWindowTitle(s, AnsiToUtf8(t).c_str());
+  return 1;
+}
+
+// SetWindowTextW: the title is kept in the ANSI code page for the A
+// functions; the host window gets the full Unicode text.
+HLE("user32.dll", SetWindowTextW, 2) {
+  std::u16string wt = Arg(c, 1) ? GWStr(Arg(c, 1)) : std::u16string();
+  SDL_Window* s = nullptr;
+  {
+    std::lock_guard<std::recursive_mutex> l(g_mu);
+    Window* w = Win(Arg(c, 0));
+    if (!w) return 0;
+    w->title = Narrow(wt);
+    s = w->sdl;
+  }
+  bool bad;
+  if (s) SDL_SetWindowTitle(s, Utf16ToUtf8(wt.data(), wt.size(), &bad).c_str());
   return 1;
 }
 
@@ -3695,6 +3852,74 @@ HLE("user32.dll", EnumDisplaySettingsA, 3) {
   PutDevMode(dm, modes[idx]);
   return 1;
 }
+
+// ---- monitors -----------------------------------------------------------------
+// One monitor, the primary, covering the screen the game sees (the
+// virtual display mode); its work area is all of it (no taskbar).
+
+constexpr uint32_t kPrimaryMonitor = 0x00010001;  // the HMONITOR
+
+HLE("user32.dll", SetProcessDPIAware, 0) { return 1; }
+
+// EnumDisplayMonitors(hdc, clip, proc, data): proc(hmonitor, hdc, &rect,
+// data) for the one monitor; stops early if it returns FALSE.
+HLE("user32.dll", EnumDisplayMonitors, 4) {
+  EnsureSdlVideo();
+  gaddr rc = HeapAllocProcess(16, true);
+  Wr32(rc + 8, uint32_t(g_display_w));
+  Wr32(rc + 12, uint32_t(g_display_h));
+  CallGuest(c, Arg(c, 2), {kPrimaryMonitor, Arg(c, 0), rc, Arg(c, 3)});
+  HeapFreeProcess(rc);
+  return 1;
+}
+
+// GetMonitorInfoA(hmonitor, MONITORINFO(EXA)*): cbSize 40, or 72 with the
+// device name.
+HLE("user32.dll", GetMonitorInfoA, 2) {
+  EnsureSdlVideo();
+  gaddr mi = Arg(c, 1);
+  uint32_t cb = Rd32(mi);
+  if (Arg(c, 0) != kPrimaryMonitor || (cb != 40 && cb != 72)) return 0;
+  for (gaddr r : {mi + 4, mi + 20}) {
+    Wr32(r + 0, 0);
+    Wr32(r + 4, 0);
+    Wr32(r + 8, uint32_t(g_display_w));
+    Wr32(r + 12, uint32_t(g_display_h));
+  }
+  Wr32(mi + 36, 1);  // MONITORINFOF_PRIMARY
+  if (cb == 72) {
+    std::memset(GPtr(mi + 40), 0, 32);
+    PutStr(mi + 40, "\\\\.\\DISPLAY1");
+  }
+  return 1;
+}
+
+// EnumDisplayDevicesA(device, index, DISPLAY_DEVICEA*, flags): with no
+// device, the adapters (one, "\\.\DISPLAY1"); with an adapter's name,
+// its monitors (one). DISPLAY_DEVICEA: cb, DeviceName[32],
+// DeviceString[128], StateFlags, DeviceID[128], DeviceKey[128].
+HLE("user32.dll", EnumDisplayDevicesA, 4) {
+  std::string dev = Arg(c, 0) ? GStr(Arg(c, 0)) : "";
+  gaddr dd = Arg(c, 2);
+  if (Arg(c, 1) != 0 || (!dev.empty() && Lower(dev) != "\\\\.\\display1")) return 0;
+  uint32_t cb = Rd32(dd);
+  if (cb < 168) return 0;
+  std::memset(GPtr(dd + 4), 0, std::min<uint32_t>(cb, 424) - 4);
+  if (dev.empty()) {
+    PutStr(dd + 4, "\\\\.\\DISPLAY1");
+    PutStr(dd + 36, "Display Adapter");
+    Wr32(dd + 164, 0x1 | 0x4);  // ATTACHED_TO_DESKTOP | PRIMARY_DEVICE
+  } else {
+    PutStr(dd + 4, "\\\\.\\DISPLAY1\\Monitor0");
+    PutStr(dd + 36, "Generic PnP Monitor");
+    Wr32(dd + 164, 0x1 | 0x2);  // DISPLAY_DEVICE_ACTIVE | ATTACHED
+  }
+  return 1;
+}
+
+// DwmSetWindowAttribute(hwnd, attribute, data, size): frame colours,
+// rounded corners, dark title bars; nothing the host window takes.
+HLE("dwmapi.dll", DwmSetWindowAttribute, 4) { return 0; }  // S_OK
 
 // Display modes are virtual: the host's mode never changes here. A mode
 // the game switches to becomes the screen it sees (GetSystemMetrics,

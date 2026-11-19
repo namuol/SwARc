@@ -41,6 +41,7 @@ add_library(recomp_win32 SHARED
   src/win32/present_overlay.cpp
   src/win32/shell_net.cpp
   src/win32/win9x_misc.cpp
+  src/win32/wininet.cpp
   src/win32/ws2_32.cpp
   src/win32/com.cpp)
 target_include_directories(recomp_win32 PUBLIC src)

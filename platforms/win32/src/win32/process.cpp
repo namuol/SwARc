@@ -3,6 +3,8 @@
 
 #include "win32/process.h"
 
+#include <sys/resource.h>
+
 #include <algorithm>
 #include <cstring>
 #include <mutex>
@@ -174,8 +176,30 @@ void MapModule(Module& m) {
   m.stale = false;
 }
 
+// Windows has no small cap on open handles, and games keep their data
+// files open for the whole session (hundreds of them). A Unix process
+// starts with the soft limit it inherits: on macOS 256 for an app started
+// from Finder or `open`, where running out fails opens with EMFILE and the
+// game reads missing data. Raise the soft limit to the hard one (or, where
+// the kernel refuses that, as macOS does above its per-process maximum, to
+// OPEN_MAX).
+static void RaiseOpenFileLimit() {
+  struct rlimit rl;
+  if (getrlimit(RLIMIT_NOFILE, &rl) != 0) return;
+  const rlim_t before = rl.rlim_cur;
+  for (rlim_t want : {rl.rlim_max, rlim_t(10240)}) {
+    if (want <= before) break;
+    struct rlimit r = rl;
+    r.rlim_cur = want;
+    if (setrlimit(RLIMIT_NOFILE, &r) == 0) return;
+  }
+  if (before < 4096)
+    WarnF("open files limited to %llu (raising it failed)\n", (unsigned long long)before);
+}
+
 int RunProcess(const win32::GameConfig& game, const std::string& exe_path,
                const std::string& game_dir, const std::string& game_args) {
+  RaiseOpenFileLimit();
   g_win32 = new Win32Process;
   Win32Process& w = *g_win32;
   w.game = game;

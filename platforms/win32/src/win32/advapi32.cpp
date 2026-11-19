@@ -300,7 +300,8 @@ HLE("advapi32.dll", RegDeleteValueA, 2) {
   return kErrorSuccess;
 }
 
-HLE("advapi32.dll", GetUserNameA, 2) {
+// GetUserNameA/W(buf, size*): the size is in characters, with the null.
+uint32_t UserName(Ctx& c, bool wide) {
   std::string n = "Player";
   uint32_t buf = Arg(c, 0), psize = Arg(c, 1);
   if (Rd32(psize) < n.size() + 1) {
@@ -308,15 +309,36 @@ HLE("advapi32.dll", GetUserNameA, 2) {
     SetLastError(kErrorInsufficientBuffer);
     return 0;
   }
-  PutStr(buf, n);
+  if (wide) PutWStr(buf, n);
+  else PutStr(buf, n);
   Wr32(psize, uint32_t(n.size() + 1));
   return 1;
 }
+HLE("advapi32.dll", GetUserNameA, 2) { return UserName(c, false); }
+HLE("advapi32.dll", GetUserNameW, 2) { return UserName(c, true); }
 
 // ---- ole32 ------------------------------------------------------------------
 
+// SystemFunction036 is RtlGenRandom(buf, len): BOOLEAN, len random bytes
+// (the CRT's rand_s). From the host's random device.
+HLE("advapi32.dll", SystemFunction036, 2) {
+  static std::mutex mu;
+  static std::random_device rd;
+  std::lock_guard<std::mutex> l(mu);
+  gaddr buf = Arg(c, 0);
+  for (uint32_t i = 0, n = Arg(c, 1); i < n; i += 4) {
+    uint32_t r = rd();
+    for (uint32_t k = 0; k < 4 && i + k < n; k++) Wr8(buf + i + k, uint8_t(r >> (8 * k)));
+  }
+  return 1;
+}
+
 HLE("ole32.dll", CoInitialize, 1) { return 0; }  // S_OK
 HLE("ole32.dll", CoInitializeEx, 2) { return 0; }
+// CoInitializeSecurity(desc, cAuth, auth, reserved, authn level, imp level,
+// auth list, caps, reserved): process-wide COM security for remote calls,
+// which never happen here.
+HLE("ole32.dll", CoInitializeSecurity, 9) { return 0; }  // S_OK
 HLE("ole32.dll", CoUninitialize, 0) { return 0; }
 
 // The COM task allocator: the process heap (a NULL free is a no-op).
@@ -509,6 +531,47 @@ HLE_NAMED("oleaut32.dll", "#6", SysFreeString, 1) {
   com::FreeBstr(Arg(c, 0));
   return 0;
 }
+
+// VARIANT (16 bytes): vt (u16) at 0, the value at 8.
+HLE_NAMED("oleaut32.dll", "#8", VariantInit, 1) {  // void
+  std::memset(GPtr(Arg(c, 0)), 0, 8);  // vt = VT_EMPTY, reserved words
+  return 0;
+}
+
+// VariantClear(v): frees what the variant owns (a BSTR, a reference on an
+// interface) and leaves it VT_EMPTY. By-reference values own nothing.
+HLE_NAMED("oleaut32.dll", "#9", VariantClear, 1) {
+  gaddr v = Arg(c, 0);
+  const uint16_t vt = Rd16(v);
+  if (!(vt & 0x4000)) {  // not VT_BYREF
+    switch (vt) {
+      case 8:  // VT_BSTR
+        com::FreeBstr(Rd32(v + 8));
+        break;
+      case 9:    // VT_DISPATCH
+      case 13: {  // VT_UNKNOWN: IUnknown::Release
+        if (gaddr p = Rd32(v + 8)) CallGuest(c, Rd32(Rd32(p) + 8), {p});
+        break;
+      }
+      default:
+        if (vt & 0x2000) {  // VT_ARRAY
+          WarnF("VariantClear: SAFEARRAY variant (vt %X) not freed\n", vt);
+          return 0x80020008u;  // DISP_E_BADVARTYPE
+        }
+        break;  // scalars own nothing
+    }
+  }
+  Wr16(v, 0);
+  return 0;  // S_OK
+}
+
+// Error objects (IErrorInfo) are never set here: GetErrorInfo has none to
+// return (S_FALSE), SetErrorInfo keeps nothing.
+HLE_NAMED("oleaut32.dll", "#200", GetErrorInfo, 2) {
+  if (Arg(c, 1)) Wr32(Arg(c, 1), 0);
+  return 1;  // S_FALSE
+}
+HLE_NAMED("oleaut32.dll", "#201", SetErrorInfo, 2) { return 0; }
 
 }  // namespace
 }  // namespace recomp::hle

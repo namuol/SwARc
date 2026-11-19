@@ -19,8 +19,10 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <map>
 #include <mutex>
+#include <thread>
 #include <set>
 #include <typeinfo>
 #include <vector>
@@ -275,6 +277,16 @@ uint64_t CreateEvent(const Ctx& c, bool wide) {
 HLE64("kernel32.dll", CreateEventA, 4) { return CreateEvent(c, false); }
 HLE64("kernel32.dll", CreateEventW, 4) { return CreateEvent(c, true); }
 
+// CreateEventExW(attrs, name, flags, access): CREATE_EVENT_MANUAL_RESET (1),
+// CREATE_EVENT_INITIAL_SET (2).
+HLE("kernel32.dll", CreateEventExW, 4) {
+  uint32_t flags = uint32_t(Arg(c, 2));
+  bool manual = flags & 1, initial = flags & 2;
+  return HandleRet(CreateNamed(NameOf(Arg(c, 1), true), [&] {
+    return std::make_shared<EventObject>(manual, initial);
+  }));
+}
+
 HLE64("kernel32.dll", SetEvent, 1) {
   GuestSyncPoint sync;
   return SignalEventHandle(uint32_t(Arg(c, 0)), false) ? 1 : 0;
@@ -354,6 +366,9 @@ uint64_t CreateSemaphore(const Ctx& c, bool wide) {
 HLE64("kernel32.dll", CreateSemaphoreA, 4) { return CreateSemaphore(c, false); }
 HLE64("kernel32.dll", CreateSemaphoreW, 4) { return CreateSemaphore(c, true); }
 
+// CreateSemaphoreExW(attrs, initial, maximum, name, flags, access).
+HLE("kernel32.dll", CreateSemaphoreExW, 6) { return CreateSemaphore(c, true); }
+
 HLE64("kernel32.dll", ReleaseSemaphore, 3) {
   GuestSyncPoint sync;
   auto s = std::dynamic_pointer_cast<SemaphoreObject>(GetHandle(uint32_t(Arg(c, 0))));
@@ -405,6 +420,54 @@ HLE64("kernel32.dll", WaitForMultipleObjects, 4) {
     objs.push_back(w);
   }
   return WaitObjects(objs, Arg(c, 2) != 0, Arg(c, 3));
+}
+
+// ---- asynchronous procedure calls --------------------------------------------
+// QueueUserAPC queues fn(data) on a thread; the thread runs its queue in an
+// alertable wait (SleepEx with alertable set), which then returns
+// WAIT_IO_COMPLETION. Queues are per thread id, oldest first.
+
+std::mutex g_apc_mu;
+std::condition_variable g_apc_cv;
+std::map<uint32_t, std::deque<std::pair<gaddr, uint32_t>>> g_apcs;
+
+// QueueUserAPC(fn, thread, data)
+HLE("kernel32.dll", QueueUserAPC, 3) {
+  GuestSyncPoint sync;
+  auto t = std::dynamic_pointer_cast<ThreadObject>(GetHandle(uint32_t(Arg(c, 1))));
+  if (!t || !t->thread) {
+    SetLastError(kErrorInvalidHandle);
+    return 0;
+  }
+  {
+    std::lock_guard<std::mutex> l(g_apc_mu);
+    g_apcs[t->thread->tid].emplace_back(gaddr(Arg(c, 0)), uint32_t(Arg(c, 2)));
+  }
+  g_apc_cv.notify_all();
+  return 1;
+}
+
+// SleepEx(ms, alertable). Alertable: returns early, after running them, if
+// APCs are or get queued for this thread (WAIT_IO_COMPLETION), else 0.
+HLE("kernel32.dll", SleepEx, 2) {
+  GuestSyncPoint sync;
+  const uint32_t ms = uint32_t(Arg(c, 0));
+  if (!Arg(c, 1)) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+    return 0;
+  }
+  const uint32_t tid = CurrentThread()->tid;
+  std::deque<std::pair<gaddr, uint32_t>> run;
+  {
+    std::unique_lock<std::mutex> l(g_apc_mu);
+    auto pred = [&] { return !g_apcs[tid].empty(); };
+    if (ms == kInfinite) g_apc_cv.wait(l, pred);
+    else g_apc_cv.wait_for(l, std::chrono::milliseconds(ms), pred);
+    run.swap(g_apcs[tid]);
+  }
+  if (run.empty()) return 0;
+  for (auto& [fn, data] : run) CallGuest(c, fn, {data});
+  return 0xC0;  // WAIT_IO_COMPLETION
 }
 
 // ---- slim reader/writer locks and condition variables ------------------------
@@ -464,6 +527,15 @@ HLE64("kernel32.dll", AcquireSRWLockShared, 1) {
   s.readers++;
   return 0;
 }
+HLE("kernel32.dll", TryAcquireSRWLockShared, 1) {
+  GuestSyncPoint sync;
+  SrwLock& s = ObjectAt<SrwLock>(Arg(c, 0));
+  std::lock_guard<std::mutex> l(s.m);
+  if (s.writer) return 0;
+  s.readers++;
+  return 1;
+}
+
 HLE64("kernel32.dll", ReleaseSRWLockExclusive, 1) {
   GuestSyncPoint sync;
   SrwLock& s = ObjectAt<SrwLock>(Arg(c, 0));
@@ -520,6 +592,73 @@ HLE64("kernel32.dll", SleepConditionVariableCS, 3) {
     return 0;
   }
   return 1;
+}
+
+// SleepConditionVariableSRW(cv, lock, ms, flags): as the CS form, with the
+// SRW lock released and retaken in the mode the flags give
+// (CONDITION_VARIABLE_LOCKMODE_SHARED = 1, else exclusive).
+HLE("kernel32.dll", SleepConditionVariableSRW, 4) {
+  GuestSyncPoint sync;
+  CondVar& v = ObjectAt<CondVar>(Arg(c, 0));
+  SrwLock& s = ObjectAt<SrwLock>(Arg(c, 1));
+  uint32_t ms = uint32_t(Arg(c, 2));
+  bool shared = Arg(c, 3) & 1;
+  bool woken;
+  {
+    std::unique_lock<std::mutex> l(v.m);
+    v.waiting++;
+    {
+      std::lock_guard<std::mutex> ls(s.m);
+      if (shared) s.readers--;
+      else s.writer = false;
+    }
+    s.cv.notify_all();
+    auto pred = [&] { return v.released > 0; };
+    if (ms == kInfinite) {
+      v.cv.wait(l, pred);
+      woken = true;
+    } else {
+      woken = v.cv.wait_for(l, std::chrono::milliseconds(ms), pred);
+    }
+    v.waiting--;
+    if (woken) v.released--;
+  }
+  {
+    std::unique_lock<std::mutex> ls(s.m);
+    if (shared) {
+      s.cv.wait(ls, [&] { return !s.writer; });
+      s.readers++;
+    } else {
+      s.cv.wait(ls, [&] { return !s.writer && !s.readers; });
+      s.writer = true;
+    }
+  }
+  if (!woken) {
+    SetLastError(kErrorTimeout);
+    return 0;
+  }
+  return 1;
+}
+
+// InitOnceExecuteOnce(once, fn, param, context): runs
+// BOOL fn(once, param, context) once. The INIT_ONCE word is 0 before, 1
+// while a thread runs fn (others wait), 2 after success; a failed fn puts
+// it back to 0 so a later call retries, as on Windows.
+HLE("kernel32.dll", InitOnceExecuteOnce, 4) {
+  GuestSyncPoint sync;
+  gaddr once = Arg(c, 0);
+  auto* word = reinterpret_cast<uint32_t*>(GPtr(once));
+  for (;;) {
+    uint32_t expect = 0;
+    if (__atomic_compare_exchange_n(word, &expect, 1, false, __ATOMIC_SEQ_CST,
+                                    __ATOMIC_SEQ_CST)) {
+      uint32_t ok = uint32_t(CallGuest(c, Arg(c, 1), {once, Arg(c, 2), Arg(c, 3)}));
+      __atomic_store_n(word, ok ? 2u : 0u, __ATOMIC_SEQ_CST);
+      return ok ? 1 : 0;
+    }
+    if (expect == 2) return 1;
+    std::this_thread::yield();
+  }
 }
 
 HLE64("kernel32.dll", WakeConditionVariable, 1) {
@@ -631,7 +770,10 @@ HLE("kernel32.dll", ResumeThread, 1) {
 }
 
 HLE("kernel32.dll", SuspendThread, 1) {
-  WarnF("SuspendThread on a running thread is not supported; ignored\n");
+  static std::once_flag once;  // games may call it every frame
+  std::call_once(once, [] {
+    WarnF("SuspendThread on a running thread is not supported; ignored (warned once)\n");
+  });
   return 0;
 }
 

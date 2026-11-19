@@ -47,6 +47,7 @@ struct FileObject : KObject {
     if (fd >= 0) close(fd);
   }
   int fd = -1;
+  std::string guest;  // the absolute guest path it was opened by
 };
 
 struct FindObject : KObject {
@@ -291,6 +292,29 @@ HLE64("kernel32.dll", GetStdHandle, 1) {
 
 HLE("kernel32.dll", SetStdHandle, 2) { return 1; }
 
+// LockFileEx(h, flags, reserved, len lo, len hi, overlapped) and
+// UnlockFileEx(h, reserved, len lo, len hi, overlapped): byte-range locks
+// guard against other processes, and there are none, so every lock is
+// granted at once (and an OVERLAPPED caller sees it complete).
+bool IsFileHandle(gaddr h) {
+  auto o = GetHandle(h);
+  return o && o->type == KObject::Type::File;
+}
+HLE("kernel32.dll", LockFileEx, 6) {
+  if (!IsFileHandle(Arg(c, 0))) {
+    SetLastError(kErrorInvalidHandle);
+    return 0;
+  }
+  return 1;
+}
+HLE("kernel32.dll", UnlockFileEx, 5) {
+  if (!IsFileHandle(Arg(c, 0))) {
+    SetLastError(kErrorInvalidHandle);
+    return 0;
+  }
+  return 1;
+}
+
 HLE("kernel32.dll", GetFileType, 1) {
   auto o = GetHandle(Arg(c, 0));
   if (!o || (o->type != KObject::Type::File && o->type != KObject::Type::StdIo)) {
@@ -357,9 +381,25 @@ uint32_t CreateFile(Ctx& c, const std::string& gpath) {
     case 4: flags |= O_CREAT; break;                  // OPEN_ALWAYS
     case 5: flags |= O_TRUNC; break;                  // TRUNCATE_EXISTING
   }
+  // A directory opens only with FILE_FLAG_BACKUP_SEMANTICS (0x02000000),
+  // and then only for queries (attributes, its final path); data access
+  // to it fails as on Windows.
   if (exists && S_ISDIR(st.st_mode)) {
-    SetLastError(kErrorAccessDenied);
-    return kInvalidHandle;
+    if (!(uint32_t(Arg(c, 5)) & 0x02000000) || write) {
+      SetLastError(kErrorAccessDenied);
+      return kInvalidHandle;
+    }
+    int dfd = open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd < 0) {
+      SetLastError(ErrnoToWin(errno));
+      return kInvalidHandle;
+    }
+    RECOMP_TRACE("  CreateFile(%s) -> directory %s\n", gpath.c_str(), path.c_str());
+    auto d = std::make_shared<FileObject>();
+    d->fd = dfd;
+    d->guest = AbsGuest(gpath);
+    SetLastError(0);
+    return NewHandle(d);
   }
   if (flags & O_CREAT) {
     // Make sure the parent exists in the per-user tree.
@@ -375,11 +415,69 @@ uint32_t CreateFile(Ctx& c, const std::string& gpath) {
   RECOMP_TRACE("  CreateFile(%s) -> %s\n", gpath.c_str(), path.c_str());
   auto f = std::make_shared<FileObject>();
   f->fd = fd;
+  f->guest = AbsGuest(gpath);
   SetLastError(exists && (disp == 2 || disp == 4) ? kErrorAlreadyExists : 0);
   return NewHandle(f);
 }
 
 HLE64("kernel32.dll", CreateFileA, 7) { return HandleRet(CreateFile(c, GStr(Arg(c, 0)))); }
+
+// OpenFile(path, OFSTRUCT*, style), the 16-bit-era open: OF_READ (0),
+// OF_WRITE (1), OF_READWRITE (2), with OF_CREATE (0x1000, create or
+// truncate), OF_EXIST (0x4000: open, close, report), OF_PARSE (0x100: the
+// full path only), OF_DELETE (0x200). OFSTRUCT: cBytes, fFixedDisk,
+// nErrCode (u16), 4 reserved bytes, szPathName[128]. The handle is a file
+// handle (HFILE_ERROR, -1, on failure).
+HLE("kernel32.dll", OpenFile, 3) {
+  std::string g = AbsGuest(GStr(Arg(c, 0)));
+  uint32_t ofs = Arg(c, 1), style = Arg(c, 2);
+  std::memset(GPtr(ofs), 0, 136);
+  Wr8(ofs + 0, 136);
+  Wr8(ofs + 1, 1);
+  PutStr(ofs + 8, g.substr(0, 127));
+  auto fail = [&](uint32_t err) {
+    Wr16(ofs + 2, uint16_t(err));
+    SetLastError(err);
+    return 0xFFFFFFFFu;
+  };
+  if (style & 0x100) return 0;  // OF_PARSE
+  struct stat st;
+  if (style & 0x200) {  // OF_DELETE
+    std::string host = HostPath(g, PathAccess::kWrite);
+    return unlink(host.c_str()) == 0 ? 1u : fail(ErrnoToWin(errno));
+  }
+  const uint32_t mode = style & 3;
+  const bool create = style & 0x1000, write = create || mode != 0;
+  std::string host = HostPath(g, !write ? PathAccess::kRead
+                                        : create ? PathAccess::kWrite : PathAccess::kUpdate);
+  if (!create && (stat(host.c_str(), &st) != 0 || !S_ISREG(st.st_mode))) return fail(2);
+  int flags = mode == 2 ? O_RDWR : mode == 1 || create ? O_WRONLY : O_RDONLY;
+  if (create) {
+    flags |= O_CREAT | O_TRUNC;
+    if (mode == 2) flags = (flags & ~O_WRONLY) | O_RDWR;
+    MakeDirs(host.substr(0, host.find_last_of('/')));
+  }
+  int fd = open(host.c_str(), flags | O_CLOEXEC, 0644);
+  if (fd < 0) return fail(ErrnoToWin(errno));
+  if (style & 0x4000) {  // OF_EXIST
+    close(fd);
+    return 1;
+  }
+  auto f = std::make_shared<FileObject>();
+  f->fd = fd;
+  f->guest = g;
+  return NewHandle(f);
+}
+
+// _lclose(hfile): CloseHandle, with HFILE_ERROR (-1) for failure.
+HLE("kernel32.dll", _lclose, 1) {
+  const uint32_t h = Arg(c, 0);
+  if (!CloseHandleValue(h)) {
+    SetLastError(kErrorInvalidHandle);
+    return 0xFFFFFFFF;
+  }
+  return 0;
+}
 HLE64("kernel32.dll", CreateFileW, 7) { return HandleRet(CreateFile(c, WidePath(Arg(c, 0)))); }
 
 int FdOf(uint64_t h) {
@@ -581,6 +679,81 @@ HLE64("kernel32.dll", GetFileAttributesExW, 3) {
 
 // GetFileInformationByHandle(h, BY_HANDLE_FILE_INFORMATION*). The volume
 // serial is GetVolumeInformation's; the file index the host inode.
+// GetFileInformationByHandleEx(h, class, buf, size): the classes the C++
+// library's <filesystem> asks for.
+HLE("kernel32.dll", GetFileInformationByHandleEx, 4) {
+  auto o = GetHandle(Arg(c, 0));
+  struct stat st;
+  if (!o || o->type != KObject::Type::File || fstat(FileFd(o.get()), &st) != 0) {
+    SetLastError(kErrorInvalidHandle);
+    return 0;
+  }
+  const std::string& g = static_cast<FileObject*>(o.get())->guest;
+  std::string name = g.substr(g.find_last_of('\\') + 1);
+  uint32_t cls = Arg(c, 1), size = Arg(c, 3);
+  gaddr d = Arg(c, 2);
+  auto need = [&](uint32_t n) {
+    if (size >= n) return true;
+    SetLastError(24);  // ERROR_BAD_LENGTH
+    return false;
+  };
+  switch (cls) {
+    case 0:  // FileBasicInfo: creation, access, write, change times; attributes
+      if (!need(40)) return 0;
+      PutFileTime(d + 0, platform::StatModifyTime(st));
+      PutFileTime(d + 8, platform::StatAccessTime(st));
+      PutFileTime(d + 16, platform::StatModifyTime(st));
+      PutFileTime(d + 24, platform::StatModifyTime(st));
+      Wr32(d + 32, AttributesOf(st, name));
+      Wr32(d + 36, 0);
+      return 1;
+    case 1:  // FileStandardInfo: allocation size, end of file, links, flags
+      if (!need(24)) return 0;
+      Wr64(d + 0, S_ISDIR(st.st_mode) ? 0 : (uint64_t(st.st_size) + 4095) & ~uint64_t(4095));
+      Wr64(d + 8, S_ISDIR(st.st_mode) ? 0 : uint64_t(st.st_size));
+      Wr32(d + 16, uint32_t(st.st_nlink));
+      Wr8(d + 20, 0);                           // DeletePending
+      Wr8(d + 21, S_ISDIR(st.st_mode) ? 1 : 0); // Directory
+      Wr16(d + 22, 0);
+      return 1;
+    case 9:  // FileAttributeTagInfo: attributes, reparse tag
+      if (!need(8)) return 0;
+      Wr32(d + 0, AttributesOf(st, name));
+      Wr32(d + 4, 0);
+      return 1;
+    case 18:  // FileIdInfo: volume serial, 128-bit file id
+      if (!need(24)) return 0;
+      Wr64(d + 0, kVolumeSerial);
+      Wr64(d + 8, uint64_t(st.st_ino));
+      Wr64(d + 16, 0);
+      return 1;
+    default:
+      WarnF("GetFileInformationByHandleEx: class %u not supported\n", cls);
+      SetLastError(kErrorInvalidParameter);
+      return 0;
+  }
+}
+
+uint32_t CopyOutW(uint32_t buf, uint32_t size, const std::string& s);
+
+// GetFinalPathNameByHandleW(h, buf, cch, flags): the path the handle was
+// opened by (there are no links to resolve in the guest's view). Only
+// VOLUME_NAME_DOS (flags & 6 == 0), as "\\?\C:\...".
+HLE("kernel32.dll", GetFinalPathNameByHandleW, 4) {
+  auto o = GetHandle(Arg(c, 0));
+  if (!o || o->type != KObject::Type::File) {
+    SetLastError(kErrorInvalidHandle);
+    return 0;
+  }
+  if (Arg(c, 3) & 6) {
+    WarnF("GetFinalPathNameByHandleW: flags %X not supported\n", Arg(c, 3));
+    SetLastError(kErrorInvalidParameter);
+    return 0;
+  }
+  std::string p = "\\\\?\\" + static_cast<FileObject*>(o.get())->guest;
+  return CopyOutW(Arg(c, 1), Arg(c, 2), p);
+}
+
 HLE64("kernel32.dll", GetFileInformationByHandle, 2) {
   auto o = GetHandle(Arg(c, 0));
   struct stat st;
@@ -725,6 +898,44 @@ HLE("kernel32.dll", GetFullPathNameA, 4) {
                        : buf + uint32_t(s + 1));
   }
   return r;
+}
+
+// SearchPathA(path, file, extension, cap, buf, &file part): the first
+// directory holding the file, in `path` (';'-separated) or, without one,
+// Windows' order: the program's directory, the current directory, the
+// system and Windows directories. The extension is added only to a name
+// without one. A name with a directory part is only looked up as given.
+HLE("kernel32.dll", SearchPathA, 6) {
+  std::string name = GStr(Arg(c, 1));
+  // The file name after any directory part (npos + 1 is 0: no directory).
+  const std::string base = name.substr(name.find_last_of("\\/") + 1);
+  if (Arg(c, 2) && base.find('.') == std::string::npos) name += GStr(Arg(c, 2));
+  std::vector<std::string> dirs;
+  if (name.find_first_of("\\/") != std::string::npos) {
+    dirs.push_back("");
+  } else if (Arg(c, 0)) {
+    std::string p = GStr(Arg(c, 0));
+    for (size_t a = 0, b; a <= p.size(); a = b + 1) {
+      b = p.find(';', a);
+      if (b == std::string::npos) b = p.size();
+      if (b > a) dirs.push_back(p.substr(a, b - a));
+    }
+  } else {
+    std::string exe = GuestExePath();
+    dirs = {exe.substr(0, exe.find_last_of('\\')), AbsGuest("."), "C:\\WINDOWS\\system32",
+            "C:\\WINDOWS"};
+  }
+  for (const std::string& d : dirs) {
+    std::string g = AbsGuest(d.empty() ? name : d + "\\" + name);
+    struct stat st;
+    if (stat(HostPath(g).c_str(), &st) != 0 || !S_ISREG(st.st_mode)) continue;
+    uint32_t cap = Arg(c, 3), buf = Arg(c, 4), filepart = Arg(c, 5);
+    uint32_t r = CopyOut(buf, cap, g);
+    if (r == g.size() && filepart) Wr32(filepart, buf + uint32_t(g.find_last_of('\\') + 1));
+    return r;
+  }
+  SetLastError(2);  // ERROR_FILE_NOT_FOUND
+  return 0;
 }
 
 HLE("kernel32.dll", GetLongPathNameA, 3) {

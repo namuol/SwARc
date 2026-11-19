@@ -91,15 +91,24 @@ size_t Write(Stream& s, const char* p, size_t n) {
 
 // Successive variadic arguments: 8-byte slots of a guest va_list (floating
 // point ones as doubles).
+// A va_list. x64 guests: every argument takes an 8-byte slot. 32-bit
+// guests (slot4): 4-byte slots, except 64-bit integers and doubles, which
+// take 8 (unaligned: x86 varargs are only 4-byte aligned).
 struct Args {
   gaddr p;
-  uint64_t Next() {
+  bool slot4 = false;
+  uint64_t Next(int bits = 32) {
+    if (slot4 && bits <= 32) {
+      uint32_t v = Rd32(p);
+      p += 4;
+      return v;
+    }
     uint64_t v = Rd64(p);
     p += 8;
     return v;
   }
   double NextD() {
-    uint64_t b = Next();
+    uint64_t b = Next(64);
     double d;
     std::memcpy(&d, &b, 8);
     return d;
@@ -209,7 +218,7 @@ std::string Format(const std::string& fmt, Args a, bool three_digit_exponents) {
         bits = 64;
         i++;
       } else if (ch == 'z' || ch == 't') {
-        bits = 64;
+        bits = a.slot4 ? 32 : 64;  // size_t / ptrdiff_t
         i++;
       } else if (ch == 'w') {
         wide = true;
@@ -222,7 +231,7 @@ std::string Format(const std::string& fmt, Args a, bool three_digit_exponents) {
           bits = 32;
           i += 3;
         } else {
-          bits = 64;  // size_t
+          bits = a.slot4 ? 32 : 64;  // size_t
           i++;
         }
       } else {
@@ -241,14 +250,14 @@ std::string Format(const std::string& fmt, Args a, bool three_digit_exponents) {
         out.push_back('%');
         break;
       case 'd': case 'i': {
-        uint64_t v = a.Next();
+        uint64_t v = a.Next(bits);
         long long s = bits == 64 ? int64_t(v) : bits == 16 ? int16_t(v) : bits == 8 ? int8_t(v)
                                                                              : int32_t(v);
         out += host(spec + "lld", s);
         break;
       }
       case 'u': case 'o': case 'x': case 'X': {
-        uint64_t v = a.Next();
+        uint64_t v = a.Next(bits);
         unsigned long long u = bits == 64 ? v : bits == 16 ? uint16_t(v) : bits == 8 ? uint8_t(v)
                                                                            : uint32_t(v);
         out += host(spec + "ll" + conv, u);
@@ -256,7 +265,9 @@ std::string Format(const std::string& fmt, Args a, bool three_digit_exponents) {
       }
       case 'p': {
         too_long(width);
-        out += Pad(host("%016llX", (unsigned long long)a.Next()), int(width),
+        out += Pad(a.slot4 ? host("%08llX", (unsigned long long)a.Next())
+                           : host("%016llX", (unsigned long long)a.Next(64)),
+                   int(width),
                    flags.find('-') != std::string::npos);
         break;
       }
@@ -355,6 +366,21 @@ HLE64("ucrtbase.dll", __stdio_common_vsprintf, kCdecl) {
   uint64_t opt = Arg(c, 0);
   std::string s = Format(GStr(Arg(c, 3)), Args{Arg(c, 5)}, opt & kThreeDigitExponents);
   return PutFormatted(opt, Arg(c, 1), Arg(c, 2), s);
+}
+
+// msvcrt.dll (the Visual C++ 6 runtime, 32-bit guests): the same
+// formatting with 32-bit varargs, and three-digit exponents as that
+// runtime prints them ("1.0e+000").
+// sprintf(buf, fmt, ...)
+HLE("msvcrt.dll", sprintf, kCdecl) {
+  std::string s = Format(GStr(Arg(c, 1)), Args{c.esp + 4 + 8, true}, true);
+  std::memcpy(GPtr(Arg(c, 0)), s.c_str(), s.size() + 1);
+  return uint32_t(s.size());
+}
+// _vsnprintf(buf, count, fmt, va_list): -1 if it does not fit.
+HLE("msvcrt.dll", _vsnprintf, kCdecl) {
+  std::string s = Format(GStr(Arg(c, 2)), Args{Arg(c, 3), true}, true);
+  return PutFormatted(0, Arg(c, 0), Arg(c, 1), s);
 }
 
 // __stdio_common_vsprintf_s: a buffer too small is an invalid parameter.

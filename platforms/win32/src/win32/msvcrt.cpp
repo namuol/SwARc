@@ -8,6 +8,7 @@
 // macro) would need the real layout, which nothing seen does.
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <map>
@@ -63,6 +64,33 @@ HLE(kDll, strncpy, kCdecl) {
   for (; i < n && Rd8(src + i); i++) Wr8(d + i, Rd8(src + i));
   for (; i < n; i++) Wr8(d + i, 0);
   return d;
+}
+
+HLE(kDll, strrchr, kCdecl) {
+  gaddr s = Arg(c, 0), last = 0;
+  uint8_t ch = uint8_t(Arg(c, 1));
+  for (;; s++) {
+    uint8_t v = Rd8(s);
+    if (v == ch) last = s;
+    if (!v) return last;
+  }
+}
+
+// operator new(size_t) and operator delete(void*), the VC6 runtime's
+// (it returns NULL on failure rather than throwing).
+HLE_NAMED(kDll, "??2@YAPAXI@Z", OperatorNew, kCdecl) {
+  return HeapAllocProcess(Arg(c, 0) ? Arg(c, 0) : 1, false);
+}
+HLE_NAMED(kDll, "??3@YAXPAX@Z", OperatorDelete, kCdecl) {
+  if (Arg(c, 0)) HeapFreeProcess(Arg(c, 0));
+  return 0;
+}
+
+// exit(code): the process ends as with ExitProcess.
+HLE(kDll, exit, kCdecl) {
+  std::fprintf(stderr, "msvcrt exit(%d)\n", int32_t(Arg(c, 0)));
+  std::fflush(nullptr);
+  std::_Exit(int(Arg(c, 0)));
 }
 
 // time_t time(time_t*): 32-bit time_t in this runtime.

@@ -328,6 +328,18 @@ HLE64("kernel32.dll", FreeLibrary, 1) {
   return 1;
 }
 
+// FreeLibraryAndExitThread(module, code): FreeLibrary, then ExitThread
+// (the C runtime's _endthreadex for a thread whose code is in a DLL).
+HLE("kernel32.dll", FreeLibraryAndExitThread, 2) {
+  {
+    std::lock_guard<std::recursive_mutex> l(g_loader_mu);
+    if (Module* m = LoadedDllAt(Arg(c, 0)); m && --m->refs == 0)
+      CallDllMain(c, *m, kDllProcessDetach);
+  }
+  GuestSyncFence();
+  throw GuestThreadExit{uint32_t(Arg(c, 1))};
+}
+
 // DLL_THREAD_ATTACH/DETACH are never sent, so there is nothing to disable.
 HLE64("kernel32.dll", DisableThreadLibraryCalls, 1) { return 1; }
 
@@ -673,6 +685,12 @@ HLE("kernel32.dll", GlobalUnlock, 1) { return 1; }
 HLE("kernel32.dll", GlobalFree, 1) {
   g_process_heap->Free(Arg(c, 0));
   return 0;
+}
+
+// LocalAlloc(flags, size): like GlobalAlloc, LMEM_MOVEABLE handles are plain
+// pointers (LocalLock would be the identity); LMEM_ZEROINIT is 0x40.
+HLE("kernel32.dll", LocalAlloc, 2) {
+  return HeapAllocProcess(Arg(c, 1) ? Arg(c, 1) : 1, Arg(c, 0) & 0x40);
 }
 
 HLE64("kernel32.dll", LocalFree, 1) {
@@ -1033,6 +1051,13 @@ HLE64("kernel32.dll", InitializeCriticalSection, 1) {
   return 0;
 }
 
+// InitializeCriticalSectionEx(cs, spin count, flags): the flags only
+// control debug info.
+HLE("kernel32.dll", InitializeCriticalSectionEx, 3) {
+  InitCs(Arg(c, 0), uint32_t(Arg(c, 1)));
+  return 1;
+}
+
 HLE64("kernel32.dll", InitializeCriticalSectionAndSpinCount, 2) {
   InitCs(Arg(c, 0), uint32_t(Arg(c, 1)));
   return 1;
@@ -1139,6 +1164,14 @@ HLE("kernel32.dll", InterlockedExchange, 2) {
 // ---- time ----------------------------------------------------------------
 
 HLE("kernel32.dll", GetTickCount, 0) { return TickCount(); }
+// ULONGLONG GetTickCount64(): EDX:EAX, milliseconds since start; does not
+// wrap after 49.7 days as GetTickCount does.
+HLE("kernel32.dll", GetTickCount64, 0) {
+  using namespace std::chrono;
+  uint64_t ms = uint64_t(duration_cast<milliseconds>(steady_clock::now() - g_start).count());
+  c.edx = uint32_t(ms >> 32);
+  return uint32_t(ms);
+}
 
 HLE64("kernel32.dll", QueryPerformanceFrequency, 1) {
   Wr64(Arg(c, 0), 10000000);
@@ -1213,6 +1246,14 @@ HLE("winmm.dll", midiInClose, 1) { return 5; }
 
 // A kernel entry on Windows, so a barrier for guests that poll a flag
 // with Sleep in the loop.
+HLE("kernel32.dll", FlushProcessWriteBuffers, 0) {
+  GuestSyncPoint sync;
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+  return 0;
+}
+
+HLE("kernel32.dll", GetCurrentProcessorNumber, 0) { return 0; }
+
 HLE("kernel32.dll", Sleep, 1) {
   GuestSyncPoint sync;
   std::this_thread::sleep_for(std::chrono::milliseconds(Arg(c, 0)));
@@ -1324,15 +1365,23 @@ HLE("kernel32.dll", GetStringTypeA, 5) {
   return 1;
 }
 
-HLE("kernel32.dll", LCMapStringW, 6) {
-  uint32_t flags = Arg(c, 1), src = Arg(c, 2), dst = Arg(c, 4);
-  int32_t n = int32_t(Arg(c, 3)), cap = int32_t(Arg(c, 5));
+uint32_t LcMapW(uint32_t flags, uint32_t src, int32_t n, uint32_t dst, int32_t cap) {
   if (n < 0) n = int32_t(GWStr(src).size() + 1);
   if (!cap) return uint32_t(n);
   if (n > cap) return 0;
   for (int32_t i = 0; i < n; i++)
     Wr16(dst + 2 * i, MapCase(Rd16(src + 2 * i), flags));
   return uint32_t(n);
+}
+
+HLE("kernel32.dll", LCMapStringW, 6) {
+  return LcMapW(Arg(c, 1), Arg(c, 2), int32_t(Arg(c, 3)), Arg(c, 4), int32_t(Arg(c, 5)));
+}
+
+// LCMapStringEx(locale name, flags, src, cch, dst, cap, version, reserved,
+// sort handle): the Vista form of LCMapStringW; every locale is en-US.
+HLE("kernel32.dll", LCMapStringEx, 9) {
+  return LcMapW(Arg(c, 1), Arg(c, 2), int32_t(Arg(c, 3)), Arg(c, 4), int32_t(Arg(c, 5)));
 }
 
 HLE("kernel32.dll", LCMapStringA, 6) {
@@ -1421,6 +1470,14 @@ HLE("kernel32.dll", CompareStringW, 6) {
                                    WideArg(Arg(c, 4), int32_t(Arg(c, 5))), flags));
 }
 
+// CompareStringEx(locale name, flags, s1, cch1, s2, cch2, version,
+// reserved, param): CompareStringW for the one locale.
+HLE("kernel32.dll", CompareStringEx, 9) {
+  uint32_t flags = uint32_t(Arg(c, 1));
+  return uint32_t(2 + CollateUnits(WideArg(Arg(c, 2), int32_t(Arg(c, 3))),
+                                   WideArg(Arg(c, 4), int32_t(Arg(c, 5))), flags));
+}
+
 HLE("kernel32.dll", CompareStringA, 6) {
   uint32_t flags = uint32_t(Arg(c, 1));
   return uint32_t(2 + CollateUnits(AnsiArg(Arg(c, 2), int32_t(Arg(c, 3))),
@@ -1452,39 +1509,82 @@ std::string LocaleString(uint32_t type) {
     case 0x000F: return ",";               // LOCALE_STHOUSAND
     case 0x0010: return "3;0";             // LOCALE_SGROUPING
     case 0x0014: return "$";               // LOCALE_SCURRENCY
-    case 0x0015: return ".";               // LOCALE_SMONDECIMALSEP
-    case 0x0016: return ",";               // LOCALE_SMONTHOUSANDSEP
+    case 0x0015: return "USD";             // LOCALE_SINTLSYMBOL
+    case 0x0016: return ".";               // LOCALE_SMONDECIMALSEP
+    case 0x0017: return ",";               // LOCALE_SMONTHOUSANDSEP
     case 0x0018: return "3;0";
     case 0x0019: return "2";
     case 0x001A: return "2";
     case 0x001B: return "0";
     case 0x001C: return "0";
+    case 0x001F: return "M/d/yyyy";        // LOCALE_SSHORTDATE
+    case 0x0020: return "dddd, MMMM d, yyyy";  // LOCALE_SLONGDATE
+    case 0x0028: return "AM";              // LOCALE_S1159
+    case 0x0029: return "PM";              // LOCALE_S2359
     case 0x0050: return "";                // LOCALE_SPOSITIVESIGN
     case 0x0051: return "-";               // LOCALE_SNEGATIVESIGN
     case 0x0059: return "en";              // LOCALE_SISO639LANGNAME
     case 0x005A: return "US";              // LOCALE_SISO3166CTRYNAME
+    case 0x0052: return "3";               // LOCALE_IPOSSIGNPOSN
+    case 0x0053: return "0";               // LOCALE_INEGSIGNPOSN
+    case 0x0054: return "1";               // LOCALE_IPOSSYMPRECEDES
+    case 0x0055: return "0";               // LOCALE_IPOSSEPBYSPACE
+    case 0x0056: return "1";               // LOCALE_INEGSYMPRECEDES
+    case 0x0057: return "0";               // LOCALE_INEGSEPBYSPACE
     case 0x005C: return "en-US";           // LOCALE_SNAME (Vista and later)
     case 0x1001: return "English";         // LOCALE_SENGLANGUAGE
     case 0x1002: return "United States";   // LOCALE_SENGCOUNTRY
+    case 0x1003: return "h:mm:ss tt";      // LOCALE_STIMEFORMAT
     case 0x1004: return "1252";            // LOCALE_IDEFAULTANSICODEPAGE
-    default: return {};
+    case 0x1009: return "1";               // LOCALE_ICALENDARTYPE (Gregorian)
+    default: break;
   }
+  // LOCALE_SDAYNAME1..7 (0x2A, Monday first), LOCALE_SABBREVDAYNAME1..7
+  // (0x31), LOCALE_SMONTHNAME1..12 (0x38), LOCALE_SABBREVMONTHNAME1..12
+  // (0x44).
+  static const char* const kDays[] = {"Monday", "Tuesday", "Wednesday", "Thursday",
+                                      "Friday", "Saturday", "Sunday"};
+  static const char* const kMonths[] = {"January", "February", "March",     "April",
+                                        "May",     "June",     "July",      "August",
+                                        "September", "October", "November", "December"};
+  uint32_t t = type & 0xFFFF;
+  if (t >= 0x2A && t < 0x31) return kDays[t - 0x2A];
+  if (t >= 0x31 && t < 0x38) return std::string(kDays[t - 0x31], 3);
+  if (t >= 0x38 && t < 0x44) return kMonths[t - 0x38];
+  if (t >= 0x44 && t < 0x50) return std::string(kMonths[t - 0x44], 3);
+  return {};
 }
 
 // GetLocaleInfoA/W(lcid, type, buf, cap).
 uint32_t LocaleInfo(Ctx& c, bool wide) {
-  std::string s = LocaleString(Arg(c, 1));
-  if (s.empty() && (Arg(c, 1) & 0xFFFF) != 0x0050) {
+  uint32_t type = uint32_t(Arg(c, 1));
+  std::string s = LocaleString(type);
+  if (s.empty() && (type & 0xFFFF) != 0x0050) {
     WarnF("GetLocaleInfo%c(%X, %X): unknown type\n", wide ? 'W' : 'A', uint32_t(Arg(c, 0)),
-          uint32_t(Arg(c, 1)));
+          type);
     SetLastError(kErrorInvalidParameter);
     return 0;
+  }
+  // LOCALE_RETURN_NUMBER: a DWORD in the buffer instead of the digits; the
+  // count is its size in characters.
+  if (type & 0x20000000) {
+    uint32_t chars = wide ? 2 : 4, cap = uint32_t(Arg(c, 3));
+    if (!cap) return chars;
+    if (cap < chars) {
+      SetLastError(kErrorInsufficientBuffer);
+      return 0;
+    }
+    Wr32(Arg(c, 2), uint32_t(std::strtoul(s.c_str(), nullptr, 10)));
+    return chars;
   }
   return PutCounted(Arg(c, 2), uint32_t(Arg(c, 3)), s, wide);
 }
 
 HLE64("kernel32.dll", GetLocaleInfoA, 4) { return LocaleInfo(c, false); }
 HLE("kernel32.dll", GetLocaleInfoW, 4) { return LocaleInfo(c, true); }
+// GetLocaleInfoEx(name, type, buf, cap): the name is ignored (en-US), the
+// other arguments are GetLocaleInfoW's.
+HLE("kernel32.dll", GetLocaleInfoEx, 4) { return LocaleInfo(c, true); }
 
 }  // namespace
 }  // namespace hle

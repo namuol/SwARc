@@ -114,7 +114,6 @@ uint32_t FindResourceIn(const PeImage& img, const std::string& type, const std::
   if (!l || (l & 0x80000000)) return 0;
   return rsrc + l;
 }
-
 uint32_t FindResourceImpl(const std::string& type, const std::string& name, uint32_t lang) {
   return FindResourceIn(g_win32->img, type, name, lang);
 }
@@ -400,6 +399,17 @@ HLE64("kernel32.dll", lstrcpyA, 2) {
   return Arg(c, 0);
 }
 
+// lstrcpynA(dst, src, n): at most n-1 characters, always terminated
+// (when n > 0).
+HLE("kernel32.dll", lstrcpynA, 3) {
+  gaddr d = Arg(c, 0), src = Arg(c, 1);
+  uint32_t n = Arg(c, 2), i = 0;
+  if (!d || !n) return d;
+  for (; i + 1 < n && Rd8(src + i); i++) Wr8(d + i, Rd8(src + i));
+  Wr8(d + i, 0);
+  return d;
+}
+
 HLE("kernel32.dll", IsDBCSLeadByte, 1) { return 0; }    // CP1252: no DBCS
 HLE("kernel32.dll", IsDBCSLeadByteEx, 2) { return 0; }
 
@@ -477,24 +487,38 @@ HLE64("kernel32.dll", DebugBreak, 0) {
 
 // Finds the first RT_VERSION resource in the mapped image. Returns its
 // guest VA and size.
-bool FindVersionResource(uint32_t* va, uint32_t* size) {
-  uint32_t e = FindResourceImpl("#16", "", 0);  // RT_VERSION, first name/lang
-  if (!e) return false;
-  *va = g_win32->img.image_base + Rd32(e);
-  *size = Rd32(e + 4);
-  return true;
-}
-
 bool IsOwnExe(const std::string& path) {
   std::string l = Lower(path), exe = Lower(Game().exe_name);
   size_t slash = l.find_last_of("\\/");
   return l.substr(slash == std::string::npos ? 0 : slash + 1) == exe;
 }
 
+// The image a version query names: the game's EXE or one of the DLLs
+// lifted with it (by file name, as those live beside the EXE); else null.
+const PeImage* ImageForPath(const std::string& path) {
+  if (IsOwnExe(path)) return &g_win32->img;
+  std::string l = Lower(path);
+  l = l.substr(l.find_last_of("\\/") + 1);
+  for (const Module& m : g_win32->modules)
+    if (m.name == l && m.img.image_base) return &m.img;
+  return nullptr;
+}
+
+// The RT_VERSION resource (first name and language) of the image at path.
+bool FindVersionResource(const std::string& path, uint32_t* va, uint32_t* size) {
+  const PeImage* img = ImageForPath(path);
+  if (!img) return false;
+  uint32_t e = FindResourceIn(*img, "#16", "", 0);
+  if (!e) return false;
+  *va = img->image_base + Rd32(e);
+  *size = Rd32(e + 4);
+  return true;
+}
+
 HLE("version.dll", GetFileVersionInfoSizeA, 2) {
   uint32_t va, size;
   if (Arg(c, 1)) Wr32(Arg(c, 1), 0);
-  if (!IsOwnExe(GStr(Arg(c, 0))) || !FindVersionResource(&va, &size)) {
+  if (!FindVersionResource(GStr(Arg(c, 0)), &va, &size)) {
     SetLastError(kErrorFileNotFound);
     return 0;
   }
@@ -506,7 +530,7 @@ HLE("version.dll", GetFileVersionInfoSizeA, 2) {
 HLE("version.dll", GetFileVersionInfoA, 4) {
   uint32_t va, size;
   uint32_t len = Arg(c, 2), buf = Arg(c, 3);
-  if (!IsOwnExe(GStr(Arg(c, 0))) || !FindVersionResource(&va, &size)) {
+  if (!FindVersionResource(GStr(Arg(c, 0)), &va, &size)) {
     SetLastError(kErrorFileNotFound);
     return 0;
   }
@@ -606,11 +630,12 @@ HLE("kernel32.dll", GetTimeFormatW, 6) {
   return PutCounted(Arg(c, 4), Arg(c, 5), out, true);
 }
 
-// The version resource of the game's own EXE, as the A forms (W paths).
+// The version resource of the game's EXE or lifted DLLs, as the A forms
+// (W paths).
 HLE("version.dll", GetFileVersionInfoSizeW, 2) {
   uint32_t va, size;
   if (Arg(c, 1)) Wr32(Arg(c, 1), 0);
-  if (!IsOwnExe(NarrowPath(GWStr(Arg(c, 0)))) || !FindVersionResource(&va, &size)) {
+  if (!FindVersionResource(NarrowPath(GWStr(Arg(c, 0))), &va, &size)) {
     SetLastError(kErrorFileNotFound);
     return 0;
   }
@@ -620,7 +645,7 @@ HLE("version.dll", GetFileVersionInfoSizeW, 2) {
 HLE("version.dll", GetFileVersionInfoW, 4) {
   uint32_t va, size;
   uint32_t len = Arg(c, 2), buf = Arg(c, 3);
-  if (!IsOwnExe(NarrowPath(GWStr(Arg(c, 0)))) || !FindVersionResource(&va, &size)) {
+  if (!FindVersionResource(NarrowPath(GWStr(Arg(c, 0))), &va, &size)) {
     SetLastError(kErrorFileNotFound);
     return 0;
   }
@@ -683,6 +708,15 @@ HLE("kernel32.dll", CreatePipe, 4) {
   WarnF("CreatePipe: not supported\n");
   SetLastError(50);  // ERROR_NOT_SUPPORTED
   return 0;
+}
+
+// CreateNamedPipeW(name, open mode, pipe mode, max, out, in, timeout, sa):
+// a pipe server is for another process to connect to (crash reporters
+// do this), and there is none.
+HLE("kernel32.dll", CreateNamedPipeW, 8) {
+  WarnF("CreateNamedPipeW(%s): not supported\n", Narrow(GWStr(Arg(c, 0))).c_str());
+  SetLastError(50);  // ERROR_NOT_SUPPORTED
+  return 0xFFFFFFFF;  // INVALID_HANDLE_VALUE
 }
 
 // Device control (volume and disk queries): no devices to talk to.

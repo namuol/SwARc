@@ -122,23 +122,7 @@ COMM_FAILS(GetOverlappedResult, 4)
 
 // ---- user32 ------------------------------------------------------------------------
 
-HLE("user32.dll", SetRect, 5) {
-  for (int i = 0; i < 4; i++) Wr32(Arg(c, 0) + 4 * uint32_t(i), Arg(c, i + 1));
-  return 1;
-}
-
-HLE("user32.dll", IntersectRect, 3) {
-  int32_t a[4], b[4];
-  for (int i = 0; i < 4; i++) {
-    a[i] = int32_t(Rd32(Arg(c, 1) + 4 * uint32_t(i)));
-    b[i] = int32_t(Rd32(Arg(c, 2) + 4 * uint32_t(i)));
-  }
-  int32_t r[4] = {std::max(a[0], b[0]), std::max(a[1], b[1]), std::min(a[2], b[2]),
-                  std::min(a[3], b[3])};
-  bool empty = r[0] >= r[2] || r[1] >= r[3];
-  for (int i = 0; i < 4; i++) Wr32(Arg(c, 0) + 4 * uint32_t(i), empty ? 0 : uint32_t(r[i]));
-  return empty ? 0 : 1;
-}
+// SetRect, IntersectRect and the other rectangle helpers: user32_window.cpp.
 
 
 HLE("user32.dll", CharToOemBuffA, 3) {
@@ -253,14 +237,7 @@ HLE("ole32.dll", StringFromCLSID, 2) {
   return 0;
 }
 
-HLE_NAMED("oleaut32.dll", "#8", VariantInit, 1) {
-  std::memset(GPtr(Arg(c, 0)), 0, 16);
-  return 0;
-}
-HLE_NAMED("oleaut32.dll", "#9", VariantClear, 1) {
-  std::memset(GPtr(Arg(c, 0)), 0, 16);
-  return 0;
-}
+// VariantInit, VariantClear, GetErrorInfo, SetErrorInfo: advapi32.cpp.
 HLE_NAMED("oleaut32.dll", "#12", VariantChangeType, 4) { return kENotImpl; }
 // RegisterActiveObject(punk, clsid, flags, &cookie) / RevokeActiveObject(
 // cookie, reserved): the running object table nobody here reads.
@@ -273,11 +250,6 @@ HLE_NAMED("oleaut32.dll", "#161", LoadTypeLib, 2) {
   Wr32(Arg(c, 1), 0);
   return 0x80029C4A;  // TYPE_E_CANTLOADLIBRARY
 }
-HLE_NAMED("oleaut32.dll", "#200", GetErrorInfo, 2) {
-  Wr32(Arg(c, 1), 0);
-  return 1;  // S_FALSE: none
-}
-HLE_NAMED("oleaut32.dll", "#201", SetErrorInfo, 2) { return 0; }
 HLE_NAMED("oleaut32.dll", "#202", CreateErrorInfo, 1) {
   Wr32(Arg(c, 0), 0);
   return kEFail;
