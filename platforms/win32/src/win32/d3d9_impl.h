@@ -238,6 +238,10 @@ uint32_t QueryInterfaceFor(Ctx& c, const guest::GUID& iid);
 // The device a method's object belongs to (fatal if `self` is not one).
 Device* DeviceOf(uint32_t self);
 
+// SetTransform's state change: transform `type` (D3D9's numbers) is `m`,
+// for GetTransform and for the fixed-function draws (Device::ff_base).
+void SetTransform(Device& d, uint32_t type, const float* m);
+
 // Sampler index: 0-15, or D3DVERTEXTEXTURESAMPLER0..3 (256..259) -> 16..19;
 // -1 if neither.
 int SamplerIndex(uint32_t s);

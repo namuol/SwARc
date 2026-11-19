@@ -409,11 +409,7 @@ void SetTSS(Device& d, uint32_t stage, uint32_t t, uint32_t v) {
 void SetTex(Device& d, uint32_t stage, uint32_t tex) {
   if (stage < 8) Bind(&d.textures[stage], tex);
 }
-void SetXform(Device& d, uint32_t t, const float* m) {
-  std::array<float, 16> a;
-  std::memcpy(a.data(), m, sizeof a);
-  d.transforms[t] = a;
-}
+void SetXform(Device& d, uint32_t t, const float* m) { SetTransform(d, t, m); }
 // Lights and material go to the Direct3D 9 device's (DrawState sends the
 // enabled lights to gfx); Device8 keeps its copy for state blocks.
 void SetMat(Device& d, Device8& x, const gfx::Material& m) {
