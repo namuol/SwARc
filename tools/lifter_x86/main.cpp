@@ -249,7 +249,7 @@ int main(int argc, char** argv) {
         for (uint64_t a = lo; a + 4 <= hi; a += 4)
           candidate(&m, p.mem.read<uint32_t>(a), &from_data_ptrs);
     }
-  size_t recovered_tables = 0;
+  size_t recovered_tables = 0, extended_tables = 0;
   while (!work.empty()) {
     uint64_t e = work.front();
     work.pop_front();
@@ -262,12 +262,26 @@ int main(int argc, char** argv) {
       more = false;
       for (const auto& [va, in] : f.insns) {
         std::vector<uint64_t> targets;
-        if (p.jumptables.count(va) ||
-            !lifter::RecoverJumpTable(p, f, in, &targets))
+        if (!lifter::RecoverJumpTable(p, f, in, &targets)) continue;
+        auto known = p.jumptables.find(va);
+        if (known == p.jumptables.end()) {
+          p.jumptables[va] = std::move(targets);
+          recovered_tables++;
+          more = true;
           continue;
-        p.jumptables[va] = std::move(targets);
-        recovered_tables++;
-        more = true;
+        }
+        // A table from the symbols can stop short of the cases the code
+        // bounds it to: add the targets it is missing.
+        bool grew = false;
+        for (uint64_t t : targets)
+          if (std::find(known->second.begin(), known->second.end(), t) == known->second.end()) {
+            known->second.push_back(t);
+            grew = true;
+          }
+        if (grew) {
+          extended_tables++;
+          more = true;
+        }
       }
       if (more) {
         f = {};
@@ -300,15 +314,16 @@ int main(int argc, char** argv) {
               "%zu via code pointers, %zu via data pointers; %zu weak)\n",
               p.entries.size(), initial, p.entries.size() - initial,
               from_code_ptrs, from_data_ptrs, p.weak.size());
-  std::printf("jump tables: %zu from Ghidra, %zu recovered\n",
-              p.jumptables.size() - recovered_tables, recovered_tables);
+  std::printf("jump tables: %zu from Ghidra (%zu extended), %zu recovered\n",
+              p.jumptables.size() - recovered_tables, extended_tables, recovered_tables);
 
   // Pass 2: final CFGs and emission.
   std::filesystem::create_directories(outdir);
   lifter::Emitter em(p, dec);
   lifter::EmitStats stats;
   std::map<std::string, std::string> files;
-  std::string body, report_warnings;
+  std::string body, report_warnings, report_dispatch;
+  std::set<uint64_t> lifted_insns;
   std::set<uint64_t> refs;
   uint64_t file_insns = 0;
   int file_no = 0;
@@ -349,6 +364,27 @@ int main(int argc, char** argv) {
     }
     lifter::Function f;
     lifter::BuildFunction(p, dec, e, &f);
+    for (const auto& [va, in] : f.insns) lifted_insns.insert(va);
+    // Indirect jumps left to the dispatcher (no table): each one is a
+    // place where a target the lifter did not find is fatal at run time.
+    for (auto it = f.insns.begin(); it != f.insns.end(); ++it) {
+      const lifter::Insn& in = it->second;
+      uint64_t t;
+      if (!in.ok || in.d.mnemonic != ZYDIS_MNEMONIC_JMP ||
+          lifter::Classify(p, f, in, &t) != lifter::Flow::TailDispatch)
+        continue;
+      char buf[64];
+      std::snprintf(buf, sizeof buf, "== %08llX in %08llX\n", (unsigned long long)in.va,
+                    (unsigned long long)e);
+      report_dispatch += buf;
+      auto b = it;
+      for (int k = 0; k < 10 && b != f.insns.begin(); k++) --b;
+      for (auto j = b; ; ++j) {
+        std::snprintf(buf, sizeof buf, "  %08llX ", (unsigned long long)j->first);
+        report_dispatch += buf + dec.Format(j->second) + "\n";
+        if (j == it) break;
+      }
+    }
     for (const auto& w : f.warnings) {
       char buf[32];
       std::snprintf(buf, sizeof buf, "%08llX: ", (unsigned long long)e);
@@ -444,6 +480,35 @@ int main(int argc, char** argv) {
     }
   }
   WriteIfChanged(std::filesystem::path(outdir) / "lift_report.txt", report);
+  WriteIfChanged(std::filesystem::path(outdir) / "dispatch_report.txt", report_dispatch);
+  {
+    std::string jt;
+    for (const auto& [va, ts] : p.jumptables) {
+      char buf[32];
+      std::snprintf(buf, sizeof buf, "%08llX", (unsigned long long)va);
+      jt += buf;
+      for (uint64_t t : ts) {
+        std::snprintf(buf, sizeof buf, " %08llX", (unsigned long long)t);
+        jt += buf;
+      }
+      jt += "\n";
+    }
+    std::string en;
+    for (uint64_t e : p.entries) {
+      char buf[32];
+      std::snprintf(buf, sizeof buf, "%08llX\n", (unsigned long long)e);
+      en += buf;
+    }
+    WriteIfChanged(std::filesystem::path(outdir) / "final_jumptables.txt", jt);
+    WriteIfChanged(std::filesystem::path(outdir) / "final_entries.txt", en);
+    std::string li;
+    for (uint64_t v : lifted_insns) {
+      char buf[32];
+      std::snprintf(buf, sizeof buf, "%08llX\n", (unsigned long long)v);
+      li += buf;
+    }
+    WriteIfChanged(std::filesystem::path(outdir) / "lifted_insns.txt", li);
+  }
   std::printf("instructions: %llu, unimplemented sites: %llu, files: %zu\n",
               (unsigned long long)stats.insns, (unsigned long long)unimpl,
               files.size());

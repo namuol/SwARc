@@ -457,9 +457,10 @@ bool RecoverJumpTable64(const Program& p, const Function& f, const Insn& jmp,
 
 }  // namespace
 
-bool RecoverJumpTable(const Program& p, const Function& f, const Insn& jmp,
-                      std::vector<uint64_t>* targets) {
-  if (p.x64) return RecoverJumpTable64(p, f, jmp, targets);
+namespace {
+
+bool RecoverJumpTable32Exact(const Program& p, const Function& f, const Insn& jmp,
+                             std::vector<uint64_t>* targets) {
   const auto& m = jmp.ops[0];
   if (!jmp.ok || jmp.d.mnemonic != ZYDIS_MNEMONIC_JMP ||
       m.type != ZYDIS_OPERAND_TYPE_MEMORY || m.mem.base != ZYDIS_REGISTER_NONE ||
@@ -477,22 +478,39 @@ bool RecoverJumpTable(const Program& p, const Function& f, const Insn& jmp,
   ZydisRegister r = m.mem.index;
   uint32_t index = 0;
   bool two_level = false, seen_ja = false;
+  // The byte index can also be loaded into the low byte of a register
+  // zeroed just before (xor ecx, ecx; mov cl, [eax+INDEX]): `zeroed` is
+  // that register until its xor is found.
+  ZydisRegister zeroed = ZYDIS_REGISTER_NONE;
   const Insn* in = &jmp;
   for (int steps = 0; steps < 16; steps++) {
     in = Before(f, in->va);
     if (!in) return false;
     const auto& o0 = in->ops[0];
     const auto& o1 = in->ops[1];
+    if (zeroed != ZYDIS_REGISTER_NONE && WritesReg(*in, zeroed)) {
+      if (in->d.mnemonic != ZYDIS_MNEMONIC_XOR || o0.type != ZYDIS_OPERAND_TYPE_REGISTER ||
+          o1.type != ZYDIS_OPERAND_TYPE_REGISTER || Full(o0.reg.value) != zeroed ||
+          o1.reg.value != o0.reg.value || o0.size != 32)
+        return false;
+      zeroed = ZYDIS_REGISTER_NONE;
+      continue;
+    }
     if (!seen_ja) {
+      const bool byte_load = o0.type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                             Full(o0.reg.value) == Full(r) &&
+                             o1.type == ZYDIS_OPERAND_TYPE_MEMORY && o1.size == 8 &&
+                             o1.mem.base != ZYDIS_REGISTER_NONE &&
+                             o1.mem.index == ZYDIS_REGISTER_NONE;
       if (in->d.mnemonic == ZYDIS_MNEMONIC_JNBE) {
         seen_ja = true;
-      } else if (!two_level && in->d.mnemonic == ZYDIS_MNEMONIC_MOVZX &&
-                 o0.type == ZYDIS_OPERAND_TYPE_REGISTER &&
-                 Full(o0.reg.value) == Full(r) &&
-                 o1.type == ZYDIS_OPERAND_TYPE_MEMORY && o1.size == 8 &&
-                 o1.mem.base != ZYDIS_REGISTER_NONE &&
-                 o1.mem.index == ZYDIS_REGISTER_NONE) {
+      } else if (!two_level && byte_load &&
+                 (in->d.mnemonic == ZYDIS_MNEMONIC_MOVZX ||
+                  (in->d.mnemonic == ZYDIS_MNEMONIC_MOV && o0.size == 8 &&
+                   o0.reg.value != ZYDIS_REGISTER_AH && o0.reg.value != ZYDIS_REGISTER_BH &&
+                   o0.reg.value != ZYDIS_REGISTER_CH && o0.reg.value != ZYDIS_REGISTER_DH))) {
         two_level = true;
+        if (in->d.mnemonic == ZYDIS_MNEMONIC_MOV) zeroed = Full(r);
         index = static_cast<uint32_t>(o1.mem.disp.value);
         r = o1.mem.base;
       } else if (WritesReg(*in, r) || in->d.meta.branch_type != ZYDIS_BRANCH_TYPE_NONE) {
@@ -508,6 +526,17 @@ bool RecoverJumpTable(const Program& p, const Function& f, const Insn& jmp,
         o0.type != ZYDIS_OPERAND_TYPE_REGISTER || Full(o0.reg.value) != Full(r) ||
         o1.type != ZYDIS_OPERAND_TYPE_IMMEDIATE || o1.imm.value.u >= 4096)
       return false;
+    // The zeroing xor can also come before the cmp.
+    for (const Insn* z = in; zeroed != ZYDIS_REGISTER_NONE;) {
+      z = Before(f, z->va);
+      if (!z || z->d.meta.branch_type != ZYDIS_BRANCH_TYPE_NONE || steps++ >= 24) return false;
+      if (!WritesReg(*z, zeroed)) continue;
+      if (z->d.mnemonic != ZYDIS_MNEMONIC_XOR || z->ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+          z->ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER || Full(z->ops[0].reg.value) != zeroed ||
+          z->ops[1].reg.value != z->ops[0].reg.value || z->ops[0].size != 32)
+        return false;  // its upper bits unknown
+      zeroed = ZYDIS_REGISTER_NONE;
+    }
     uint32_t cases = static_cast<uint32_t>(o1.imm.value.u) + 1;
     if (two_level) {
       // A byte index table picks the entry.
@@ -529,6 +558,53 @@ bool RecoverJumpTable(const Program& p, const Function& f, const Insn& jmp,
     return true;
   }
   return false;
+}
+
+// A jmp [TABLE+reg*4] whose bound the exact pattern above cannot prove
+// (the index reloaded from a spill, compared in another register, ...):
+// MSVC puts the table in .text right after the function's code, so its
+// entries are read while they point back into code shortly before it,
+// at most as many as a cmp with ja just before the jmp bounds, if there is
+// one. A wrong extra target only adds lifted code (as a stray data
+// pointer does); a missing one would be a fatal jump at run time.
+bool RecoverJumpTable32Loose(const Program& p, const Function& f, const Insn& jmp,
+                             std::vector<uint64_t>* targets) {
+  const auto& m = jmp.ops[0];
+  if (!jmp.ok || jmp.d.mnemonic != ZYDIS_MNEMONIC_JMP ||
+      m.type != ZYDIS_OPERAND_TYPE_MEMORY || m.mem.base != ZYDIS_REGISTER_NONE ||
+      m.mem.index == ZYDIS_REGISTER_NONE || m.mem.scale != 4)
+    return false;
+  const Module* mod = p.TextOf(jmp.va);
+  const uint32_t table = static_cast<uint32_t>(m.mem.disp.value);
+  if (p.TextOf(table) != mod || table < jmp.va) return false;
+  uint32_t cap = 1024;
+  const Insn* in = &jmp;
+  for (int steps = 0; steps < 24 && (in = Before(f, in->va)); steps++) {
+    if (in->d.mnemonic == ZYDIS_MNEMONIC_CMP && in->ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+        in->ops[1].imm.value.u < 1024) {
+      cap = static_cast<uint32_t>(in->ops[1].imm.value.u) + 1;
+      break;
+    }
+  }
+  constexpr uint32_t kWindow = 0x20000;  // how far before its table a case may lie
+  targets->clear();
+  for (uint32_t i = 0; i < cap; i++) {
+    const uint64_t a = table + 4ull * i;
+    if (p.TextOf(a) != mod || p.TextOf(a + 3) != mod) break;
+    const uint64_t t = p.mem.read<uint32_t>(a);
+    if (p.TextOf(t) != mod || t >= table || table - t > kWindow) break;
+    if (std::find(targets->begin(), targets->end(), t) == targets->end()) targets->push_back(t);
+  }
+  return !targets->empty();
+}
+
+}  // namespace
+
+bool RecoverJumpTable(const Program& p, const Function& f, const Insn& jmp,
+                      std::vector<uint64_t>* targets) {
+  if (p.x64) return RecoverJumpTable64(p, f, jmp, targets);
+  return RecoverJumpTable32Exact(p, f, jmp, targets) ||
+         RecoverJumpTable32Loose(p, f, jmp, targets);
 }
 
 void BuildFunction(const Program& p, const Decoder& dec, uint64_t entry,
