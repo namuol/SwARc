@@ -677,6 +677,30 @@ bool RecoverJumpTable32Loose(const Program& p, const Function& f, const Insn& jm
     }
     if (std::find(targets->begin(), targets->end(), t) == targets->end()) targets->push_back(t);
   }
+  // An index negated (neg r) or counted down past zero (sub r, k with jb)
+  // just before the jmp reaches the slots before the table too (the CRT's
+  // memcpy copies backwards this way): read down while they are cases.
+  uint32_t below = 0;
+  in = &jmp;
+  for (int steps = 0; steps < 8 && (in = Before(f, in->va)); steps++) {
+    const auto& o0 = in->ops[0];
+    if (o0.type != ZYDIS_OPERAND_TYPE_REGISTER || Full(o0.reg.value) != Full(m.mem.index) ||
+        !WritesReg(*in, m.mem.index))
+      continue;
+    if (in->d.mnemonic == ZYDIS_MNEMONIC_NEG) below = 32;
+    else if (in->d.mnemonic == ZYDIS_MNEMONIC_SUB &&
+             in->ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE && in->ops[1].imm.value.u <= 32)
+      below = static_cast<uint32_t>(in->ops[1].imm.value.u);
+    break;  // the nearest write to the index decides
+  }
+  for (uint32_t i = 1; i <= below; i++) {
+    const uint64_t a = table - 4ull * i;
+    if (a < mod->text_lo || in_code(a)) break;
+    const uint64_t t = p.mem.read<uint32_t>(a);
+    const uint64_t dist = t < table ? table - t : t - table;
+    if (p.TextOf(t) != mod || dist > kWindow) break;
+    if (std::find(targets->begin(), targets->end(), t) == targets->end()) targets->push_back(t);
+  }
   return !targets->empty();
 }
 
