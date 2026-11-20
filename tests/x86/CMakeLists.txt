@@ -181,6 +181,7 @@ if(TARGET recomp_lift)
     add_executable(recomp_lift_fixture fixture_reader.cpp)
     target_link_libraries(recomp_lift_fixture PRIVATE recomp_lift_objs)
     add_executable(lift_discovery_test lift_discovery_test.cpp)
+    target_compile_features(lift_discovery_test PRIVATE cxx_std_20)
     add_dependencies(lift_discovery_test recomp_lift_fixture lift_discovery_fixture)
     add_test(NAME lift_discovery
              COMMAND lift_discovery_test $<TARGET_FILE:recomp_lift_fixture> "${_fix}/discovery.o"
