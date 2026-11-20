@@ -107,7 +107,7 @@ def game_env(c):
     arr("LIFT_ARGS", c["lift"].get("args", []))
     var("LIFT_N", len(images))
     arr("LIFT_FILES", [i["file"] for i in images])
-    arr("LIFT_MANIFESTS", [i.get("manifest", "empty.manifest") for i in images])
+    arr("LIFT_MANIFESTS", [os.path.basename(i.get("manifest", "empty.manifest")) for i in images])
     arr("LIFT_BASES", [i.get("base", "") for i in images])
     var("DISK_GB", c.get("disk_gb", 5))
     var("BUILD_TIME", c.get("build_time", "a few minutes"))
@@ -222,8 +222,11 @@ def assemble(root, c, build, kit):
     shutil.copy2(os.path.join(SWARC, "tools", "pe_symbols.py"), os.path.join(kit, "bin"))
     open(os.path.join(kit, "data", "empty.manifest"), "w").close()
     for img in c["lift"]["images"]:
-        if "manifest" in img:
-            shutil.copy2(os.path.join(root, img["manifest"]), os.path.join(kit, "data"))
+        if "manifest" in img:  # into data/ by its name alone (game.env names it so)
+            dst = os.path.join(kit, "data", os.path.basename(img["manifest"]))
+            if os.path.exists(dst):
+                sys.exit("kit: two lift manifests named %s" % os.path.basename(dst))
+            shutil.copy2(os.path.join(root, img["manifest"]), dst)
     shutil.copy2(os.path.join(root, "cmake", "Info.plist.in"), os.path.join(kit, "app", "Info.plist"))
     with open(os.path.join(kit, "game.env"), "w") as f:
         f.write(game_env(c))

@@ -273,11 +273,10 @@ names=$(printf '%s, ' "${LIFT_FILES[@]}"); names=${names%, }
 echo "    Translating $names to C++..."
 lift=(--exe) args=()
 for ((i = 0; i < LIFT_N; i++)); do
-  img=${LIFT_FILES[$i]}
-  run "Reading $img" /usr/bin/python3 -I "$KIT/bin/pe_symbols.py" "$game/$img" \
-    --out "$WORK/symbols-$img" --seeds --quiet
+  img=${LIFT_FILES[$i]} sym="$WORK/symbols-${LIFT_FILES[$i]//\//_}"  # images can be in subfolders
+  run "Reading $img" /usr/bin/python3 -I "$KIT/bin/pe_symbols.py" "$game/$img" --out "$sym" --seeds --quiet
   [ $i -gt 0 ] && lift=(--module)
-  args+=("${lift[@]}" "$game/$img" --symbols "$WORK/symbols-$img" --manifest "$KIT/data/${LIFT_MANIFESTS[$i]}")
+  args+=("${lift[@]}" "$game/$img" --symbols "$sym" --manifest "$KIT/data/${LIFT_MANIFESTS[$i]}")
   [ -n "${LIFT_BASES[$i]}" ] && args+=(--base "${LIFT_BASES[$i]}")
 done
 run "Translating" "$KIT/bin/recomp_lift" "${LIFT_ARGS[@]+"${LIFT_ARGS[@]}"}" "${args[@]}" --out "$WORK/generated"
