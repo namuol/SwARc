@@ -105,6 +105,8 @@ gfx::FfState DrawState(const Device& d, bool fixed) {
   f.viewport = {v.X, v.Y, v.Width, v.Height, v.MinZ, v.MaxZ};
   const guest::D3DRECT& r = d.scissor;
   f.scissor = {r.x1, r.y1, r.x2, r.y2};
+  // User clip planes: shader draws apply them too (in clip space).
+  std::memcpy(f.clip, d.ff_base.clip, sizeof f.clip);
   if (!fixed) return f;
   // Stages from the first with COLOROP DISABLE (1) on are unused.
   bool active = true;
