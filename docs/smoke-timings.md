@@ -132,3 +132,35 @@ mid-game shot showed its second board. Tiberian Sun's intro now plays out
 (skirmish 19 -> 27 s, campaign-list 12 -> 20 s), DX-Ball 2's shot is the
 board before launch (new local reference). Soldiers: 8 s with TEST_HIDE.
 Then `-j 3`, twice: **11/11 in 92 s and 91 s**.
+
+## Evening: campaign starts as cases, a repo's cases side by side
+
+The RA2 and TS campaign starts were checked by hand: `tools/try-run.sh 140`
+with Escapes at fixed times (one once landed on the in-mission options
+menu), then a look at the frames. Now each is a smoke case that waits for
+every screen, presses Escape once per screen it skips, and compares the
+mission's sidebar. smoke.py builds a repo once (`"build"`) and runs its
+cases side by side (`"parallel"`: a log and per-user data per case). Every
+case also presses each skip key once (RA2: Escape once the logo is up, TS:
+on the intro's first frame and on its menu animation), and the skirmish
+shots are 2 s into the match.
+
+| Case | Before | After (alone) |
+|---|---|---|
+| ra2-yr-recomp/campaign | 140 s + a manual look | 24-27 s (10 s of it the mission loading) |
+| ra2-yr-recomp/skirmish | 24-25 s | 21-23 s |
+| ra2-yr-recomp/side-dropdown | 14 s | 14 s |
+| ra2-yr-recomp/map-list | 14-15 s | 14-15 s |
+| ra2-yr-recomp/classic-skirmish | 22-23 s | 20-21 s |
+| ra2-yr-recomp/classic-side-dropdown | 14 s | 15 s |
+| tiberian-sun-recomp/campaign | 140 s + a manual look | 8-10 s |
+| tiberian-sun-recomp/skirmish | 27 s | 10 s |
+| tiberian-sun-recomp/campaign-list | 20 s | 6 s |
+
+| Suite | Before | After |
+|---|---|---|
+| ra2-yr-recomp | 91-92 s (five cases) + 140 s | 24-25 s, six cases (`-j 6`, three runs) |
+| tiberian-sun-recomp | 47 s (two cases) + 140 s | 10 s, three cases (`-j 3`, three runs) |
+
+The RA2 logos play 13 s unless skipped; one Escape on the EA logo brings
+the main menu at 6 s (the rest is loading).

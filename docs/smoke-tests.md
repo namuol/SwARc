@@ -4,8 +4,7 @@ Smoke cases (tools/smoke.py) drive a game with a scripted input file
 (<ID>_TEST_INPUT, platforms/win32/src/win32/user32_window.cpp) and compare
 or check what it shows. They run often, so they should take as long as the
 game does and not a second more, and pass on a busy machine. Timings before
-and after converting every recomp: docs/smoke-timings.md (12 min one after
-another before, about 3 min after, and less with -j).
+and after converting every recomp: docs/smoke-timings.md.
 
 ## Wait for screens, don't sleep through them
 
@@ -68,18 +67,31 @@ no keys pressed. (Trace the game's file and video calls with <ID>_TRACE=1
 and <ID>_TRACE_FILTER=File, or the name of the video API.) Check
 the EXE's strings for switches and the game's settings files for an intro
 option (RA2's `[Intro] Play=no` is the intro movie only; Soldiers' profile
-`showIntro` is not its logo videos). Otherwise a key: Escape skips RA2's,
-TS's and Soldiers' logos and DX-Ball 2's; Return Spelunky's intro story.
-Press it inside the wait for the menu (`press Escape 0.5`), so presses stop
-the moment the menu is up, unless the key does something on the menu:
+`showIntro` is not its logo videos). Otherwise a key: Escape skips RA2's, TS's and Soldiers' logos and DX-Ball
+2's; Return Spelunky's intro story. Press it once, after a wait for the
+screen it skips, not repeatedly until the next screen is up: a press can
+reach the game late, under load, and land on a screen where the key does
+something else.
 
-- DX-Ball 2 quits on Escape at its menu, and Tiberian Sun on its game
-  choice; a press meant for the intro landed there under load (both failed
-  once in parallel runs). Their intros play out: where a stray press is
-  fatal, don't press. RA2's Escape on its menu does nothing, so it presses.
+- RA2's Escape on the Single Player menu goes back: presses through its
+  logos until the main menu was up sometimes landed there (classic-skirmish
+  hung in a parallel run). Its cases now wait for the logo's pixels and
+  press once (the logos otherwise play 13 s).
+- Tiberian Sun quits on Escape at its game choice. Its cases wait for the
+  intro's first frame that is not black (`320,100!=000000 tol 8`) and press
+  once; the same for its menu animation (wait for the game choice to go,
+  `!=`, then press).
+- DX-Ball 2 quits on Escape at its menu; its logo plays out.
 - Soldiers opens a Quit dialog on Escape at the menu (and the next Escape
   closes it): pressing through its videos needed `!=` on the dialog's text.
   Hiding the videos (above) made that unnecessary.
+
+Movies (a campaign's briefing) are skipped the same way: wait for the
+movie's first second (waitpick on its first frames; it moves on soon), press
+once. In a mission Escape opens the options menu, so the in-mission wait
+should also fail with it open (pixels it covers, or `!=` on its own). A
+loading screen between a movie and the mission may be presented only once
+or twice (TS): too briefly to wait for.
 
 Frames presented within 0.3 s of a press don't count towards a match, so a
 press that opened something is seen before the wait ends.
@@ -90,7 +102,10 @@ What a game shows can depend on earlier runs (a saved language, a seen
 intro, a tutorial already done). `"fresh_data": true` gives each run new
 per-user data; `"data": "smoke/data"` seeds it with settings files (the
 game's own config, not its art), e.g. Spelunky's config.txt with the
-language chosen, which skips the language screen.
+language chosen, which skips the language screen. Tiberian Sun's seeds the
+game's SUN.INI with its intro counted as seen; with no SUN.INI at all the
+game picks another screen size. `"data"` at the top level of cases.json is
+every case's.
 
 ## Clicks and timing
 
@@ -115,8 +130,17 @@ new local references (`--update`, then look at them).
 
 ## Many at once
 
-`-j N` runs N repos side by side; each repo's cases still run in turn. Games
-then load slower (six at once stalled every main thread for 5-24 s), so
-`seconds` and every wait's timeout are multiplied by N
-(`<ID>_TEST_WAIT_SCALE`). `-j 3` runs all six recomps in about 100 s; more
-jobs don't help (RA2's five cases are the floor).
+`-j N` runs up to N games at once. Games then load slower (six at once
+stalled every main thread for 5-24 s), so `seconds` and every wait's timeout
+are multiplied by the number that can run at once (`<ID>_TEST_WAIT_SCALE`).
+
+A repo's cases run side by side when its cases.json says `"parallel": true`.
+Each case then needs its own log and per-user data: smoke.py passes
+`<PREFIX>_RUN_LOG` (the run script writes the game's log there) and
+`$XDG_DATA_HOME` (fresh, or seeded from `"data"`), so a repo opting in must
+have a run script that takes the log path. `"build"` (a command) builds
+once before the cases and sets `<PREFIX>_NO_BUILD=1`, which the run script
+honours: several cases' builds of one tree would collide, and an up-to-date
+check per case costs time. Without `"parallel"` a repo's cases run one at a
+time, as before. RA2 (six cases) and TS (three) run side by side: RA2 in
+25 s with `-j 6`, TS in 10 s.

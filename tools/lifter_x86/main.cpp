@@ -8,6 +8,8 @@
 //            [--module <game.dll> --symbols DIR [--manifest FILE]
 //             [--base HEX]]...
 //            [--only VA[,VA...]]   (just these functions and their callees)
+//            [--sweep-gaps]   (also lift .text code nothing refers to)
+//            [--dump-discovery]   (final_jumptables/entries, lifted_insns.txt)
 //   recomp_lift (--forms LIST | --code BIN) [--x64]
 //               (--x87-test | --int-test | --sse-test) OUT.cpp
 //
@@ -107,6 +109,7 @@ int main(int argc, char** argv) {
   uint64_t per_file = 12000;
   uint64_t dump = 0;
   std::string x87_test, int_test, sse_test, forms, code;
+  bool sweep_gaps = false, dump_discovery = false;
   bool forms_x64 = false;
   std::set<uint64_t> only;
   for (int i = 1; i < argc; i++) {
@@ -120,6 +123,8 @@ int main(int argc, char** argv) {
     else if (a == "--out") outdir = val();
     else if (a == "--insns-per-file") per_file = std::stoull(val());
     else if (a == "--dump") dump = std::stoull(val(), nullptr, 16);
+    else if (a == "--sweep-gaps") sweep_gaps = true;
+    else if (a == "--dump-discovery") dump_discovery = true;
     else if (a == "--x87-test") x87_test = val();
     else if (a == "--int-test") int_test = val();
     else if (a == "--sse-test") sse_test = val();
@@ -249,7 +254,15 @@ int main(int argc, char** argv) {
         for (uint64_t a = lo; a + 4 <= hi; a += 4)
           candidate(&m, p.mem.read<uint32_t>(a), &from_data_ptrs);
     }
-  size_t recovered_tables = 0;
+  size_t recovered_tables = 0, extended_tables = 0;
+  std::map<uint64_t, size_t> symbol_tables;  // jmp -> cases the symbols list
+  for (const auto& [va, ts] : p.jumptables) symbol_tables[va] = ts.size();
+  // Bytes of .text that some lifted function decodes (for --sweep-gaps).
+  std::map<const lifter::Module*, std::vector<bool>> covered;
+  for (const auto& m : p.modules) covered[&m].assign(m.text_hi - m.text_lo, false);
+  size_t from_gaps = 0, gap_rejected = 0, from_tables = 0;
+  std::set<uint64_t> gap_entries;
+  for (int sweep = 0;; sweep++) {
   while (!work.empty()) {
     uint64_t e = work.front();
     work.pop_front();
@@ -257,21 +270,116 @@ int main(int argc, char** argv) {
     lifter::Function f;
     lifter::BuildFunction(p, dec, e, &f);
     // Switch tables Ghidra did not export: recover them and rebuild, as
-    // their targets may hold further switches.
-    for (bool more = true; more;) {
-      more = false;
+    // their targets may hold further switches. A table recovered while
+    // the function was only partly known can be read too far (the next
+    // switch's table is only recognised once the code addressing it is),
+    // so within this function's rounds the latest recovery replaces the
+    // earlier ones; what the table held before this function (from the
+    // symbols or another function reaching the same jmp) is always kept.
+    std::map<uint64_t, std::vector<uint64_t>> prior;
+    for (int round = 0, more = 1; more; round++) {
+      more = 0;
       for (const auto& [va, in] : f.insns) {
         std::vector<uint64_t> targets;
-        if (p.jumptables.count(va) ||
-            !lifter::RecoverJumpTable(p, f, in, &targets))
+        if (!lifter::RecoverJumpTable(p, f, in, &targets)) continue;
+        auto known = p.jumptables.find(va);
+        if (!prior.count(va))
+          prior[va] = known == p.jumptables.end() ? std::vector<uint64_t>{} : known->second;
+        std::vector<uint64_t> merged = prior[va];
+        for (uint64_t t : targets)
+          if (std::find(merged.begin(), merged.end(), t) == merged.end()) merged.push_back(t);
+        if (known == p.jumptables.end()) {
+          p.jumptables[va] = std::move(merged);
+          recovered_tables++;
+          more = 1;
           continue;
-        p.jumptables[va] = std::move(targets);
-        recovered_tables++;
-        more = true;
+        }
+        // Past a few rounds, tables only grow: no rebuild can undo another.
+        if (round >= 8) {
+          bool grew = false;
+          for (uint64_t t : merged)
+            if (std::find(known->second.begin(), known->second.end(), t) == known->second.end()) {
+              known->second.push_back(t);
+              grew = true;
+            }
+          more |= grew;
+        } else if (known->second != merged) {
+          known->second = std::move(merged);
+          more = 1;
+        }
       }
       if (more) {
         f = {};
         lifter::BuildFunction(p, dec, e, &f);
+      }
+    }
+    // Every case target is also a weak entry: an indirect jump that lands
+    // on it through another table than its own (the CRT's memcpy indexes
+    // the slots before a table, which belong to the table before it) or
+    // from another copy of the function goes through the dispatcher and
+    // finds it. Inside this function its jmp still goes to the label.
+    for (const auto& [va, in] : f.insns) {
+      auto jt = p.jumptables.find(va);
+      if (jt == p.jumptables.end()) continue;
+      for (uint64_t t : jt->second) candidate(p.TextOf(t), t, &from_tables);
+    }
+    // A gap's code that does not look like compiled user code (undecodable
+    // bytes, privileged or obsolete instructions) is data: dropped.
+    if (gap_entries.count(e)) {
+      bool bogus = false;
+      for (const auto& [va, in] : f.insns) {
+        if (!in.ok) { bogus = true; break; }
+        switch (in.d.mnemonic) {
+          case ZYDIS_MNEMONIC_IN: case ZYDIS_MNEMONIC_OUT: case ZYDIS_MNEMONIC_INSB:
+          case ZYDIS_MNEMONIC_INSD: case ZYDIS_MNEMONIC_INSW: case ZYDIS_MNEMONIC_OUTSB:
+          case ZYDIS_MNEMONIC_OUTSD: case ZYDIS_MNEMONIC_OUTSW: case ZYDIS_MNEMONIC_CLI:
+          case ZYDIS_MNEMONIC_STI: case ZYDIS_MNEMONIC_HLT: case ZYDIS_MNEMONIC_IRETD:
+          case ZYDIS_MNEMONIC_IRET: case ZYDIS_MNEMONIC_LES: case ZYDIS_MNEMONIC_LDS:
+          case ZYDIS_MNEMONIC_ARPL: case ZYDIS_MNEMONIC_BOUND: case ZYDIS_MNEMONIC_AAA:
+          case ZYDIS_MNEMONIC_AAD: case ZYDIS_MNEMONIC_AAM: case ZYDIS_MNEMONIC_AAS:
+          case ZYDIS_MNEMONIC_DAA: case ZYDIS_MNEMONIC_DAS: case ZYDIS_MNEMONIC_SALC:
+          case ZYDIS_MNEMONIC_INTO: case ZYDIS_MNEMONIC_SLDT: case ZYDIS_MNEMONIC_VERW:
+          case ZYDIS_MNEMONIC_RDPMC: case ZYDIS_MNEMONIC_ENTER: case ZYDIS_MNEMONIC_INT1:
+            bogus = true;
+            break;
+          default:
+            if (in.d.mnemonic == ZYDIS_MNEMONIC_JMP &&
+                in.ops[0].type == ZYDIS_OPERAND_TYPE_POINTER)
+              bogus = true;  // far jmp
+            break;
+        }
+        if (bogus) break;
+      }
+      if (bogus) {
+        // Only its first instruction counts as seen: the data can run
+        // straight into code nothing refers to, which a later sweep starts
+        // at once the bytes before it are rejected one by one.
+        p.entries.erase(e);
+        p.weak.erase(e);
+        gap_rejected++;
+        const lifter::Module* im = p.TextOf(e);
+        auto first = f.insns.find(e);
+        const uint64_t end = first == f.insns.end() ? e + 1 : first->second.next();
+        for (uint64_t b = e; b < end && b < im->text_hi; b++) covered[im][b - im->text_lo] = true;
+        continue;
+      }
+    }
+    for (const auto& [va, in] : f.insns) {
+      const lifter::Module* im = p.TextOf(va);
+      if (!im) continue;
+      auto& cv = covered[im];
+      for (uint64_t b = va; b < in.next() && b < im->text_hi; b++) cv[b - im->text_lo] = true;
+    }
+    for (const auto& [jva, ts] : p.jumptables) {
+      (void)ts;
+      auto jt = f.insns.find(jva);
+      if (jt == f.insns.end() || jt->second.ops[0].type != ZYDIS_OPERAND_TYPE_MEMORY) continue;
+      const uint64_t t0 = static_cast<uint32_t>(jt->second.ops[0].mem.disp.value);
+      const lifter::Module* tm = p.TextOf(t0);
+      if (!tm) continue;
+      for (uint64_t a = t0; a + 4 <= tm->text_hi; a += 4) {
+        if (p.TextOf(p.mem.read<uint32_t>(a)) != tm) break;
+        for (int k = 0; k < 4; k++) covered[tm][a + k - tm->text_lo] = true;
       }
     }
     for (const auto* s : {&f.direct_calls, &f.tail_calls, &f.setjmp_returns})
@@ -296,19 +404,52 @@ int main(int argc, char** argv) {
       }
     }
   }
+  if (!sweep_gaps || !only.empty()) break;
+  // --sweep-gaps: code that nothing found refers to (reached through a
+  // computed address, or never) is lifted too, as weak entries: each run
+  // of .text no function decodes, past padding and pointer tables, starts
+  // one, until no gap is left that decodes.
+  size_t before_sweep = from_gaps;
+  for (const auto& m : p.modules) {
+    auto& cv = covered[&m];
+    for (uint64_t a = m.text_lo; a < m.text_hi;) {
+      if (cv[a - m.text_lo]) { a++; continue; }
+      const uint8_t b0 = p.mem.read<uint8_t>(a);
+      if (b0 == 0xCC || b0 == 0x90 || b0 == 0x00) { a++; continue; }
+      // A run of dwords that point into this .text: a table, not code.
+      if (a % 4 == 0 && a + 8 <= m.text_hi &&
+          p.TextOf(p.mem.read<uint32_t>(a)) == &m && p.TextOf(p.mem.read<uint32_t>(a + 4)) == &m) {
+        while (a + 4 <= m.text_hi && p.TextOf(p.mem.read<uint32_t>(a)) == &m) a += 4;
+        continue;
+      }
+      lifter::Insn in;
+      if (p.entries.count(a) || !dec.Decode(p, a, &in) || !in.ok) {
+        a++;
+        continue;
+      }
+      candidate(&m, a, &from_gaps);
+      gap_entries.insert(a);
+      // Skip the rest of this gap; the next sweep sees what is still left.
+      while (a < m.text_hi && !cv[a - m.text_lo]) a++;
+    }
+  }
+  if (from_gaps == before_sweep) break;
+  }
+  for (const auto& [va, n] : symbol_tables) extended_tables += p.jumptables[va].size() > n;
   std::printf("functions: %zu (%zu from Ghidra/exports, %zu discovered: "
-              "%zu via code pointers, %zu via data pointers; %zu weak)\n",
+              "%zu via code pointers, %zu via data pointers, %zu from gaps, %zu case targets; %zu weak)\n",
               p.entries.size(), initial, p.entries.size() - initial,
-              from_code_ptrs, from_data_ptrs, p.weak.size());
-  std::printf("jump tables: %zu from Ghidra, %zu recovered\n",
-              p.jumptables.size() - recovered_tables, recovered_tables);
+              from_code_ptrs, from_data_ptrs, from_gaps, from_tables, p.weak.size());
+  std::printf("jump tables: %zu from Ghidra (%zu extended), %zu recovered\n",
+              p.jumptables.size() - recovered_tables, extended_tables, recovered_tables);
 
   // Pass 2: final CFGs and emission.
   std::filesystem::create_directories(outdir);
   lifter::Emitter em(p, dec);
   lifter::EmitStats stats;
   std::map<std::string, std::string> files;
-  std::string body, report_warnings;
+  std::string body, report_warnings, report_dispatch;
+  std::set<uint64_t> lifted_insns;
   std::set<uint64_t> refs;
   uint64_t file_insns = 0;
   int file_no = 0;
@@ -349,6 +490,28 @@ int main(int argc, char** argv) {
     }
     lifter::Function f;
     lifter::BuildFunction(p, dec, e, &f);
+    if (dump_discovery)
+      for (const auto& [va, in] : f.insns) lifted_insns.insert(va);
+    // Indirect jumps left to the dispatcher (no table): each one is a
+    // place where a target the lifter did not find is fatal at run time.
+    for (auto it = f.insns.begin(); it != f.insns.end(); ++it) {
+      const lifter::Insn& in = it->second;
+      uint64_t t;
+      if (!in.ok || in.d.mnemonic != ZYDIS_MNEMONIC_JMP ||
+          lifter::Classify(p, f, in, &t) != lifter::Flow::TailDispatch)
+        continue;
+      char buf[64];
+      std::snprintf(buf, sizeof buf, "== %08llX in %08llX\n", (unsigned long long)in.va,
+                    (unsigned long long)e);
+      report_dispatch += buf;
+      auto b = it;
+      for (int k = 0; k < 10 && b != f.insns.begin(); k++) --b;
+      for (auto j = b; ; ++j) {
+        std::snprintf(buf, sizeof buf, "  %08llX ", (unsigned long long)j->first);
+        report_dispatch += buf + dec.Format(j->second) + "\n";
+        if (j == it) break;
+      }
+    }
     for (const auto& w : f.warnings) {
       char buf[32];
       std::snprintf(buf, sizeof buf, "%08llX: ", (unsigned long long)e);
@@ -444,6 +607,35 @@ int main(int argc, char** argv) {
     }
   }
   WriteIfChanged(std::filesystem::path(outdir) / "lift_report.txt", report);
+  WriteIfChanged(std::filesystem::path(outdir) / "dispatch_report.txt", report_dispatch);
+  if (dump_discovery) {  // what discovery found, for analysis
+    std::string jt;
+    for (const auto& [va, ts] : p.jumptables) {
+      char buf[32];
+      std::snprintf(buf, sizeof buf, "%08llX", (unsigned long long)va);
+      jt += buf;
+      for (uint64_t t : ts) {
+        std::snprintf(buf, sizeof buf, " %08llX", (unsigned long long)t);
+        jt += buf;
+      }
+      jt += "\n";
+    }
+    std::string en;
+    for (uint64_t e : p.entries) {
+      char buf[32];
+      std::snprintf(buf, sizeof buf, "%08llX\n", (unsigned long long)e);
+      en += buf;
+    }
+    WriteIfChanged(std::filesystem::path(outdir) / "final_jumptables.txt", jt);
+    WriteIfChanged(std::filesystem::path(outdir) / "final_entries.txt", en);
+    std::string li;
+    for (uint64_t v : lifted_insns) {
+      char buf[32];
+      std::snprintf(buf, sizeof buf, "%08llX\n", (unsigned long long)v);
+      li += buf;
+    }
+    WriteIfChanged(std::filesystem::path(outdir) / "lifted_insns.txt", li);
+  }
   std::printf("instructions: %llu, unimplemented sites: %llu, files: %zu\n",
               (unsigned long long)stats.insns, (unsigned long long)unimpl,
               files.size());
