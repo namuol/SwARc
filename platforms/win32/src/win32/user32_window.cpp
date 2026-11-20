@@ -1140,9 +1140,11 @@ void InjectTestFocus() {
 
 // Test hook: <ID>_TEST_INPUT=<file> replays scripted input, one command
 // per line, times in seconds since the first event pump:
-//   <t> goto <x> <y>      move the game's cursor to client (x, y): it is
-//                         driven by relative motion, so this homes it to
-//                         the top-left corner first, over a few frames
+//   <t> goto <x> <y> [step]   move the game's cursor to client (x, y): it
+//                         is driven by relative motion, so this homes it to
+//                         the top-left corner first, over a few frames, then
+//                         moves in steps of at most `step` px (default 200;
+//                         small ones for games that accelerate the cursor)
 //   <t> move <dx> <dy>    relative motion
 //   <t> pointer <x> <y>   the host pointer is at client pixel (x, y)
 //                         (the game's cursor should follow it exactly),
@@ -1213,20 +1215,30 @@ void InjectTestInput() {
       int n = std::sscanf(line, "%lf %31s %63s %63s", &t, cmd, a, b);
       if (n < 2) continue;
       std::string c = cmd;
-      if (c == "goto" && n == 4) {
+      if (c == "goto" && n >= 4) {
         // Home: two big moves (the virtual cursor clamps at the edge and
-        // the game re-centres it every frame), then steps of <= 200 px.
+        // the game re-centres it every frame), then steps of <= 200 px
+        // (or the given step, for games that accelerate large motion),
+        // 0.1 s apart (proportionally less for smaller steps).
+        char st[32] = {};
+        std::sscanf(line, "%*f %*s %*s %*s %31s", st);
+        float step = *st ? std::max(1.0f, float(std::atof(st))) : 200.0f;
         q.push_back(motion(t, -4000, -4000));
         q.push_back(motion(t + 0.1, -4000, -4000));
         q.push_back(motion(t + 0.2, -4000, -4000));
         float x = std::atof(a), y = std::atof(b);
-        double tt = t + 0.3;
+        double tt = t + 0.3, gap = std::max(0.03, 0.1 * step / 200.0);
         while (x > 0 || y > 0) {
-          float sx = std::min(x, 200.0f), sy = std::min(y, 200.0f);
+          float sx = std::min(x, step), sy = std::min(y, step);
+          if (*st) {  // a given step: both axes in proportion (a straight path)
+            float k = std::min(1.0f, step / std::max(x, y));
+            sx = x - x * k < 0.5f ? x : x * k;
+            sy = y - y * k < 0.5f ? y : y * k;
+          }
           q.push_back(motion(tt, sx, sy));
           x -= sx;
           y -= sy;
-          tt += 0.1;
+          tt += gap;
         }
       } else if (c == "pointer" && n == 4) {
         SDL_Event e{};
