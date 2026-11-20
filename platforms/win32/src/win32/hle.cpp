@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cctype>
 #include <map>
+#include <mutex>
 #include <set>
 #include <vector>
 
@@ -85,8 +86,13 @@ gaddr ProcAddress(gaddr hmodule, const std::string& name) {
     auto ex = DeclaredExports().find(dll);
     if (ex != DeclaredExports().end() && ex->second.count(name))
       return ThunkFor(dll, name);  // a real export; fatal if ever called
-    WarnF("GetProcAddress(%s, %s): not implemented, returning NULL\n",
-          dll.c_str(), name.c_str());
+    // Once per name: some games probe an optional export on every load.
+    static std::mutex mu;
+    static std::set<std::string> warned;
+    std::lock_guard<std::mutex> l(mu);
+    if (warned.insert(dll + "!" + name).second)
+      WarnF("GetProcAddress(%s, %s): not implemented, returning NULL (warned once)\n",
+            dll.c_str(), name.c_str());
     return 0;
   }
   return ThunkFor(dll, name);
