@@ -106,12 +106,12 @@ struct FsUniforms {
 // specular. Stages after the end and unused fields stay zero, so states
 // that draw alike share a variant.
 struct FsVariantKey {
-  int8_t color[8][4], alpha[8][4], stage[8][3];
+  int8_t color[8][4], alpha[8][4], stage[8][4];
   int8_t func, fog, table, flat, specular, discard;
 
   bool operator==(const FsVariantKey& o) const { return std::memcmp(this, &o, sizeof *this) == 0; }
 };
-static_assert(sizeof(FsVariantKey) == 94, "no padding: compared and hashed as bytes");
+static_assert(sizeof(FsVariantKey) == 102, "no padding: compared and hashed as bytes");
 
 // ---- small maths on D3D row-major matrices (row vectors: v * M)
 
@@ -447,7 +447,7 @@ class GpuDevice final : public Device {
     fs.code_size = fs_size;
     fs.stage = SDL_GPU_SHADERSTAGE_FRAGMENT;
     fs.num_storage_buffers = 0;
-    fs.num_samplers = 8;
+    fs.num_samplers = 16;  // ff.frag: eight 2D, then eight cube
     fs_ = SDL_CreateGPUShader(dev_, &fs);
     fs.code = reinterpret_cast<const Uint8*>(kFfFragAlphaTest);
 #if defined(__APPLE__)
@@ -2098,6 +2098,7 @@ void r_color0(inout vec4 c) {
     PipelineKey key;
     int vs = 0, fs = 0, vl = 0;  // vs_list_, fs_list_, vl_list_
     SDL_GPUTexture* tex[8] = {};
+    bool cube[8] = {};  // tex[i] is a cube texture (ff.frag's cube samplers)
     SDL_GPUSampler* smp[8] = {};
     SDL_GPUViewport viewport{};
     SDL_Rect scissor{};
@@ -2607,7 +2608,7 @@ void r_color0(inout vec4 c) {
         stencil_ref = c.stencil_ref;
         have_rect = true;
       };
-      SDL_GPUTextureSamplerBinding ff_samplers[8];
+      SDL_GPUTextureSamplerBinding ff_samplers[16];
       bool have_ff_samplers = false;  // ff_samplers are bound (no other draw's since)
       for (const Cmd& c : cmds_) {
         if (c.program < 0) {
@@ -2709,10 +2710,15 @@ void r_color0(inout vec4 c) {
             SDL_PushGPUFragmentUniformData(cmd, 0, &fs_list_[size_t(c.fs)], sizeof(FsUniforms));
             fs = c.fs;
           }
-          SDL_GPUTextureSamplerBinding tb[8];
-          for (int i = 0; i < 8; i++) tb[i] = {c.tex[i] ? c.tex[i] : dummy_, c.smp[i]};
+          // ff.frag's eight 2D samplers, then its eight cube ones: a
+          // stage's texture in the one of its type, a dummy in the other.
+          SDL_GPUTextureSamplerBinding tb[16];
+          for (int i = 0; i < 8; i++) {
+            tb[i] = {c.tex[i] && !c.cube[i] ? c.tex[i] : dummy_, c.smp[i]};
+            tb[8 + i] = {c.cube[i] ? c.tex[i] : dummy_cube_, c.smp[i]};
+          }
           if (!have_ff_samplers || std::memcmp(tb, ff_samplers, sizeof tb)) {
-            SDL_BindGPUFragmentSamplers(rp, 0, tb, 8);
+            SDL_BindGPUFragmentSamplers(rp, 0, tb, 16);
             std::memcpy(ff_samplers, tb, sizeof tb);
             have_ff_samplers = true;
           }
@@ -3189,7 +3195,7 @@ void r_color0(inout vec4 c) {
         key.color[s][i] = int8_t(f.color[s][i]);
         key.alpha[s][i] = int8_t(f.alpha[s][i]);
       }
-      for (int i = 0; i < 3; i++) key.stage[s][i] = int8_t(f.stage[s][i]);
+      for (int i = 0; i < 4; i++) key.stage[s][i] = int8_t(f.stage[s][i]);
     }
     key.func = discard ? int8_t(f.mode[0]) : 0;
     key.fog = int8_t(f.mode[2]);
@@ -3232,7 +3238,7 @@ void r_color0(inout vec4 c) {
     };
     ivec4s("k_color", [&](int s) { return std::array<int, 4>{k.color[s][0], k.color[s][1], k.color[s][2], k.color[s][3]}; });
     ivec4s("k_alpha", [&](int s) { return std::array<int, 4>{k.alpha[s][0], k.alpha[s][1], k.alpha[s][2], k.alpha[s][3]}; });
-    ivec4s("k_stage", [&](int s) { return std::array<int, 4>{k.stage[s][0], k.stage[s][1], k.stage[s][2], 0}; });
+    ivec4s("k_stage", [&](int s) { return std::array<int, 4>{k.stage[s][0], k.stage[s][1], k.stage[s][2], k.stage[s][3]}; });
     defs += "const ivec4 k_mode = ivec4(" + std::to_string(k.func) + ", 0, " + std::to_string(k.fog) +
             ", " + std::to_string(k.table) + ");\n";
     defs += "const ivec4 k_mode2 = ivec4(" + std::to_string(k.flat) + ", " +
@@ -3286,7 +3292,7 @@ void r_color0(inout vec4 c) {
       fs.format = format;
       fs.stage = SDL_GPU_SHADERSTAGE_FRAGMENT;
       fs.num_uniform_buffers = 1;
-      fs.num_samplers = 8;
+      fs.num_samplers = 16;  // ff.frag: eight 2D, then eight cube
       sh = SDL_CreateGPUShader(dev_, &fs);
       if (!sh) log = SDL_GetError();
     }
@@ -3429,6 +3435,7 @@ void r_color0(inout vec4 c) {
         b.gen = tex_gen_;
         b.id = st.textures[s];
         b.tex = it != textures_.end() ? it->second.tex : nullptr;
+        b.cube = it != textures_.end() && it->second.cube;
       }
       const SamplerKey k = StageSampler(st, s);
       if (!b.smp || std::memcmp(&k, &b.key, sizeof k) != 0) {
@@ -3436,6 +3443,7 @@ void r_color0(inout vec4 c) {
         b.smp = Sampler(k);
       }
       c.tex[s] = b.tex;
+      c.cube[s] = b.cube;
       c.smp[s] = b.smp;
     }
   }
@@ -3798,6 +3806,7 @@ void r_color0(inout vec4 c) {
         u.alpha[s][3] = int(t[27]);
         u.stage[s][0] = int(t[28]);
         u.stage[s][1] = bound ? 1 : 0;
+        u.stage[s][3] = bound && textures_.at(st.textures[s]).cube ? 1 : 0;
         uint32_t ttf = t[24], count = ttf & 0xFF;
         u.stage[s][2] = (ttf & 256) && count >= 2 ? int(count) - 1 : -1;
       }
@@ -4656,6 +4665,7 @@ void r_color0(inout vec4 c) {
     uint64_t gen = ~0ull;
     TextureId id = 0;
     SDL_GPUTexture* tex = nullptr;
+    bool cube = false;
     SamplerKey key{};
     SDL_GPUSampler* smp = nullptr;
   };
