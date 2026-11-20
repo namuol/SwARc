@@ -934,6 +934,10 @@ class Translator {
             post += "  " + var + "." + m + " = " + v + "." + m + ";\n";
           }
         }
+        bool fog = false;
+        for (const auto& [reg, sm] : vs3_outputs_) fog = fog || sm.first.usage == kFog;
+        // A vertex shader that writes no fog: none (pixel shaders read it).
+        if (!fog) post += "  " + Varying({kFog, 0}, true) + " = vec4(1.0, 0.0, 0.0, 1.0);\n";
       } else {
         g += "vec4 r_opos, r_ofog, r_opts;\nvec4 r_od[2];\nvec4 r_ot[8];\n";
         pre += "  r_opos = vec4(0.0); r_ofog = vec4(0.0); r_opts = vec4(1.0);\n";
@@ -954,6 +958,9 @@ class Translator {
             post += "  " + Varying({kTexcoord, num}, true) + " = r_ot[" + std::to_string(num) + "];\n";
           }
         }
+        // A vertex shader that writes no fog: none (pixel shaders read it).
+        if (!written_.count({RASTOUT, 1}))
+          post += "  " + Varying({kFog, 0}, true) + " = vec4(1.0, 0.0, 0.0, 1.0);\n";
       }
     } else {
       g += "vec4 r_v[16];\nvec4 r_oc[4];\nvec4 r_odepth;\n";
@@ -999,6 +1006,10 @@ class Translator {
           post += "  gl_FragDepth = r_odepth.x;\n";
           out_->writes_depth = true;
         }
+      // Fog (before shader model 3 the device applies it after the
+      // shader), then the alpha test.
+      if ((out_->color_outputs & 1) && major_ < 3)
+        post += "  r_fog(r_c0, " + Varying({kFog, 0}, false) + ".x);\n";
       if (out_->color_outputs & 1) post += "  r_color0(r_c0);\n";
     }
     pre = "  for (int i = 0; i < " + std::to_string(std::max(temps_, 1u)) + "; i++) r_t[i] = vec4(0.0);\n" + pre;
