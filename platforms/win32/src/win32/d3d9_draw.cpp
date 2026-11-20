@@ -300,10 +300,6 @@ std::string FfPixelSource(const Device& d, const hlsl::Program& vs) {
                                   : "    cur = float4(rgb, al); }\n";
   }
   if (d.rs[kRsSpecularEnable]) body += "  cur.rgb = saturate(cur.rgb + spec.rgb);\n";
-  if (d.rs[kRsFogEnable] && Writes(vs, hlsl::kFog, 0)) {
-    in += "float i_fog : FOG, ";
-    body += "  cur.rgb = lerp(fogc.rgb, cur.rgb, saturate(i_fog));\n";
-  }
   for (uint32_t i = 0; i < 8; i++)
     if (tc_in[i]) {
       char b[64];
@@ -311,12 +307,13 @@ std::string FfPixelSource(const Device& d, const hlsl::Program& vs) {
       in += b;
     }
   if (in.size() >= 2) in.resize(in.size() - 2);
-  return "float4 tf : register(c0);\nfloat4 fogc : register(c1);\n" + samplers +
+  return "float4 tf : register(c0);\n" + samplers +
          "float4 main(" + in + ") : COLOR0 {\n" + body + "  return cur;\n}\n";
 }
 
 // The generated pixel shader for the current state behind `vs`, and its
-// constants (c0 texture factor, c1 fog colour) in *consts.
+// constants (c0 texture factor) in *consts. Fog is the device's, after
+// the shader (gfx).
 gfx::ShaderId FfPixelShader(Device& d, const hlsl::Program& vs, float (*consts)[4]) {
   std::string src = FfPixelSource(d, vs);
   auto unpack = [](uint32_t argb, float* out) {
@@ -326,7 +323,6 @@ gfx::ShaderId FfPixelShader(Device& d, const hlsl::Program& vs, float (*consts)[
     out[3] = float(argb >> 24) / 255.0f;
   };
   unpack(d.rs[kRsTextureFactor], consts[0]);
-  unpack(d.rs[34], consts[1]);  // D3DRS_FOGCOLOR
   auto it = d.ff_pixel_shaders.find(src);
   if (it != d.ff_pixel_shaders.end()) return it->second;
   hlsl::Program p;
@@ -349,8 +345,9 @@ gfx::ShaderId FfPixelShader(Device& d, const hlsl::Program& vs, float (*consts)[
 // (black), and each stage's texture coordinates: its TEXCOORDINDEX set, or
 // generated in camera space (normal, position, reflection vector, sphere
 // map), then through the stage's transform when TEXTURETRANSFORMFLAGS has a
-// count (D3D's rules: a 2D set enters as (u, v, 1, 0)). Not done here
-// (warned once): lighting, fog.
+// count (D3D's rules: a 2D set enters as (u, v, 1, 0)), and the vertex fog
+// factor (c44: FOGSTART, FOGEND, FOGDENSITY). Not done here (warned once):
+// lighting.
 std::string FfVertexSource(const Device& d, uint32_t fvf) {
   const bool rhw = (fvf & 0x400E) == 0x004;
   const bool normal = (fvf & 0x010) != 0;
@@ -375,7 +372,14 @@ std::string FfVertexSource(const Device& d, uint32_t fvf) {
   }
   body += (fvf & 0x040) ? "  o.diff = v.diff;\n" : "  o.diff = float4(1.0, 1.0, 1.0, 1.0);\n";
   body += (fvf & 0x080) ? "  o.spec = v.spec;\n" : "  o.spec = float4(0.0, 0.0, 0.0, 0.0);\n";
-  bool camera = false;  // camera-space position / normal needed
+  // Vertex fog: the factor from the camera-space depth (or distance with
+  // RANGEFOGENABLE) by FOGVERTEXMODE, with c44 = (start, end, density);
+  // the specular alpha for pretransformed vertices or FOGVERTEXMODE NONE.
+  // Table fog (FOGTABLEMODE) is the pixel stage's, from the depth.
+  const uint32_t fog_mode = d.rs[140];
+  const bool fog_depth = d.rs[kRsFogEnable] && !d.rs[35] && !rhw && fog_mode >= 1 && fog_mode <= 3;
+  out += "  float fog : FOG;\n";
+  bool camera = fog_depth;  // camera-space position / normal needed
   std::string gen;
   for (uint32_t s = 0; s < 8; s++) {
     const uint32_t set = d.tss[s][11] & 0xFFFF, tci = d.tss[s][11] >> 16;
@@ -416,10 +420,20 @@ std::string FfVertexSource(const Device& d, uint32_t fvf) {
     body += "  float3 e = -normalize(cp);\n  float3 cr = 2.0 * dot(e, cn) * cn - e;\n";
   }
   body += gen;
+  if (fog_depth) {
+    body += d.rs[48] ? "  float fd = length(cp);\n" : "  float fd = cp.z;\n";
+    body += fog_mode == 1   ? "  o.fog = exp(-fd * fogp.z);\n"
+            : fog_mode == 2 ? "  o.fog = exp(-(fd * fogp.z) * (fd * fogp.z));\n"
+                            : "  o.fog = fogp.y == fogp.x ? (fd < fogp.y ? 1.0 : 0.0)"
+                              " : (fogp.y - fd) / (fogp.y - fogp.x);\n";
+  } else {
+    body += "  o.fog = o.spec.a;\n";
+  }
   out += "};\n";
   std::string decl = "float4 m0 : register(c0);\nfloat4 m1 : register(c1);\nfloat4 m2 : register(c2);\n"
                      "float4 m3 : register(c3);\nfloat4 vp : register(c4);\nfloat4 wv0 : register(c5);\n"
-                     "float4 wv1 : register(c6);\nfloat4 wv2 : register(c7);\n";
+                     "float4 wv1 : register(c6);\nfloat4 wv2 : register(c7);\n"
+                     "float4 fogp : register(c44);\n";
   for (uint32_t s = 0; s < 8; s++)
     if (d.tss[s][24] & 0xFF)
       for (uint32_t r = 0; r < 4; r++)
@@ -430,15 +444,11 @@ std::string FfVertexSource(const Device& d, uint32_t fvf) {
 
 // Whether the fixed-function vertex state is beyond FfVertexSource.
 void NoteFfVertexGaps(const Device& d, uint32_t fvf) {
-  static bool warned_light = false, warned_fog = false;
+  static bool warned_light = false;
   const bool rhw = (fvf & 0x400E) == 0x004;
   if (!rhw && d.rs[137] && (fvf & 0x010) && !warned_light) {  // LIGHTING with normals
     warned_light = true;
     WarnF("d3d9: fixed-function lighting with a pixel shader is not emulated (vertex colours used)\n");
-  }
-  if (!rhw && d.rs[28] && d.rs[140] && !warned_fog) {  // FOGENABLE with FOGVERTEXMODE
-    warned_fog = true;
-    WarnF("d3d9: fixed-function vertex fog with a pixel shader is not emulated\n");
   }
 }
 
@@ -491,6 +501,8 @@ const Device::FfVertexShader& FfVertexShaderFor(Device& d, float (*c)[4]) {
   c[4][1] = float(v.Y);
   c[4][2] = v.Width ? 2.0f / float(v.Width) : 0.0f;
   c[4][3] = v.Height ? -2.0f / float(v.Height) : 0.0f;
+  for (int i = 0; i < 3; i++) std::memcpy(&c[44][i], &d.rs[36 + i], 4);  // FOGSTART, END, DENSITY
+  c[44][3] = 0.0f;
   return it->second;
 }
 
