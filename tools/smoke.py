@@ -31,18 +31,30 @@ A case fails if:
   - its "check" (a command; "{out}" is the case's result folder, holding
     the frames kept with "shot_every": N) exits non-zero.
 Other case keys: "args" (game arguments, after "--"), "env" (variables for
-the game, "{prefix}" filled in: <PREFIX>_TEST_HIDE hides intro videos a
-game finds by listing their folder), "fresh_data": true
-(new per-user data each run, as $XDG_DATA_HOME) and "data" (a folder
-copied in as that data first: settings that skip a first-run screen).
+the game, "{prefix}" filled in: <PREFIX>_TEST_HIDE hides files from the
+game, e.g. intro videos), "fresh_data": true (new per-user data each run,
+as $XDG_DATA_HOME) and "data" (a folder copied in as that data first:
+settings that skip a first-run screen; "data" at the top level is every
+case's default).
+
+Repo-level keys for running a repo's cases side by side:
+  "build": a command (list) that builds what every case runs. smoke.py
+     runs it once, before the repo's cases, and then sets
+     <PREFIX>_NO_BUILD=1: the run script must skip its own build then.
+  "parallel": true: the cases may run at once. The run script must write
+     its log to $<PREFIX>_RUN_LOG (smoke.py passes the case's own), and
+     each case gets its own per-user data ($XDG_DATA_HOME, "data" copied
+     in), so no case sees another's settings or saves.
+Without "parallel" a repo's cases run one after another and the log is
+read from build/run.log.
 A case with no reference saves its shot as the reference (NEW: look at it).
 --update replaces the references with this run's shots. References are the
 game's own pixels: keep smoke/ref/ out of git.
 
--j N runs N repos at once (each repo's cases one after another: they share
-its build/run.log). Games then load slower, so timeouts (`seconds` and the
-waits') are multiplied by N: a pass costs no more, a failure takes longer.
--j 3 runs every recomp in about 100 s (docs/smoke-timings.md).
+-j N runs up to N games at once (cases of repos without "parallel" still
+one after another). Games then load slower, so timeouts (`seconds` and the
+waits') are multiplied by the number running at once: a pass costs no
+more, a failure takes longer. Timings: docs/smoke-timings.md.
 
 Runs are muted (SDL_AUDIO_DRIVER=dummy) unless SDL_AUDIO_DRIVER is set.
 
@@ -59,6 +71,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import threading
 import time
 
 SAMPLE = 4        # compare every 4th pixel in each direction
@@ -155,13 +168,15 @@ def run_case(repo, defaults, case, update, scale=1):
     env = dict(os.environ)
     # Muted (SDL's dummy audio driver) unless SDL_AUDIO_DRIVER is set.
     env.setdefault('SDL_AUDIO_DRIVER', 'dummy')
-    # "fresh_data": per-user data (saves, settings) made anew for each run,
-    # from the "data" folder if given (copied as $XDG_DATA_HOME), so no
-    # earlier run or play session changes what the game shows.
-    if case.get("fresh_data") or case.get("data"):
+    # Per-user data (saves, settings) made anew for each run, from the
+    # "data" folder if given (copied as $XDG_DATA_HOME), so no earlier run,
+    # play session or case running alongside changes what the game shows.
+    # Cases of a "parallel" repo always get their own.
+    seed = case.get("data", defaults.get("data"))
+    if case.get("fresh_data") or seed or defaults.get("parallel"):
         data = os.path.join(out, "data")
-        if case.get("data"):
-            shutil.copytree(os.path.join(repo, case["data"]), data)
+        if seed:
+            shutil.copytree(os.path.join(repo, seed), data)
         else:
             os.makedirs(data)
         env["XDG_DATA_HOME"] = data
@@ -173,6 +188,14 @@ def run_case(repo, defaults, case, update, scale=1):
     ends = script_exits(inp)
     env.update({f"{prefix}_TEST_INPUT": inp, f"{prefix}_SHOT_DIR": out,
                 f"{prefix}_BACKGROUND": "1", f"{prefix}_TEST_WAIT_SCALE": str(scale)})
+    # The run's log: the case's own if the run script takes one (a
+    # "parallel" repo's must), else the repo's build/run.log.
+    log_path = os.path.join(repo, "build", "run.log")
+    if defaults.get("parallel"):
+        log_path = os.path.join(out, "run.log")
+        env[f"{prefix}_RUN_LOG"] = log_path
+    if defaults.get("build"):  # built once before the cases (run_repo_build)
+        env[f"{prefix}_NO_BUILD"] = "1"
     if case.get("shot_every"):  # frames the "check" looks at
         env[f"{prefix}_SHOT_EVERY"] = str(case["shot_every"])
     elif not ends:  # frames counted from the saved ones; an exit logs the count
@@ -185,10 +208,10 @@ def run_case(repo, defaults, case, update, scale=1):
     took = time.time() - started
     with open(os.path.join(out, "try-run.txt"), "w") as f:
         f.write(proc.stdout)
-    log_path = os.path.join(repo, "build", "run.log")
     log = ""
     if os.path.exists(log_path):
-        shutil.copy(log_path, os.path.join(out, "run.log"))
+        if log_path != os.path.join(out, "run.log"):
+            shutil.copy(log_path, os.path.join(out, "run.log"))
         with open(log_path, errors="replace") as f:
             log = f.read()
 
@@ -257,21 +280,21 @@ def run_case(repo, defaults, case, update, scale=1):
     return status, took, problems, notes, out
 
 
-def run_repo(repo, only, update, scale=1):
-    """Runs one repo's cases in order (they share its build/run.log)."""
-    repo = os.path.abspath(repo)
-    with open(os.path.join(repo, "smoke", "cases.json")) as f:
-        spec = json.load(f)
-    results = []
-    for case in spec["cases"]:
-        if only and case["name"] not in only:
-            continue
-        label = f"{os.path.basename(repo)}/{case['name']}"
-        print(f"... {label} (up to {case['seconds']} s)", flush=True)
-        status, took, problems, notes, out = run_case(repo, spec, case, update, scale)
-        results.append((label, status, took, problems, notes, out))
-        print(f"{status:4}  {label}  {took:.0f} s  " + "; ".join(problems + notes), flush=True)
-    return results
+def build_repo(repo, spec):
+    """Runs the repo's "build" command once; None if it built, else why not."""
+    if not spec.get("build"):
+        return None
+    out = os.path.join(repo, "build", "smoke")
+    os.makedirs(out, exist_ok=True)
+    proc = subprocess.run(spec["build"], cwd=repo, stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT, text=True)
+    with open(os.path.join(out, "build.txt"), "w") as f:
+        f.write(proc.stdout)
+    if proc.returncode == 0:
+        return None
+    errors = [l for l in proc.stdout.splitlines() if "error" in l][:5]
+    return "build failed: " + ("; ".join(errors) or f"exit {proc.returncode}") + \
+        " (see " + os.path.join(out, "build.txt") + ")"
 
 
 def main():
@@ -280,14 +303,74 @@ def main():
     ap.add_argument("--update", action="store_true", help="replace references with this run's shots")
     ap.add_argument("--only", help="comma-separated case names")
     ap.add_argument("-j", "--jobs", type=int, default=1,
-                    help="repos run at once (each repo's cases still run one at a time)")
+                    help="games run at once (a repo's cases at once only if its cases.json has \"parallel\")")
     args = ap.parse_args()
     only = set(args.only.split(",")) if args.only else None
+    jobs = max(1, args.jobs)
     started = time.time()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
-        scale = min(max(1, args.jobs), len(args.repos))
-        per_repo = list(pool.map(lambda r: run_repo(r, only, args.update, scale), args.repos))
-    results = [r for rs in per_repo for r in rs]
+
+    repos = []  # (repo, spec, its cases)
+    for r in args.repos:
+        repo = os.path.abspath(r)
+        with open(os.path.join(repo, "smoke", "cases.json")) as f:
+            spec = json.load(f)
+        cases = [c for c in spec["cases"] if not only or c["name"] in only]
+        if cases:
+            repos.append((repo, spec, cases))
+
+    # Builds first, all repos at once (most are up to date: a second each).
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(repos))) as pool:
+        broken = dict(zip([r for r, _, _ in repos],
+                          pool.map(lambda x: build_repo(x[0], x[1]), repos)))
+
+    # Then the cases: up to `jobs` games at once. A repo without "parallel"
+    # runs one case at a time (its cases share build/run.log). Cases start
+    # in the order given, repo by repo, skipping those of a busy repo.
+    pending = [(repo, spec, case) for repo, spec, cases in repos for case in cases]
+    # Timeouts scale with how many games can run at once.
+    scale = min(jobs, len(pending)) if pending else 1
+    results = {}
+    busy = set()
+    lock = threading.Condition()
+
+    def take():
+        with lock:
+            while True:
+                if not pending:
+                    return None
+                for i, (repo, spec, case) in enumerate(pending):
+                    if spec.get("parallel") or repo not in busy:
+                        busy.add(repo)
+                        return pending.pop(i)
+                lock.wait()
+
+    def worker():
+        while True:
+            item = take()
+            if item is None:
+                return
+            repo, spec, case = item
+            label = f"{os.path.basename(repo)}/{case['name']}"
+            print(f"... {label} (up to {case['seconds']} s)", flush=True)
+            if broken.get(repo):
+                status, took, problems, notes = "FAIL", 0.0, [broken[repo]], []
+                out = os.path.join(repo, "build", "smoke")
+            else:
+                status, took, problems, notes, out = run_case(repo, spec, case, args.update, scale)
+            print(f"{status:4}  {label}  {took:.0f} s  " + "; ".join(problems + notes), flush=True)
+            with lock:
+                results[id(case)] = (label, status, took, problems, notes, out)
+                if not spec.get("parallel"):
+                    busy.discard(repo)
+                lock.notify_all()
+
+    order = [id(c) for _, _, cases in repos for c in cases]
+    threads = [threading.Thread(target=worker) for _ in range(min(jobs, max(1, len(pending))))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    results = [results[k] for k in order]
     failed = sum(1 for r in results if r[1] == "FAIL")
     print()
     for label, status, took, problems, notes, out in results:
