@@ -1,0 +1,52 @@
+# Builds the player kit (external/SwARc/player/kit.py) on the oldest
+# supported macOS, so its bundled Homebrew libraries run there and on every
+# newer version. Pull requests that touch what goes into it, and manual
+# runs, keep it as a workflow artifact; a pushed v* tag also attaches it to
+# that tag's GitHub release, where install.sh downloads the latest one.
+#
+# Generated from SwARc's player/templates/kit.yml by
+# `external/SwARc/player/kit.py sync`: change it there, not here.
+name: kit
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - ".github/workflows/kit.yml"
+      - "recomplauncher.json"
+      - "install.sh"
+      - "tools/**"
+      - "src/**"
+      - "data/**"
+      - "patches/**"
+      - "*.manifest"
+      - "CMakeLists.txt"
+      - "cmake/**"
+permissions:
+  contents: write
+jobs:
+  kit:
+    runs-on: @RUNNER@
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: brew install @BREW@
+      - name: SwARc
+        run: tools/swarc.sh setup
+      - name: Generated files are current
+        run: python3 -I external/SwARc/player/kit.py sync --check
+      - name: Kit
+        run: python3 -I external/SwARc/player/kit.py build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: @ID@-kit-macos-arm64
+          path: dist/@ASSET@
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1 ||
+            gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes "Build kit for install.sh."
+          gh release upload "$GITHUB_REF_NAME" dist/@ASSET@ --clobber

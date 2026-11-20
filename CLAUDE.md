@@ -26,6 +26,10 @@ OS or middleware API goes here, even when a game is where it came up.
   tools/lifter_ppc and tests/ppc, the AArch64 core src/a64,
   tools/lifter_a64 and tests/a64; each platform module is
   platforms/<name> (Win32: platforms/win32).
+- player/ is what games' players need (the one-line installer, the build
+  kit, the player's build, the tart VM test): player/README.md. A game
+  describes itself in its recomplauncher.json; nothing game-specific goes
+  in player/.
 
 ## Build and test
 - Standalone (library tests only):
