@@ -87,14 +87,20 @@ struct GuestThreadExit {
   uint32_t code;
 };
 
-// <ID>_BACKGROUND=1 (used for automated test runs): never move or hide the
-// host pointer, don't take focus when the window appears, and answer
-// message boxes with their default button.
+// <ID>_BACKGROUND=1 (every automated test run; tools/smoke.py sets it):
+// keeps the run off the host's input. It never moves, hides or grabs the
+// host pointer, ignores the host's mouse, runs windowed, and answers
+// message boxes with their default button. The window still appears on
+// screen, and on macOS the game can still come to the front and take the
+// focus: SDL is only asked not to activate the window when it's shown, and
+// a newly launched app may activate anyway. It does not keep a run out of
+// the way of someone using the Mac: <ID>_HEADLESS does.
 bool Background();
 
-// <ID>_HEADLESS=1: Background(), and no window is ever shown: the game
-// draws and presents as usual (frames are counted, TEST_INPUT waits and
-// shots read them) but nothing reaches the screen.
+// <ID>_HEADLESS=1 (tools/smoke.py --headless): Background(), and no window
+// is ever shown: the game draws and presents as usual (frames are counted,
+// TEST_INPUT waits and shots read them) but nothing reaches the screen.
+// For test runs on a Mac someone is using.
 bool Headless();
 
 // Per-host-thread pointer to the guest thread running on it (null once it

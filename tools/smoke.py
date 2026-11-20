@@ -47,8 +47,12 @@ Repo-level keys for running a repo's cases side by side:
      in), so no case sees another's settings or saves.
 Without "parallel" a repo's cases run one after another and the log is
 read from build/run.log.
---headless runs the games with <PREFIX>_HEADLESS=1: their windows are never
-shown, so runs never take the focus (frames, waits and shots work as shown).
+Every case runs with <PREFIX>_BACKGROUND=1, which keeps it off the host's
+input (no pointer moves or grabs, the host's mouse ignored) but still shows
+its window, which can come to the front and take the focus. --headless
+runs the games with <PREFIX>_HEADLESS=1 as well: their windows are never
+shown, so runs stay out of the way of someone using the Mac (frames, waits
+and shots work as shown). Use it for runs on a Mac someone is using.
 A case with no reference saves its shot as the reference (NEW: look at it).
 --update replaces the references with this run's shots. References are the
 game's own pixels: keep smoke/ref/ out of git.
@@ -197,8 +201,9 @@ def run_case(repo, defaults, case, update, scale=1, headless=False, frames_scale
     env["RECOMP_PREFIX"] = prefix  # for a shared run script (player/run-installed.sh)
     env.update({f"{prefix}_TEST_INPUT": inp, f"{prefix}_SHOT_DIR": out,
                 f"{prefix}_BACKGROUND": "1", f"{prefix}_TEST_WAIT_SCALE": str(scale)})
-    # --headless: the game's windows are never shown (<PREFIX>_HEADLESS), so
-    # a run never takes the focus; frames, waits and shots work as before.
+    # <PREFIX>_BACKGROUND keeps the run off the host's input, but its window
+    # still shows and can take the focus. --headless: the game's windows are
+    # never shown (<PREFIX>_HEADLESS); frames, waits and shots work as before.
     if headless:
         env[f"{prefix}_HEADLESS"] = "1"
     # The run's log: the case's own if the run script takes one (a
@@ -316,7 +321,7 @@ def main():
     ap.add_argument("repos", nargs="+")
     ap.add_argument("--update", action="store_true", help="replace references with this run's shots")
     ap.add_argument("--headless", action="store_true",
-                    help="never show the games' windows, so runs never take the focus")
+                    help="never show the games' windows (<PREFIX>_HEADLESS): for runs on a Mac someone is using")
     ap.add_argument("--only", help="comma-separated case names")
     ap.add_argument("--frames-scale", type=float, default=1.0,
                     help="want this share of each case's min_frames (a slower GPU: 0.5 in a VM)")
