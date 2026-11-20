@@ -59,6 +59,7 @@ def load_config(root):
     c["name"] = doc["name"]
     c["find"] = doc["game"]["check"]["file"]
     c["env"] = x["id"].upper().replace("-", "_")
+    c["cmake_name"] = x.get("cmake_name", x["binary"])  # <cmake_name>_host, <cmake_name>_kit_parts
     c["kit_name"] = "%s-kit" % x["id"]
     c["asset"] = "%s-kit-macos-arm64.tar.gz" % x["id"]
     c.setdefault("kit", {})
@@ -157,7 +158,7 @@ def configure_and_build(root, c, build):
                        check=True, stdout=log, stderr=subprocess.STDOUT)
     print("building...")
     with open(os.path.join(build, "build.log"), "w") as log:
-        r = subprocess.run(["cmake", "--build", build, "--target", c["binary"] + "_kit_parts"],
+        r = subprocess.run(["cmake", "--build", build, "--target", c["cmake_name"] + "_kit_parts"],
                            stdout=log, stderr=subprocess.STDOUT)
     if r.returncode:
         with open(os.path.join(build, "build.log")) as f:
@@ -186,10 +187,10 @@ def assemble(root, c, build, kit):
         if not any(lib in t for t in linked):
             sys.exit("kit: the game's link line has no %s" % lib)
 
-    # The game's own objects (its <binary>_host target).
-    host = [e for e in cc if "/%s_host.dir/" % c["binary"] in e["command"]]
+    # The game's own objects (its <cmake_name>_host target).
+    host = [e for e in cc if "/%s_host.dir/" % c["cmake_name"] in e["command"]]
     if not host:
-        sys.exit("kit: no %s_host objects in %s" % (c["binary"], build))
+        sys.exit("kit: no %s_host objects in %s" % (c["cmake_name"], build))
     for e in host:
         toks = shlex.split(e["command"])
         obj = toks[toks.index("-o") + 1]
