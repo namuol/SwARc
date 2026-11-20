@@ -109,24 +109,9 @@ gfx::FfState DrawState(const Device& d, bool fixed) {
   // Stages from the first with COLOROP DISABLE (1) on are unused.
   bool active = true;
   for (uint32_t s = 0; s < 8; s++) {
-    // A cube texture: gfx's fixed-function pixel stage samples 2D textures
-    // only, so this stage and the ones after it are left out (the
-    // environment-map stage is the last one in practice). Warned once.
-    bool skip = false;
-    if (auto* ct = com::As<Texture>(d.textures[s]); active && ct && ct->cube && d.tss[s][1] != 1) {
-      static bool warned = false;
-      if (!warned) {
-        warned = true;
-        WarnF("d3d9: fixed-function stage %u with a cube texture: not supported, the stage "
-              "and later ones are skipped (warned once)\n", s);
-      }
-      active = false;
-      skip = true;
-    }
     active = active && d.tss[s][1] != 1;
     for (uint32_t t = 1; t < 33; t++)
       if (t < 13 || t > 21) f.tss[s][t] = d.tss[s][t];
-    if (skip) f.tss[s][1] = 1;  // D3DTOP_DISABLE
     // D3D9 moved these to sampler states. Filters: D3DTEXF (NONE 0, POINT
     // 1, LINEAR 2, ANISOTROPIC 3) to D3D7's magnification (anisotropic 5)
     // and mip (NONE 1, POINT 2, LINEAR 3) values.
@@ -141,7 +126,6 @@ gfx::FfState DrawState(const Device& d, bool fixed) {
     f.tss[s][20] = ss[9];                     // MAXMIPLEVEL
     f.tss[s][21] = ss[10];                    // MAXANISOTROPY
     auto* t = active ? com::As<Texture>(d.textures[s]) : nullptr;
-    if (t && t->cube) FatalF("d3d9: fixed-function stage %u with a cube texture", s);
     f.textures[s] = t ? t->tex : 0;
   }
   // The material and the first eight enabled lights (in index order: the
