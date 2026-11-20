@@ -1191,6 +1191,9 @@ class GpuDevice final : public Device {
   struct PsState {
     int32_t alpha[4];  // D3DCMPFUNC (ALWAYS when the test is off), ALPHAREF
     float bias[16];    // per sampler register: MIPMAPLODBIAS (R_BIAS on Metal)
+    float fog_color[4];
+    float fog[4];          // FOGSTART, FOGEND, FOGDENSITY
+    int32_t fog_mode[4];   // 0 off, 1 vertex (the FOG varying), 2 table; FOGTABLEMODE
   };
 
   static std::string Prelude(hlsl::Stage stage, uint32_t samplers) {
@@ -1271,11 +1274,26 @@ vec4 r_position(vec4 p) {
       p += "#define R_INT_BINDING " + binding(3, 1) + "\n";
       p += std::string("#define R_SAMPLER_BINDING(n) set = ") + (metal ? "0" : "2") + ", binding = n\n";
       p += "layout(std140, " + binding(3, 2) +
-           ") uniform r_ps_state { ivec4 r_alpha; vec4 r_bias[4]; };\n";
+           ") uniform r_ps_state { ivec4 r_alpha; vec4 r_bias[4]; vec4 r_fogc; vec4 r_fogp;"
+           " ivec4 r_fogm; };\n";
       // Metal samplers have no LOD bias (SDL_GPU drops it there): the
       // shader adds it where the level is implicit. Vulkan's apply it.
       p += metal ? "#define R_BIAS(n) r_bias[(n) >> 2][(n) & 3]\n" : "#define R_BIAS(n) 0.0\n";
-      p += R"(vec2 r_vpos() { return gl_FragCoord.xy - 0.5; }
+      p += R"(// Fog after a pixel shader (before shader model 3): the factor is the
+// vertex stage's FOG output (vertex fog), or from the depth by FOGTABLEMODE
+// (table fog); 1 keeps the colour, 0 is the fog colour.
+void r_fog(inout vec4 c, float vf) {
+  if (r_fogm.x == 0) return;
+  float f = vf;
+  if (r_fogm.x == 2) {
+    float d = gl_FragCoord.z;
+    if (r_fogm.y == 1) f = exp(-d * r_fogp.z);
+    else if (r_fogm.y == 2) f = exp(-(d * r_fogp.z) * (d * r_fogp.z));
+    else f = r_fogp.y == r_fogp.x ? (d < r_fogp.y ? 1.0 : 0.0) : (r_fogp.y - d) / (r_fogp.y - r_fogp.x);
+  }
+  c.rgb = mix(r_fogc.rgb, c.rgb, clamp(f, 0.0, 1.0));
+}
+vec2 r_vpos() { return gl_FragCoord.xy - 0.5; }
 float r_vface() { return gl_FrontFacing ? 1.0 : -1.0; }
 // The alpha test, on the alpha at 8-bit precision.
 void r_color0(inout vec4 c) {
@@ -1487,6 +1505,12 @@ void r_color0(inout vec4 c) {
     pst.alpha[0] = state.rs[15] ? int32_t(state.rs[25]) : 8;
     pst.alpha[1] = int32_t(state.rs[24] & 0xFF);
     for (uint32_t r = 0; r < 16 && d.sampler_states; r++) pst.bias[r] = AsFloat(d.sampler_states[r][8]);
+    if (state.rs[28]) {  // FOGENABLE: table fog when FOGTABLEMODE is set
+      pst.fog_mode[0] = state.rs[35] ? 2 : 1;
+      pst.fog_mode[1] = int32_t(state.rs[35]);
+    }
+    Argb(pst.fog_color, state.rs[34]);
+    for (int i = 0; i < 3; i++) pst.fog[i] = AsFloat(state.rs[36 + i]);
     PushUniform(sc, 5, &pst, sizeof pst);
 
     // Samplers: pixel 0-15 at 0-15, vertex 0-3 at 16-19.
