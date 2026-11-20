@@ -53,6 +53,7 @@ constexpr uint32_t DIERR_UNSUPPORTED = 0x80004001;
 constexpr uint32_t DIERR_DEVICENOTREG = 0x80040154;
 constexpr uint32_t DIERR_NOTACQUIRED = 0x8007000C;
 constexpr uint32_t DIERR_ACQUIRED = 0x800700AA;
+constexpr uint32_t DIERR_NOTFOUND = 0x80070002;
 
 // Device classes (EnumDevices) and types.
 constexpr uint32_t DI8DEVCLASS_ALL = 0, DI8DEVCLASS_DEVICE = 1,
@@ -66,7 +67,9 @@ constexpr uint32_t kGamepadType = DI8DEVTYPE_GAMEPAD | (2 << 8) | 0x10000;  // s
 
 constexpr uint32_t DISCL_EXCLUSIVE = 0x1;
 constexpr uint32_t DIGDD_PEEK = 0x1;
-constexpr uint32_t DIPROP_BUFFERSIZE = 1, DIPROP_AXISMODE = 2;
+constexpr uint32_t DIPROP_BUFFERSIZE = 1, DIPROP_AXISMODE = 2, DIPROP_GRANULARITY = 3;
+constexpr uint32_t DIPH_DEVICE = 0, DIPH_BYOFFSET = 1;
+constexpr uint32_t kWheelDelta = 120;
 constexpr uint32_t DIPROPAXISMODE_ABS = 0;
 constexpr uint32_t DIDC_ATTACHED = 0x1;
 
@@ -401,6 +404,16 @@ HLE_NAMED("dinput8.dll", "IDirectInputDevice8A::GetProperty", DID8_GetProperty, 
       if (d->keyboard) return DIERR_UNSUPPORTED;
       Wr32(ph + 16, d->absolute ? 0 : 1);
       return DI_OK;
+    // (DIPROPDWORD: dwObj at +8, dwHow at +12) The smallest step an axis
+    // reports: one count for X and Y, WHEEL_DELTA for the wheel, whose
+    // data are multiples of it. Games divide the wheel's motion by it.
+    case DIPROP_GRANULARITY: {
+      uint32_t obj = Rd32(ph + 8), how = Rd32(ph + 12);
+      if (d->keyboard || how != DIPH_BYOFFSET || obj > DIMOFS_Z || obj % 4)
+        return how == DIPH_DEVICE ? DIERR_INVALIDPARAM : DIERR_NOTFOUND;
+      Wr32(ph + 16, obj == DIMOFS_Z ? kWheelDelta : 1);
+      return DI_OK;
+    }
     default:
       RECOMP_TRACE("  GetProperty %X: unsupported\n", prop);
       return DIERR_UNSUPPORTED;
