@@ -60,6 +60,11 @@ more, a failure takes longer. Timings: docs/smoke-timings.md.
 
 Runs are muted (SDL_AUDIO_DRIVER=dummy) unless SDL_AUDIO_DRIVER is set.
 
+--frames-scale F wants F times each case's min_frames (a slower GPU, as in
+a VM). --run SCRIPT runs every case with SCRIPT instead of the repo's run script,
+and builds nothing: player/run-installed.sh tests the app a player install
+made (player/vm-test.sh).
+
 Results go to REPO/build/smoke/<name>/ (shot, run log, check output). Exit
 status 1 if any case failed.
 """
@@ -156,7 +161,7 @@ def script_exits(input_path):
         return any(line.split("#")[0].split()[1:2] == ["exit"] for line in f)
 
 
-def run_case(repo, defaults, case, update, scale=1, headless=False):
+def run_case(repo, defaults, case, update, scale=1, headless=False, frames_scale=1.0):
     name = case["name"]
     prefix = case.get("prefix", defaults.get("prefix"))
     script = case.get("run", defaults.get("run", "tools/try-run.sh"))
@@ -188,6 +193,7 @@ def run_case(repo, defaults, case, update, scale=1, headless=False):
     for k, v in case.get("env", {}).items():
         env[k.replace("{prefix}", prefix)] = v
     ends = script_exits(inp)
+    env["RECOMP_PREFIX"] = prefix  # for a shared run script (player/run-installed.sh)
     env.update({f"{prefix}_TEST_INPUT": inp, f"{prefix}_SHOT_DIR": out,
                 f"{prefix}_BACKGROUND": "1", f"{prefix}_TEST_WAIT_SCALE": str(scale)})
     # --headless: the game's windows are never shown (<PREFIX>_HEADLESS), so
@@ -245,8 +251,9 @@ def run_case(repo, defaults, case, update, scale=1, headless=False):
     m = re.search(r"TEST_INPUT: exit at [\d.]+ s, (\d+) frames presented", log)
     if m:
         presented = int(m.group(1))
-    if presented < case.get("min_frames", 1):
-        problems.append(f"~{presented} frames presented, want {case.get('min_frames', 1)}")
+    want = max(1, int(case.get("min_frames", 1) * frames_scale))
+    if presented < want:
+        problems.append(f"~{presented} frames presented, want {want}")
     if case.get("check") and not problems:
         cmd = [a.replace("{out}", out) for a in case["check"]]
         chk = subprocess.run(cmd, cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -310,6 +317,10 @@ def main():
     ap.add_argument("--headless", action="store_true",
                     help="never show the games' windows, so runs never take the focus")
     ap.add_argument("--only", help="comma-separated case names")
+    ap.add_argument("--frames-scale", type=float, default=1.0,
+                    help="want this share of each case's min_frames (a slower GPU: 0.5 in a VM)")
+    ap.add_argument("--run", help="run every case with this script instead of the repo's, and build nothing "
+                    "(player/run-installed.sh: the app a player install made)")
     ap.add_argument("-j", "--jobs", type=int, default=1,
                     help="games run at once (a repo's cases at once only if its cases.json has \"parallel\")")
     args = ap.parse_args()
@@ -323,6 +334,10 @@ def main():
         with open(os.path.join(repo, "smoke", "cases.json")) as f:
             spec = json.load(f)
         cases = [c for c in spec["cases"] if not only or c["name"] in only]
+        if args.run:
+            spec = dict(spec, run=os.path.abspath(args.run))
+            spec.pop("build", None)
+            cases = [{k: v for k, v in c.items() if k != "run"} for c in cases]
         if cases:
             repos.append((repo, spec, cases))
 
@@ -364,7 +379,7 @@ def main():
                 status, took, problems, notes = "FAIL", 0.0, [broken[repo]], []
                 out = os.path.join(repo, "build", "smoke")
             else:
-                status, took, problems, notes, out = run_case(repo, spec, case, args.update, scale, args.headless)
+                status, took, problems, notes, out = run_case(repo, spec, case, args.update, scale, args.headless, args.frames_scale)
             print(f"{status:4}  {label}  {took:.0f} s  " + "; ".join(problems + notes), flush=True)
             with lock:
                 results[id(case)] = (label, status, took, problems, notes, out)
