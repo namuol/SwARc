@@ -88,6 +88,13 @@ struct GameConfig : recomp::GameConfig {
   };
   Adapter adapter;
 
+  // Dialogs are created but not drawn (games draw their own windows). A
+  // dialog with no owner, such as a launcher's settings dialog shown
+  // before the game's window exists, cannot be seen or reached by the
+  // keyboard: with this set, each one presses its default button (the
+  // DM_GETDEFID one, else IDOK) once it is initialised.
+  bool ownerless_dialogs_take_default = false;
+
   // DLLs the game loads itself (LoadLibrary) whose code is lifted with
   // the EXE (recomp_lift --module), e.g. a game logic DLL. They
   // are read from guest_dir (the host game directory) by file name.

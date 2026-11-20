@@ -3050,6 +3050,15 @@ uint32_t CreateDialogFromTemplate(Ctx& c, uint32_t hinst, uint32_t t, uint32_t o
     g_focus = focus;
   }
   if (style & WS_VISIBLE) CallGuest(c, UserProc("ShowWindow"), {hdlg, 5 /* SW_SHOW */});
+  // GameConfig::ownerless_dialogs_take_default: the default button's
+  // click, queued for the dialog's (or the caller's modal) loop.
+  if (!owner && Game().ownerless_dialogs_take_default) {
+    uint32_t def = Send(hdlg, 0x0400 /* DM_GETDEFID */, 0, 0);
+    uint32_t id = (def >> 16) == 0x534B /* DC_HASDEFID */ ? (def & 0xFFFF) : 1 /* IDOK */;
+    RECOMP_TRACE("  ownerless dialog %X: pressing its default button %u\n", hdlg, id);
+    PostTo(CurrentThread()->tid,
+           Msg{hdlg, WM_COMMAND, id, DlgItem(hdlg, id), TickCount(), g_mouse_x, g_mouse_y});
+  }
   return hdlg;
 }
 
