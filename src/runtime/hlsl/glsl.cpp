@@ -983,6 +983,14 @@ class Emitter {
       o += "  " + Decl(entry_->ret, "r_ret") + " = " + call + ";\n";
       outs = Output("r_ret", entry_->ret, entry_->ret_semantic, entry_->loc) + outs;
     }
+    if (tg_.stage == Stage::Vertex) {
+      // A vertex shader that writes no fog: none (pixel shaders read it).
+      if (!declared_.count("r_v" + std::to_string(VaryingLocation({kFog, 0}))))
+        outs += "  " + Varying({kFog, 0}, true, entry_->loc) + " = vec4(1.0, 0.0, 0.0, 1.0);\n";
+    } else if ((out_->color_outputs & 1) && tg_.major < 3) {
+      // Fog: before shader model 3 the device applies it after the shader.
+      outs += "  r_fog(r_c0, " + Varying({kFog, 0}, false, entry_->loc) + ".x);\n";
+    }
     // The backend's per-pixel work on the colour (the alpha test).
     if (out_->color_outputs & 1) outs += "  r_color0(r_c0);\n";
     return o + outs + "}\n";
