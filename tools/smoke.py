@@ -47,6 +47,8 @@ Repo-level keys for running a repo's cases side by side:
      in), so no case sees another's settings or saves.
 Without "parallel" a repo's cases run one after another and the log is
 read from build/run.log.
+--headless runs the games with <PREFIX>_HEADLESS=1: their windows are never
+shown, so runs never take the focus (frames, waits and shots work as shown).
 A case with no reference saves its shot as the reference (NEW: look at it).
 --update replaces the references with this run's shots. References are the
 game's own pixels: keep smoke/ref/ out of git.
@@ -154,7 +156,7 @@ def script_exits(input_path):
         return any(line.split("#")[0].split()[1:2] == ["exit"] for line in f)
 
 
-def run_case(repo, defaults, case, update, scale=1):
+def run_case(repo, defaults, case, update, scale=1, headless=False):
     name = case["name"]
     prefix = case.get("prefix", defaults.get("prefix"))
     script = case.get("run", defaults.get("run", "tools/try-run.sh"))
@@ -188,6 +190,10 @@ def run_case(repo, defaults, case, update, scale=1):
     ends = script_exits(inp)
     env.update({f"{prefix}_TEST_INPUT": inp, f"{prefix}_SHOT_DIR": out,
                 f"{prefix}_BACKGROUND": "1", f"{prefix}_TEST_WAIT_SCALE": str(scale)})
+    # --headless: the game's windows are never shown (<PREFIX>_HEADLESS), so
+    # a run never takes the focus; frames, waits and shots work as before.
+    if headless:
+        env[f"{prefix}_HEADLESS"] = "1"
     # The run's log: the case's own if the run script takes one (a
     # "parallel" repo's must), else the repo's build/run.log.
     log_path = os.path.join(repo, "build", "run.log")
@@ -301,6 +307,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("repos", nargs="+")
     ap.add_argument("--update", action="store_true", help="replace references with this run's shots")
+    ap.add_argument("--headless", action="store_true",
+                    help="never show the games' windows, so runs never take the focus")
     ap.add_argument("--only", help="comma-separated case names")
     ap.add_argument("-j", "--jobs", type=int, default=1,
                     help="games run at once (a repo's cases at once only if its cases.json has \"parallel\")")
@@ -356,7 +364,7 @@ def main():
                 status, took, problems, notes = "FAIL", 0.0, [broken[repo]], []
                 out = os.path.join(repo, "build", "smoke")
             else:
-                status, took, problems, notes, out = run_case(repo, spec, case, args.update, scale)
+                status, took, problems, notes, out = run_case(repo, spec, case, args.update, scale, args.headless)
             print(f"{status:4}  {label}  {took:.0f} s  " + "; ".join(problems + notes), flush=True)
             with lock:
                 results[id(case)] = (label, status, took, problems, notes, out)
