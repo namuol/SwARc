@@ -92,6 +92,11 @@ struct GuestThreadExit {
 // message boxes with their default button.
 bool Background();
 
+// <ID>_HEADLESS=1: Background(), and no window is ever shown: the game
+// draws and presents as usual (frames are counted, TEST_INPUT waits and
+// shots read them) but nothing reaches the screen.
+bool Headless();
+
 // Per-host-thread pointer to the guest thread running on it (null once it
 // has finished).
 Thread* CurrentThread();

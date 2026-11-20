@@ -73,10 +73,18 @@ uint32_t GuestProcessorCount() {
   return std::clamp<unsigned>(n, 2, 8);  // capped: 2002 code may assume few
 }
 
+bool Headless() {
+  static const bool hl = [] {
+    const char* e = Env("HEADLESS");
+    return e && *e && *e != '0';
+  }();
+  return hl;
+}
+
 bool Background() {
   static const bool bg = [] {
     const char* e = Env("BACKGROUND");
-    return e && *e && *e != '0';
+    return Headless() || (e && *e && *e != '0');
   }();
   return bg;
 }

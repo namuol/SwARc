@@ -972,7 +972,13 @@ bool OnMainThread() { return std::this_thread::get_id() == g_main_thread_id; }
 void EnsureSdlVideo() {
   if (g_sdl_up) return;
   if (!OnMainThread()) FatalF("SDL video requested off the main thread");
-  if (Background()) SDL_SetHint(SDL_HINT_WINDOW_ACTIVATE_WHEN_SHOWN, "0");
+  if (Background()) {
+    SDL_SetHint(SDL_HINT_WINDOW_ACTIVATE_WHEN_SHOWN, "0");
+    // On macOS SDL_Init otherwise brings the app to the foreground: the
+    // focus would leave whatever the user is doing.
+    SDL_SetHint(SDL_HINT_MAC_BACKGROUND_APP, "1");
+    SDL_SetHint(SDL_HINT_WINDOW_ACTIVATE_WHEN_RAISED, "0");
+  }
   // Leave SIGINT/SIGTERM alone: SDL would turn them into quit events the
   // game may ignore, making the process hard to stop.
   SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
@@ -1434,7 +1440,8 @@ uint32_t CreateSdl2Window(const std::string& title_utf8, int w, int h, SDL_Windo
   EnsureSdlVideo();
   Window win;
   win.sdl = SDL_CreateWindow(title_utf8.c_str(), ToPoints(nullptr, w), ToPoints(nullptr, h),
-                             flags | SDL_WINDOW_HIGH_PIXEL_DENSITY | gfx::ChosenWindowFlags());
+                             flags | (Headless() ? SDL_WINDOW_HIDDEN : 0) |
+                                 SDL_WINDOW_HIGH_PIXEL_DENSITY | gfx::ChosenWindowFlags());
   if (!win.sdl) return 0;
   win.title = title_utf8;
   win.w = w;
@@ -1552,7 +1559,7 @@ void ShowWindowNoActivate(uint32_t hwnd) {
     win->visible = true;
     sdl = win->sdl;
   }
-  if (sdl) SDL_ShowWindow(sdl);
+  if (sdl && !Headless()) SDL_ShowWindow(sdl);
   UpdateFullscreen(hwnd);
 }
 
@@ -1786,7 +1793,7 @@ HLE("user32.dll", CreateWindowExA, 12) {
       if (Window* wp = Win(hwnd)) {
         wp->visible = true;
         wp->dirty = true;
-        if (wp->sdl) SDL_ShowWindow(wp->sdl);
+        if (wp->sdl && !Headless()) SDL_ShowWindow(wp->sdl);
       }
     }
     UpdateFullscreen(hwnd);
@@ -1905,7 +1912,7 @@ HLE("user32.dll", ShowWindow, 2) {
     if (!show) {
       SDL_HideWindow(sdl);
     } else {
-      SDL_ShowWindow(sdl);
+      if (!Headless()) SDL_ShowWindow(sdl);
       // Behind an exclusive-mode "screen" the game's minimize on
       // deactivation is not carried out: the window simply stays put
       // while the game idles, and focusing it again resumes the game.
@@ -2089,7 +2096,7 @@ HLE("user32.dll", SetWindowPos, 7) {
   ApplyRect(hwnd, int32_t(Arg(c, 2)), int32_t(Arg(c, 3)), int32_t(Arg(c, 4)),
             int32_t(Arg(c, 5)), !nomove, !nosize);
   if (flags & 0x40) {  // SWP_SHOWWINDOW
-    if (SDL_Window* s = SdlWindowFor(hwnd)) SDL_ShowWindow(s);
+    if (SDL_Window* s = SdlWindowFor(hwnd); s && !Headless()) SDL_ShowWindow(s);
     {
       std::lock_guard<std::recursive_mutex> l(g_mu);
       if (Window* w = Win(hwnd)) w->visible = true;
@@ -2497,7 +2504,8 @@ HLE("user32.dll", SetForegroundWindow, 1) {
       hwnd = w->parent;
     }
   }
-  if (SDL_Window* s = SdlWindowFor(hwnd)) SDL_RaiseWindow(s);
+  // Background: the game is told it is in front, the host is not asked.
+  if (SDL_Window* s = SdlWindowFor(hwnd); s && !Background()) SDL_RaiseWindow(s);
   bool activate = false;
   {
     std::lock_guard<std::recursive_mutex> l(g_mu);
@@ -2514,7 +2522,7 @@ HLE("user32.dll", SetForegroundWindow, 1) {
   return 1;
 }
 HLE("user32.dll", BringWindowToTop, 1) {
-  if (SDL_Window* s = SdlWindowFor(Arg(c, 0))) SDL_RaiseWindow(s);
+  if (SDL_Window* s = SdlWindowFor(Arg(c, 0)); s && !Background()) SDL_RaiseWindow(s);
   return 1;
 }
 
