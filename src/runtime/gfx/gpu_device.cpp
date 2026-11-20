@@ -1185,6 +1185,8 @@ class GpuDevice final : public Device {
   struct VsState {
     int32_t in[16][4];  // per input slot: byte offset of vertex 0, stride, D3DDECLTYPE (-1: none), 0
     float pixel[4];     // 1 / viewport width, 1 / viewport height
+    float clip[8][4];   // user clip planes, in clip space (shaders)
+    int32_t clip_mask[4];  // CLIPPLANEENABLE, -, -, -
   };
   struct PsState {
     int32_t alpha[4];  // D3DCMPFUNC (ALWAYS when the test is off), ALPHAREF
@@ -1206,7 +1208,7 @@ class GpuDevice final : public Device {
       p += "#define R_INT_BINDING " + binding(1, 1) + "\n";
       p += std::string("#define R_SAMPLER_BINDING(n) set = ") + (metal ? "0" : "0") + ", binding = n\n";
       p += "layout(std140, " + binding(1, 2) +
-           ") uniform r_vs_state { ivec4 r_in[16]; vec4 r_pixel; };\n";
+           ") uniform r_vs_state { ivec4 r_in[16]; vec4 r_pixel; vec4 r_clip[8]; ivec4 r_clipmask; };\n";
       p += "layout(std430, " + binding(0, metal ? 3 : int(samplers)) +
            ") readonly buffer r_vertices { uint r_vb[]; };\n";
       p += R"(uint r_word(int b) {
@@ -1255,7 +1257,14 @@ vec4 r_fetch(int slot) {
 }
 // D3D9 puts pixel centres on integers, SDL_GPU on halves: half a pixel
 // right and down (clip space is y-up).
-vec4 r_position(vec4 p) { return vec4(p.x + p.w * r_pixel.x, p.y - p.w * r_pixel.y, p.zw); }
+// User clip planes (CLIPPLANEENABLE): with shaders, D3D9's are in clip
+// space, against the position the shader writes.
+out float gl_ClipDistance[8];
+vec4 r_position(vec4 p) {
+  for (int i = 0; i < 8; i++)
+    gl_ClipDistance[i] = (r_clipmask.x & (1 << i)) != 0 ? dot(r_clip[i], p) : 1.0;
+  return vec4(p.x + p.w * r_pixel.x, p.y - p.w * r_pixel.y, p.zw);
+}
 )";
     } else {
       p += "#define R_FLOAT_BINDING " + binding(3, 0) + "\n";
@@ -1428,6 +1437,8 @@ void r_color0(inout vec4 c) {
       st.in[i][1] = int32_t(vsm.stride);
       st.in[i][2] = int32_t(in.type);
     }
+    std::memcpy(st.clip, state.clip, sizeof st.clip);
+    st.clip_mask[0] = int32_t(state.rs[152] & 0xFF);
     st.pixel[0] = 1.0f / float(std::max(state.viewport.width, 1u));
     st.pixel[1] = 1.0f / float(std::max(state.viewport.height, 1u));
 
@@ -4011,7 +4022,7 @@ void r_color0(inout vec4 c) {
       const char* name;
     };
     static const Check kChecks[] = {
-        {185, "TWOSIDEDSTENCILMODE"}, {152, "CLIPPLANEENABLE"}, {194, "SRGBWRITEENABLE"},
+        {185, "TWOSIDEDSTENCILMODE"}, {194, "SRGBWRITEENABLE"},
     };
     for (const Check& ch : kChecks) {
       if (!st.rs[ch.rs] || (warned_rs_ & (1ull << (&ch - kChecks)))) continue;
