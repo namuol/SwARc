@@ -137,7 +137,7 @@ std::vector<Case> Cases() {
     a.I(LABEL, {Src(LBL, 1)});
     a.I(CRS, {Dst(R, 1, 7), Src(R, 0), Src(C, 5)});
     a.I(RET, {});
-    cs.push_back({"vs20", a.End(), 1, 1, 0});
+    cs.push_back({"vs20", a.End(), 1, 2, 0, {"r_var18 = vec4(1.0, 0.0, 0.0, 1.0);"}});
   }
   {  // vs_3_0: declared outputs, vertex texture fetch
     Asm a(false, 3, 0);
@@ -151,7 +151,7 @@ std::vector<Case> Cases() {
     a.I(ADD, {Dst(O, 0), Src(V, 0), Src(R, 0)});
     a.I(MOV, {Dst(O, 1), Src(V, 1)});
     a.I(MOV, {Dst(O, 2, 0xF, 1), Src(R, 0)});
-    cs.push_back({"vs30", a.End(), 2, 2, 0});
+    cs.push_back({"vs30", a.End(), 2, 3, 0});
   }
   {  // vs_3_0: one output register packed with two semantics
     Asm a(false, 3, 0);
@@ -161,7 +161,7 @@ std::vector<Case> Cases() {
     a.Dcl(5, 1, Dst(O, 1, 12));
     a.I(MOV, {Dst(O, 0), Src(V, 0)});
     a.I(MOV, {Dst(O, 1), Src(V, 0)});
-    cs.push_back({"vs30_packed", a.End(), 1, 2, 0, {".xy = r_o[1].xy;", ".zw = r_o[1].zw;"}});
+    cs.push_back({"vs30_packed", a.End(), 1, 3, 0, {".xy = r_o[1].xy;", ".zw = r_o[1].zw;"}});
   }
   {  // ps_1_1: texture registers, co-issue, cnd, lrp, modifiers
     Asm a(true, 1, 1);
@@ -173,13 +173,13 @@ std::vector<Case> Cases() {
     a.I(LRP, {Dst(R, 1), Src(C, 0), Src(T, 1), Src(R, 0)});
     a.I(CND, {Dst(R, 0, 0xF, 0, 1), Src(R, 0, kW), Src(R, 1), Src(T, 0, 0xE4, 6)});
     a.I(TEXKILL, {Dst(T, 1)});
-    cs.push_back({"ps11", a.End(), 0, 4, 1});
+    cs.push_back({"ps11", a.End(), 0, 5, 1, {"r_fog(r_c0, r_var18.x);"}});
   }
   {  // ps_1_1: texkill on coordinates no tex reads
     Asm a(true, 1, 1);
     a.I(TEXKILL, {Dst(T, 2)});
     a.I(MOV, {Dst(R, 0), Src(V, 0)});
-    cs.push_back({"ps11_texkill", a.End(), 0, 2, 1, {"if (any(lessThan(r_tc[2].xyz"}});
+    cs.push_back({"ps11_texkill", a.End(), 0, 3, 1, {"if (any(lessThan(r_tc[2].xyz"}});
   }
   {  // ps_2_0: declared inputs and samplers, texld variants, multiple outputs
     Asm a(true, 2, 0);
@@ -197,7 +197,7 @@ std::vector<Case> Cases() {
     a.I(MOV, {Dst(OC, 0), Src(R, 0)});
     a.I(MOV, {Dst(OC, 1), Src(R, 3)});
     a.I(MOV, {Dst(ODEPTH, 0, 1), Src(R, 1, kXXXX)});
-    cs.push_back({"ps20", a.End(), 0, 2, 3});
+    cs.push_back({"ps20", a.End(), 0, 3, 3});
   }
   {  // ps_3_0: vPos, vFace, predication, setp, derivatives, if on a compare
     Asm a(true, 3, 0);
