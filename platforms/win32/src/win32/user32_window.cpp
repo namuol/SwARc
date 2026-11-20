@@ -1118,7 +1118,9 @@ void InjectTestFocus() {
 //   <t> pointer <x> <y>   the host pointer is at client pixel (x, y)
 //                         (the game's cursor should follow it exactly),
 //                         independent of how the frame is shown
-//   <t> click [left|right]
+//   <t> click [left|right] [seconds]   held for that long (default 0.08)
+//   <t> wheel <notches>   turn the wheel (positive: away from the user);
+//                         a fraction is a fine-grained (trackpad) step
 //   <t> key <SDL scancode name> [seconds]   e.g. Escape, Return, Space, A;
 //                         held for that long (default 0.08)
 //   <t> warp <x> <y>      to client (x, y) in one relative move
@@ -1224,6 +1226,7 @@ void InjectTestInput() {
         q.push_back({t, e});
       } else if (c == "click") {
         bool right = n >= 3 && std::string(a) == "right";
+        double hold = n >= 4 ? std::atof(b) : 0.08;
         SDL_Event e{};
         e.type = SDL_EVENT_MOUSE_BUTTON_DOWN;
         e.button.button = right ? SDL_BUTTON_RIGHT : SDL_BUTTON_LEFT;
@@ -1232,8 +1235,15 @@ void InjectTestInput() {
         q.push_back({t, e});
         e.type = SDL_EVENT_MOUSE_BUTTON_UP;
         e.button.down = false;
-        q.push_back({t + 0.08, e});
-        last_release = std::max(last_release, t + 0.08);
+        q.push_back({t + hold, e});
+        last_release = std::max(last_release, t + hold);
+      } else if (c == "wheel" && n >= 3) {
+        SDL_Event e{};
+        e.type = SDL_EVENT_MOUSE_WHEEL;
+        e.wheel.which = kTestPointer;
+        e.wheel.y = float(std::atof(a));
+        e.wheel.direction = SDL_MOUSEWHEEL_NORMAL;
+        q.push_back({t, e});
       } else if (c == "key" && n >= 3) {
         SDL_Scancode sc = SDL_GetScancodeFromName(a);
         if (sc == SDL_SCANCODE_UNKNOWN) {
@@ -1434,6 +1444,8 @@ void InjectTestInput() {
       }
     } else if (e.type == SDL_EVENT_KEY_DOWN || e.type == SDL_EVENT_KEY_UP) {
       e.key.windowID = id;
+    } else if (e.type == SDL_EVENT_MOUSE_WHEEL) {
+      e.wheel.windowID = id;
     } else {
       e.button.windowID = id;
     }
