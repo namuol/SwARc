@@ -22,6 +22,7 @@
 #define ENTRY 2      // a function entry
 #define NO_ENTRY 3   // not a function entry
 #define NO_TABLE 4   // the jmp has no table
+#define SECONDARY 5  // a secondary entry into the function given
 #define SWEEP 0x100      // only with --sweep-gaps
 #define NO_SWEEP 0x200   // only without it
 
@@ -274,7 +275,9 @@ ng_c3: movl $3, %eax
 // An index counted down past zero (sub 4, then jae away: the last 1..3
 // bytes of a copy) reaches the 4 slots before its table, where the code
 // after the jmp continues; those slots are another switch's table. Its
-// cases, reached through the second jmp, are function entries too.
+// cases, reached through the second jmp, can be reached through the
+// dispatcher: each is a secondary entry into the function that owns it
+// (sub_prev, the closest one starting before it), not a copy of its own.
   PAD
 sub_prev:
   movl 4(%esp), %eax
@@ -374,7 +377,9 @@ text_end:
   .long TABLE, A(ng_jmp), 3, A(ng_c1), A(ng_c2), A(ng_c3)
   .long TABLE, A(sp_jmp), 4, A(sp_c0), A(sp_c1), A(sp_c2), A(sp_c3)
   .long TABLE, A(sd_jmp), 4, A(sp_c0), A(sp_c1), A(sp_c2), A(sp_c3)
-  .long ENTRY, A(sp_c2), 0
+  .long NO_ENTRY, A(sp_c2), 0
+  .long SECONDARY, A(sp_c2), 1, A(sub_prev)
+  .long SECONDARY, A(sp_c0), 1, A(sub_prev)
   .long TABLE, A(ex_jmp), 6, A(ex_c0), A(ex_c1), A(ex_c2), A(ex_c3), A(ex_c4), A(ex_def)
   .long NO_ENTRY | NO_SWEEP, A(unreferenced), 0
   .long ENTRY | SWEEP, A(unreferenced), 0

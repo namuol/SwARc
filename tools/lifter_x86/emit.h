@@ -7,6 +7,7 @@
 #include <map>
 #include <set>
 #include <string>
+#include <vector>
 
 #include "function.h"
 
@@ -25,8 +26,12 @@ class Emitter {
 
   // Appends the function definition to *out. Every function it references
   // (calls, tail calls) is added to *refs for forward declarations.
+  // `entries` (addresses in f's body, may be null) are secondary entries:
+  // each gets an f_X of its own that enters f there, through
+  // Ctx::entry_label, instead of a copy of the code from that label.
   void EmitFunction(const Function& f, std::string* out,
-                    std::set<uint64_t>* refs, EmitStats* stats);
+                    std::set<uint64_t>* refs, EmitStats* stats,
+                    const std::vector<uint64_t>* entries = nullptr);
 
  private:
   std::map<uint64_t, uint64_t> FindX87Runs(const Function& f,
