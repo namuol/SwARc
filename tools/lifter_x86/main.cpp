@@ -260,8 +260,9 @@ int main(int argc, char** argv) {
   // Bytes of .text that some lifted function decodes (for --sweep-gaps).
   std::map<const lifter::Module*, std::vector<bool>> covered;
   for (const auto& m : p.modules) covered[&m].assign(m.text_hi - m.text_lo, false);
-  size_t from_gaps = 0, gap_rejected = 0, from_tables = 0;
+  size_t from_gaps = 0, gap_rejected = 0;
   std::set<uint64_t> gap_entries;
+  std::set<uint64_t> case_targets;  // switch case targets (see below)
   for (int sweep = 0;; sweep++) {
   while (!work.empty()) {
     uint64_t e = work.front();
@@ -313,15 +314,18 @@ int main(int argc, char** argv) {
         lifter::BuildFunction(p, dec, e, &f);
       }
     }
-    // Every case target is also a weak entry: an indirect jump that lands
-    // on it through another table than its own (the CRT's memcpy indexes
-    // the slots before a table, which belong to the table before it) or
-    // from another copy of the function goes through the dispatcher and
-    // finds it. Inside this function its jmp still goes to the label.
+    // Every case target can also be reached through the dispatcher: an
+    // indirect jump can land on it through another table than its own
+    // (the CRT's memcpy indexes the slots before a table, which belong to
+    // the table before it). Inside this function its jmp goes to the
+    // label; for the dispatcher it becomes a secondary entry of a function
+    // that lifts it (below), not a function of its own: that would be a
+    // copy of everything reachable from the label, for each case.
     for (const auto& [va, in] : f.insns) {
       auto jt = p.jumptables.find(va);
       if (jt == p.jumptables.end()) continue;
-      for (uint64_t t : jt->second) candidate(p.TextOf(t), t, &from_tables);
+      for (uint64_t t : jt->second)
+        if (p.InText(t)) case_targets.insert(t);
     }
     // A gap's code that does not look like compiled user code (undecodable
     // bytes, privileged or obsolete instructions) is data: dropped.
@@ -436,10 +440,47 @@ int main(int argc, char** argv) {
   if (from_gaps == before_sweep) break;
   }
   for (const auto& [va, n] : symbol_tables) extended_tables += p.jumptables[va].size() > n;
+
+  // Case targets that are not entries anyway become secondary entries of a
+  // function whose body has them: the one starting closest before the
+  // target, else the first after it. Not of a function whose lifted body
+  // is renamed (replace, host, native) or whose start sets up state its
+  // body needs (an x64 frame for exceptions or longjmp). A target no such
+  // function has is lifted on its own, as a weak entry.
+  std::map<uint64_t, std::vector<uint64_t>> secondary;  // owner -> labels
+  size_t from_tables = 0;
+  for (auto it = case_targets.begin(); it != case_targets.end();)
+    it = p.entries.count(*it) ? case_targets.erase(it) : std::next(it);
+  if (!case_targets.empty()) {
+    std::map<uint64_t, uint64_t> owner;
+    for (uint64_t e : p.entries) {
+      if (p.replaced.count(e) || p.hosted.count(e) || p.natives.count(e) ||
+          (p.x64 && p.eh_frames.count(e)))
+        continue;
+      lifter::Function f;
+      lifter::BuildFunction(p, dec, e, &f);
+      if (f.insns.empty() || (p.x64 && !f.setjmp_returns.empty())) continue;
+      for (auto t = case_targets.lower_bound(f.insns.begin()->first);
+           t != case_targets.end() && *t <= f.insns.rbegin()->first; ++t)
+        if (f.insns.count(*t) && (!owner.count(*t) || e <= *t)) owner[*t] = e;
+    }
+    for (uint64_t t : case_targets) {
+      auto o = owner.find(t);
+      if (o != owner.end()) {
+        secondary[o->second].push_back(t);
+      } else {
+        p.entries.insert(t);
+        p.weak.insert(t);
+        from_tables++;
+      }
+    }
+  }
   std::printf("functions: %zu (%zu from Ghidra/exports, %zu discovered: "
-              "%zu via code pointers, %zu via data pointers, %zu from gaps, %zu case targets; %zu weak)\n",
+              "%zu via code pointers, %zu via data pointers, %zu from gaps, %zu case targets; "
+              "%zu weak), %zu secondary entries\n",
               p.entries.size(), initial, p.entries.size() - initial,
-              from_code_ptrs, from_data_ptrs, from_gaps, from_tables, p.weak.size());
+              from_code_ptrs, from_data_ptrs, from_gaps, from_tables, p.weak.size(),
+              case_targets.size() - from_tables);
   std::printf("jump tables: %zu from Ghidra (%zu extended), %zu recovered\n",
               p.jumptables.size() - recovered_tables, extended_tables, recovered_tables);
 
@@ -518,7 +559,8 @@ int main(int argc, char** argv) {
       report_warnings += buf + w + "\n";
     }
     uint64_t before = stats.insns;
-    em.EmitFunction(f, &body, &refs, &stats);
+    auto sec = secondary.find(e);
+    em.EmitFunction(f, &body, &refs, &stats, sec == secondary.end() ? nullptr : &sec->second);
     file_insns += stats.insns - before;
     per_module[cur].functions++;
     per_module[cur].insns += stats.insns - before;
@@ -530,18 +572,20 @@ int main(int argc, char** argv) {
   std::string table =
       "// Generated by recomp_lift. Do not edit.\n"
       "#include \"x86/lifted.h\"\nnamespace recomp::gen {\n";
-  for (uint64_t e : p.entries)
+  std::set<uint64_t> all = p.entries;  // with the secondary entries
+  for (const auto& [o, ls] : secondary) all.insert(ls.begin(), ls.end());
+  for (uint64_t e : all)
     table += "void " + lifter::FnName(e) + "(::recomp::Ctx& c);\n";
   table += "}  // namespace recomp::gen\nnamespace recomp {\n"
            "extern const LiftedFn kLiftedFunctions[] = {\n";
-  for (uint64_t e : p.entries) {
+  for (uint64_t e : all) {
     char buf[64];
     std::snprintf(buf, sizeof buf, "  {0x%08llXu, &gen::f_%08llX},\n",
                   (unsigned long long)e, (unsigned long long)e);
     table += buf;
   }
   table += "};\nextern const uint32_t kLiftedFunctionCount = " +
-           std::to_string(p.entries.size()) + ";\n}  // namespace recomp\n";
+           std::to_string(all.size()) + ";\n}  // namespace recomp\n";
   files["table.cpp"] = table;
 
   // Functions the manifest hands to a shared native implementation
@@ -628,6 +672,15 @@ int main(int argc, char** argv) {
     }
     WriteIfChanged(std::filesystem::path(outdir) / "final_jumptables.txt", jt);
     WriteIfChanged(std::filesystem::path(outdir) / "final_entries.txt", en);
+    std::string se;  // secondary entry, the function it enters
+    for (const auto& [o, ls] : secondary)
+      for (uint64_t l : ls) {
+        char buf[32];
+        std::snprintf(buf, sizeof buf, "%08llX %08llX\n", (unsigned long long)l,
+                      (unsigned long long)o);
+        se += buf;
+      }
+    WriteIfChanged(std::filesystem::path(outdir) / "final_secondary.txt", se);
     std::string li;
     for (uint64_t v : lifted_insns) {
       char buf[32];

@@ -6,8 +6,9 @@
 // .lift_expect records:
 //   kind | mode, address, n, n targets
 // kinds: 1 the jmp's table holds exactly the targets, 2 a function entry,
-// 3 not a function entry, 4 the jmp has no table; mode 0x100: only with
-// --sweep-gaps, 0x200: only without.
+// 3 not a function entry, 4 the jmp has no table, 5 a secondary entry
+// into the function at the one target (lifted as part of it, not on its
+// own); mode 0x100: only with --sweep-gaps, 0x200: only without.
 //
 //   lift_discovery_test <recomp_lift_fixture> <discovery.o> <work dir>
 
@@ -16,6 +17,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <set>
 #include <sstream>
 
@@ -71,6 +73,7 @@ int main(int argc, char** argv) {
     }
     std::map<uint32_t, std::set<uint32_t>> tables;
     std::set<uint32_t> entries;
+    std::map<uint32_t, uint32_t> secondary;  // label -> function
     {
       std::ifstream in(dir / "final_jumptables.txt");
       for (std::string line; std::getline(in, line);) {
@@ -83,6 +86,9 @@ int main(int argc, char** argv) {
       std::ifstream en(dir / "final_entries.txt");
       for (std::string line; std::getline(en, line);)
         if (!line.empty()) entries.insert(std::stoul(line, nullptr, 16));
+      std::ifstream se(dir / "final_secondary.txt");
+      for (std::string l, o; se >> l >> o;)
+        secondary[std::stoul(l, nullptr, 16)] = std::stoul(o, nullptr, 16);
     }
     for (size_t i = 0; i + 3 <= expect.size();) {
       const uint32_t kind = expect[i] & 0xff, only = expect[i] & 0x300, va = expect[i + 1],
@@ -108,6 +114,14 @@ int main(int argc, char** argv) {
         case 4:
           if (t != tables.end()) what = Name(va) + " has a table:" + Names(t->second);
           break;
+        case 5: {
+          auto s = secondary.find(va);
+          if (s == secondary.end())
+            what = Name(va) + " is not a secondary entry";
+          else if (!want.count(s->second))
+            what = Name(va) + " enters " + Name(s->second) + ", expected" + Names(want);
+          break;
+        }
         default:
           std::fprintf(stderr, "bad .lift_expect kind %u\n", kind);
           return 2;
