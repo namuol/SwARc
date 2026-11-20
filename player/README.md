@@ -46,6 +46,7 @@ A [RecompLauncher](https://github.com/elripalda/RecompLauncher) profile; SwARc r
     "binary": "soldiers",              // CMake target and executable
     "repo": "namuol/soldiers-heroes-of-wwii-recomp",
     "steam": { "appid": 11480, "depot": 11481, "manifest": "<depot manifest ID>", "build": "21022753",
+               // or "depots": [{ "depot": 2229851, "manifest": "..." }, ...]: all of them, into one folder
                "title": "<name on Steam>", "folder": "<download folder name>", "size": "1.7 GB" },
     "files": ["Soldiers.exe", "resource.pak"],     // must exist in a game copy ("Dir/" for a folder)
     "hashes": { "Soldiers.exe": "<sha-256>" },     // the Supported build: every one must match

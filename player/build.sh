@@ -171,8 +171,10 @@ steam_download() {
   echo
   mkdir -p "$STEAM_GAME_DIR"
   # Not run(): the QR code and the progress must show, on the terminal itself.
-  "$dd/DepotDownloader" -app "$STEAM_APP" -depot "$STEAM_DEPOT" -manifest "$STEAM_MANIFEST" -os windows \
-    -qr -dir "$STEAM_GAME_DIR" < /dev/tty ||
+  # Every depot of the game in one call (one sign-in), into one folder, as
+  # Steam installs them.
+  "$dd/DepotDownloader" -app "$STEAM_APP" -depot "${STEAM_DEPOTS[@]}" -manifest "${STEAM_MANIFESTS[@]}" \
+    -os windows -qr -dir "$STEAM_GAME_DIR" < /dev/tty ||
     die "the download from Steam didn't finish." "Run this again to retry; it continues where it stopped."
 }
 what_files() { local IFS=,; printf '%s' "${FILES[*]}" | sed 's/,/, /g; s/\/$//; s/\/,/,/g'; }

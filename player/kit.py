@@ -48,9 +48,11 @@ def load_config(root):
     for key in ("id", "app", "binary", "repo", "steam", "files", "hashes", "lift"):
         if key not in x:
             sys.exit("kit: %s: x-swarc.%s is missing" % (path, key))
-    for key in ("appid", "depot", "manifest", "title", "folder", "size"):
+    for key in ("appid", "title", "folder", "size"):
         if key not in x["steam"]:
             sys.exit("kit: %s: x-swarc.steam.%s is missing" % (path, key))
+    if not x["steam"].get("depots") and not ("depot" in x["steam"] and "manifest" in x["steam"]):
+        sys.exit("kit: %s: x-swarc.steam needs depot and manifest, or depots" % path)
     if not x["lift"].get("images"):
         sys.exit("kit: %s: x-swarc.lift.images is empty" % path)
     c = dict(x)
@@ -83,8 +85,9 @@ def game_env(c):
     var("REPO", c["repo"])
     var("FIND", c["find"])
     var("STEAM_APP", steam["appid"])
-    var("STEAM_DEPOT", steam["depot"])
-    var("STEAM_MANIFEST", steam["manifest"])
+    depots = steam.get("depots") or [{"depot": steam["depot"], "manifest": steam["manifest"]}]
+    arr("STEAM_DEPOTS", [d["depot"] for d in depots])
+    arr("STEAM_MANIFESTS", [d["manifest"] for d in depots])
     var("STEAM_BUILD", steam.get("build", ""))
     var("STEAM_TITLE", steam["title"])
     var("STEAM_FOLDER", steam["folder"])
