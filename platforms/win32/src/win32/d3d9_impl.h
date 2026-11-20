@@ -241,6 +241,10 @@ Device* DeviceOf(uint32_t self);
 // SetTransform's state change: transform `type` (D3D9's numbers) is `m`,
 // for GetTransform and for the fixed-function draws (Device::ff_base).
 void SetTransform(Device& d, uint32_t type, const float* m);
+// User clip plane i (< 8, D3DCAPS9::MaxUserClipPlanes): kept in
+// Device::ff_base, where fixed-function draws apply it in world space
+// (D3DRS_CLIPPLANEENABLE).
+void SetClipPlane(Device& d, uint32_t i, const float* p);
 
 // Sampler index: 0-15, or D3DVERTEXTEXTURESAMPLER0..3 (256..259) -> 16..19;
 // -1 if neither.

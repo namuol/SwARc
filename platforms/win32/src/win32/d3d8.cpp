@@ -433,17 +433,12 @@ void EnableLight(Device& d, Device8& x, uint32_t i, bool on) {
   x.light_on[i] = on;
   d.light_on[i] = on;
 }
-// User clip planes are kept (GetClipPlane, state blocks) but not applied:
-// the Direct3D 9 HLE has none yet. Warned once when a draw could use them.
+// User clip planes: kept here for GetClipPlane and state blocks (32 of
+// them), the first 8 (MaxUserClipPlanes) applied through Direct3D 9's.
 void SetClip(Device& d, Device8& x, uint32_t i, const float* p) {
-  (void)d;
   if (i >= 32) return;
   std::memcpy(x.clip[i], p, 16);
-  static bool warned = false;
-  if (!warned) {
-    warned = true;
-    WarnF("d3d8: SetClipPlane: user clip planes are not applied\n");
-  }
+  SetClipPlane(d, i, p);
 }
 void SetVs(Device& d, Device8& x, uint32_t h) {
   x.vs = h;

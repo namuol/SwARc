@@ -441,6 +441,10 @@ void SetTransform(Device& d, uint32_t type, const float* m) {
     std::memcpy(to, a.data(), sizeof a);
 }
 
+void SetClipPlane(Device& d, uint32_t i, const float* p) {
+  if (i < 8) std::memcpy(d.ff_base.clip[i], p, 16);
+}
+
 }  // namespace recomp::d3d9
 
 namespace recomp::hle {
@@ -896,6 +900,19 @@ HLE_NAMED("d3d9.dll", "IDirect3DDevice9::SetTransform", D3DDev9_SetTransform, 3)
   float m[16];
   std::memcpy(m, GPtr(Arg(c, 2)), sizeof m);
   SetTransform(*Dev(c), Arg(c, 1), m);
+  return D3D_OK;
+}
+
+// (Index, pPlane): ax + by + cz + dw >= 0 is kept.
+HLE_NAMED("d3d9.dll", "IDirect3DDevice9::SetClipPlane", D3DDev9_SetClipPlane, 3) {
+  if (Arg(c, 1) >= 8) return D3DERR_INVALIDCALL;
+  SetClipPlane(*Dev(c), Arg(c, 1), reinterpret_cast<const float*>(GPtr(Arg(c, 2))));
+  return D3D_OK;
+}
+
+HLE_NAMED("d3d9.dll", "IDirect3DDevice9::GetClipPlane", D3DDev9_GetClipPlane, 3) {
+  if (Arg(c, 1) >= 8) return D3DERR_INVALIDCALL;
+  std::memcpy(GPtr(Arg(c, 2)), Dev(c)->ff_base.clip[Arg(c, 1)], 16);
   return D3D_OK;
 }
 
