@@ -20,7 +20,6 @@ SAVED_DIR_FILE="$SUPPORT/game-dir"
 STEAM_GAME_DIR="$SUPPORT/$STEAM_FOLDER"
 WORK="$HOME/Library/Caches/$ID-build"
 LOG="$HOME/Library/Logs/$ID-build.log"
-BUNDLE_ID="local.$ID-recomp"
 
 game_dir_arg="" launch=1 supplied_args=()
 while [ $# -gt 0 ]; do
@@ -62,6 +61,7 @@ run() {  # run "what" command...: quietly, the end of the log on failure
 sha256() { shasum -a 256 "$1" 2>/dev/null | cut -d' ' -f1; }
 env_of() { eval "printf '%s' \"\${${ENV}_$1:-}\""; }  # env_of GAME_DIR -> $SOLDIERS_GAME_DIR
 
+BUNDLE_ID=$(/usr/libexec/PlistBuddy -c "Print CFBundleIdentifier" "$KIT/app/Info.plist")
 mkdir -p "$SUPPORT" "$(dirname "$LOG")"
 printf '\n=== build %s, kit %s ===\n' "$(date)" "$(head -1 "$KIT/VERSION" 2>/dev/null)" >> "$LOG"
 echo "${bold}$NAME — native Mac build${off}"

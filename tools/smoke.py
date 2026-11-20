@@ -61,9 +61,10 @@ more, a failure takes longer. Timings: docs/smoke-timings.md.
 Runs are muted (SDL_AUDIO_DRIVER=dummy) unless SDL_AUDIO_DRIVER is set.
 
 --frames-scale F wants F times each case's min_frames (a slower GPU, as in
-a VM). --run SCRIPT runs every case with SCRIPT instead of the repo's run script,
-and builds nothing: player/run-installed.sh tests the app a player install
-made (player/vm-test.sh).
+a VM). --run SCRIPT runs every case with SCRIPT instead of the repo's run
+script, leaves out cases that name their own, and builds nothing:
+player/run-installed.sh tests the app a player install made
+(player/vm-test.sh).
 
 Results go to REPO/build/smoke/<name>/ (shot, run log, check output). Exit
 status 1 if any case failed.
@@ -337,7 +338,12 @@ def main():
         if args.run:
             spec = dict(spec, run=os.path.abspath(args.run))
             spec.pop("build", None)
-            cases = [{k: v for k, v in c.items() if k != "run"} for c in cases]
+            # A case with its own run script tests another program than the
+            # one installed (RA2's classic-RA2 cases): left out.
+            skipped = [c["name"] for c in cases if "run" in c]
+            if skipped:
+                print("--run: skipping %s (their own run script)" % ", ".join(skipped))
+            cases = [c for c in cases if "run" not in c]
         if cases:
             repos.append((repo, spec, cases))
 

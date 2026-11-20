@@ -24,7 +24,8 @@ Its executable is a starter script, `Contents/MacOS/launcher`, that passes the g
 - CMake targets `<binary>` (the game), `<binary>_host` (its non-lifted code) and `<binary>_kit_parts` (depends on
   `<binary>_host`, `recomp_lift` and the libraries the game links), and a `<ID>_GENERATED_DIR` cache variable naming
   the lifted code's folder. `<ID>` is the id in upper case.
-- `cmake/Info.plist.in` with `CFBundleIdentifier` `local.<id>-recomp`.
+- `cmake/Info.plist.in`, used as it is (no CMake variables in it). Its `CFBundleIdentifier` tells an install
+  of this game from another app of the same name.
 - The game binary takes `--game-dir DIR`.
 - `tools/swarc.sh setup` (CI uses it to fetch SwARc) and `smoke/cases.json` (for `vm-test.sh`).
 
