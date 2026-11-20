@@ -284,6 +284,15 @@ HLE("user32.dll", GetKeyState, 1) {
   return r;
 }
 
+// GetKeyboardState(BYTE[256]): GetKeyState's bits for every key (bit 7
+// down, bit 0 toggled).
+HLE("user32.dll", GetKeyboardState, 1) {
+  uint32_t out = Arg(c, 0);
+  for (int vk = 0; vk < 256; vk++)
+    Wr8(out + uint32_t(vk), uint8_t((g_key_down[vk] ? 0x80 : 0) | (g_key_toggled[vk] ? 1 : 0)));
+  return 1;
+}
+
 HLE("user32.dll", GetAsyncKeyState, 1) {
   uint8_t vk = uint8_t(Arg(c, 0));
   uint32_t r = (g_key_down[vk] ? 0x8000u : 0) |

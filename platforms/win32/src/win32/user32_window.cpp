@@ -186,27 +186,31 @@ uint32_t g_next_hwnd = 0x00010010;
 uint16_t g_next_atom = 0xC100;
 uint32_t g_focus = 0, g_active = 0;
 
-// WH_CBT hooks, the last installed first (see "hooks").
-struct CbtHook {
+// Hooks run by this module (WH_KEYBOARD, WH_CBT), the last installed
+// first (see "hooks").
+constexpr int32_t kWhKeyboard = 2, kWhCbt = 5;
+struct Hook {
+  int32_t type;
   uint32_t handle, proc, tid;  // tid 0: every thread
 };
-std::vector<CbtHook> g_cbt_hooks;
+std::vector<Hook> g_hooks;
 
-// The procedure of the calling thread's first WH_CBT hook after `after`
-// (0: the first one); 0 if there is none.
-uint32_t NextCbtHook(uint32_t after) {
+// The procedure of the calling thread's first `type` hook after the hook
+// `after` (0: the first one); 0 if there is none.
+uint32_t NextHook(int32_t type, uint32_t after) {
   std::lock_guard<std::recursive_mutex> l(g_mu);
   uint32_t tid = CurrentThread()->tid;
   bool past = after == 0;
-  for (const CbtHook& k : g_cbt_hooks) {
+  for (const Hook& k : g_hooks) {
     if (!past) {
       past = k.handle == after;
       continue;
     }
-    if (!k.tid || k.tid == tid) return k.proc;
+    if (k.type == type && (!k.tid || k.tid == tid)) return k.proc;
   }
   return 0;
 }
+uint32_t NextCbtHook(uint32_t after) { return NextHook(kWhCbt, after); }
 int g_cursor_count = 0;  // ShowCursor display counter
 int32_t g_mouse_x = 0, g_mouse_y = 0;  // screen coordinates
 // The host pointer over the game window, in client (mode) coordinates;
@@ -853,6 +857,31 @@ bool TakeMessage(uint32_t hwnd, uint32_t lo, uint32_t hi, bool remove, Msg* out)
     }
   }
   return false;
+}
+
+// WH_KEYBOARD: GetMessage and PeekMessage show each key message they
+// return (WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP) to the
+// thread's keyboard hooks first: KeyboardProc(HC_ACTION (0), or
+// HC_NOREMOVE (3) when the message stays queued, vk, keystroke lParam).
+// A nonzero return discards a removed message: true when it was.
+bool KeyboardHookDiscards(Ctx& c, const Msg& m, bool removed) {
+  if (m.msg != WM_KEYDOWN && m.msg != WM_KEYUP && m.msg != WM_SYSKEYDOWN &&
+      m.msg != WM_SYSKEYUP)
+    return false;
+  uint32_t proc = NextHook(kWhKeyboard, 0);
+  if (!proc) return false;
+  uint32_t r = CallGuest(c, proc, {removed ? 0u : 3u, m.wparam, m.lparam});
+  return removed && r != 0;
+}
+
+// Takes the first matching message, as TakeMessage, after the keyboard
+// hooks have seen it (and not discarded it).
+bool TakeHookedMessage(Ctx& c, uint32_t hwnd, uint32_t lo, uint32_t hi, bool remove,
+                       Msg* out) {
+  for (;;) {
+    if (!TakeMessage(hwnd, lo, hi, remove, out)) return false;
+    if (!KeyboardHookDiscards(c, *out, remove)) return true;
+  }
 }
 
 // Marks hwnd (and with `children`, its descendants) as needing paint.
@@ -2598,7 +2627,7 @@ HLE("user32.dll", PeekMessageA, 5) {
            flags = Arg(c, 4);
   PumpHostEvents();
   Msg m;
-  if (!TakeMessage(hwnd, lo, hi, flags & 1 /* PM_REMOVE */, &m)) return 0;
+  if (!TakeHookedMessage(c, hwnd, lo, hi, flags & 1 /* PM_REMOVE */, &m)) return 0;
   PutMsg(msg_va, m);
   return 1;
 }
@@ -2608,7 +2637,7 @@ HLE("user32.dll", GetMessageA, 4) {
   Msg m;
   for (;;) {
     PumpHostEvents();
-    if (TakeMessage(hwnd, lo, hi, true, &m)) break;
+    if (TakeHookedMessage(c, hwnd, lo, hi, true, &m)) break;
     if (OnMainThread() && g_sdl_up) {
       SDL_WaitEventTimeout(nullptr, 10);
     } else {
@@ -3048,7 +3077,7 @@ uint32_t RunModal(Ctx& c, uint32_t hdlg) {
     }
     PumpHostEvents();
     Msg msg;
-    if (TakeMessage(0, 0, 0, true, &msg)) {
+    if (TakeHookedMessage(c, 0, 0, 0, true, &msg)) {
       PutMsg(m, msg);
       CallGuest(c, translate, {m});
       CallGuest(c, dispatch, {m});
@@ -3980,11 +4009,10 @@ HLE64("user32.dll", SetWindowsHookExA, 4) {
   static uint32_t next = 0x00F00010;
   int32_t type = int32_t(Arg(c, 0));
   uint32_t h = next += 0x10;
-  if (type == 5) {
+  if (type == kWhCbt || type == kWhKeyboard) {
     std::lock_guard<std::recursive_mutex> l(g_mu);
     uint32_t tid = uint32_t(Arg(c, 3));
-    g_cbt_hooks.insert(g_cbt_hooks.begin(),
-                       CbtHook{h, uint32_t(Arg(c, 1)), tid});
+    g_hooks.insert(g_hooks.begin(), Hook{type, h, uint32_t(Arg(c, 1)), tid});
   } else {
     RECOMP_TRACE("  SetWindowsHookExA(type %d, proc %08llX): never called\n", type,
                  (unsigned long long)Arg(c, 1));
@@ -3993,17 +4021,23 @@ HLE64("user32.dll", SetWindowsHookExA, 4) {
 }
 HLE64("user32.dll", UnhookWindowsHookEx, 1) {
   std::lock_guard<std::recursive_mutex> l(g_mu);
-  for (auto it = g_cbt_hooks.begin(); it != g_cbt_hooks.end(); ++it)
+  for (auto it = g_hooks.begin(); it != g_hooks.end(); ++it)
     if (it->handle == uint32_t(Arg(c, 0))) {
-      g_cbt_hooks.erase(it);
+      g_hooks.erase(it);
       break;
     }
   return 1;
 }
-// CallNextHookEx(hook, code, wp, lp): the next WH_CBT hook of the chain
-// after `hook` (for this thread or global); 0 at its end.
+// CallNextHookEx(hook, code, wp, lp): the next hook of `hook`'s type in
+// the chain (for this thread or global); 0 at its end.
 HLE64("user32.dll", CallNextHookEx, 4) {
-  uint32_t proc = NextCbtHook(uint32_t(Arg(c, 0)));
+  int32_t type = 0;
+  {
+    std::lock_guard<std::recursive_mutex> l(g_mu);
+    for (const Hook& k : g_hooks)
+      if (k.handle == uint32_t(Arg(c, 0))) type = k.type;
+  }
+  uint32_t proc = type ? NextHook(type, uint32_t(Arg(c, 0))) : 0;
   if (!proc) return 0;
   return CallGuest(c, proc, {Arg(c, 1), Arg(c, 2), Arg(c, 3)});
 }
