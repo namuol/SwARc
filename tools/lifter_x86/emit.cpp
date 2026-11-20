@@ -3879,7 +3879,8 @@ std::string FnName(uint64_t va) { return Fmt("f_%08llX", U(va)); }
 void CacheXmm(std::string* out, size_t at);  // below
 
 void Emitter::EmitFunction(const Function& f, std::string* out,
-                           std::set<uint64_t>* refs, EmitStats* stats) {
+                           std::set<uint64_t>* refs, EmitStats* stats,
+                           const std::vector<uint64_t>* entries) {
   std::string& o = *out;
   auto nm = p_.names.find(f.entry);
   o += "// " + (nm != p_.names.end() ? nm->second : FnName(f.entry)) + "\n";
@@ -3918,6 +3919,14 @@ void Emitter::EmitFunction(const Function& f, std::string* out,
   const bool sj = p_.x64 && !f.setjmp_returns.empty();
   if (sj) o += "  uint64_t SJ = 0;\n";
   if (resumable) o += "  try {\n";
+  // Secondary entries: their f_X (after this function) sets entry_label
+  // to the entry's number and calls this one, which continues there.
+  if (entries && !entries->empty()) {
+    o += "  if (const uint32_t at = c.entry_label) {\n    c.entry_label = 0;\n    switch (at) {\n";
+    for (size_t i = 0; i < entries->size(); i++)
+      o += Fmt("      case %zuu: goto L_%08llX;\n", i + 1, U((*entries)[i]));
+    o += "    }\n  }\n";
+  }
   // Instructions are emitted in address order, so if the function also
   // reaches code below its entry (shared tails, e.g. strstr jumping into
   // strchr), execution must start with a jump to the entry.
@@ -3930,6 +3939,7 @@ void Emitter::EmitFunction(const Function& f, std::string* out,
 
   // Labels: branch targets plus non-contiguous fallthroughs.
   std::set<uint64_t> labels = f.labels;
+  if (entries) labels.insert(entries->begin(), entries->end());
   for (auto it = f.insns.begin(); it != f.insns.end(); ++it) {
     auto nx = std::next(it);
     uint64_t t;
@@ -4007,6 +4017,11 @@ void Emitter::EmitFunction(const Function& f, std::string* out,
          "  }\n";
   if (!resumable && !p_.x64) CacheXmm(&o, body_at);
   o += "}\n\n";
+  if (entries)
+    for (size_t i = 0; i < entries->size(); i++)
+      o += Fmt("void f_%08llX(::recomp::Ctx& c) { c.entry_label = %zuu; LIFT_MUSTTAIL return %s(c); }\n",
+               U((*entries)[i]), i + 1, FnName(f.entry).c_str());
+  if (entries && !entries->empty()) o += "\n";
 }
 
 // XMM registers in locals (ARCHITECTURE.md, "SSE/SSE2"), like the general
