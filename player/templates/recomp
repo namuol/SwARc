@@ -1,0 +1,16 @@
+#!/bin/bash
+# @DISPLAY_NAME@'s developer commands: ./recomp help.
+# Generated from SwARc's player/templates/recomp by `./recomp sync`: change
+# it there, not here. The commands are SwARc's player/recomp.sh, at the
+# commit tools/swarc.sh pins; this gets that checkout first if it's missing.
+set -euo pipefail
+cd "$(dirname "$0")"
+if [ ! -d external/SwARc/.git ]; then
+  echo "recomp: getting SwARc (tools/swarc.sh setup)" >&2
+  tools/swarc.sh setup
+fi
+if [ ! -f external/SwARc/player/recomp.sh ]; then
+  echo "recomp: external/SwARc is at a commit from before ./recomp; run tools/swarc.sh sync" >&2
+  exit 1
+fi
+exec /bin/bash external/SwARc/player/recomp.sh "$@"

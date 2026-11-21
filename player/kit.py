@@ -4,8 +4,10 @@ game on a player's Mac except the game itself.
 
   kit.py build [--root GAME_REPO]        dist/<id>-kit-macos-arm64.tar.gz
   kit.py sync [--root GAME_REPO] [--check]
-      write the game's install.sh and .github/workflows/kit.yml from
+      write the game's install.sh, recomp and .github/workflows/kit.yml from
       player/templates (--check: fail if they are out of date instead)
+  kit.py env [--root GAME_REPO]
+      print the game's settings as bash variables (for player/recomp.sh)
 
 The game is described by recomplauncher.json at the root of its repository
 (player/README.md, "recomplauncher.json"). `build` configures the game's
@@ -294,7 +296,8 @@ def cmd_build(root, c):
 
 # --- sync ------------------------------------------------------------------
 
-GENERATED = (("install.sh", "install.sh", 0o755), ("kit.yml", os.path.join(".github", "workflows", "kit.yml"), 0o644))
+GENERATED = (("install.sh", "install.sh", 0o755), ("recomp", "recomp", 0o755),
+             ("kit.yml", os.path.join(".github", "workflows", "kit.yml"), 0o644))
 
 
 def render(template, c):
@@ -333,7 +336,7 @@ def cmd_sync(root, c, check):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("command", choices=("build", "sync"))
+    ap.add_argument("command", choices=("build", "sync", "env"))
     ap.add_argument("--root", default=os.path.dirname(os.path.dirname(SWARC)),
                     help="the game's repository (default: the one SwARc is checked out in)")
     ap.add_argument("--check", action="store_true", help="sync: fail if the files are out of date")
@@ -342,6 +345,10 @@ def main():
     c = load_config(root)
     if a.command == "build":
         cmd_build(root, c)
+    elif a.command == "env":  # for player/recomp.sh: game.env and the kit's names
+        q = shlex.quote
+        print(game_env(c) + "KIT_NAME=%s\nASSET=%s\nBREW=(%s)" % (
+            q(c["kit_name"]), q(c["asset"]), " ".join(q(b) for b in c["kit"].get("brew", []))))
     else:
         cmd_sync(root, c, a.check)
 

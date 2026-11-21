@@ -7,7 +7,9 @@ only describes itself, in `recomplauncher.json` at its repository's root.
 | File | What it is |
 |---|---|
 | `kit.py build` | Makes `dist/<id>-kit-macos-arm64.tar.gz` in the game's repo: everything needed to build the game except the game itself (the bundled libraries, the lifter, the game's non-lifted objects, headers, CMake's flags, manifests, `game.env`, `build.sh`) |
-| `kit.py sync [--check]` | Writes the game's `install.sh` and `.github/workflows/kit.yml` from `templates/` (`--check`: fails if they're stale; CI runs it) |
+| `recomp.sh` | The game repo's developer commands, run as `./recomp` there (below) |
+| `kit.py sync [--check]` | Writes the game's `install.sh`, `recomp` and `.github/workflows/kit.yml` from `templates/` (`--check`: fails if they're stale; CI runs it) |
+| `kit.py env` | The game's settings as bash variables, for `recomp.sh` |
 | `player.sh` | Shipped in the kit and installed in the app's `Contents/Resources`: the app menu's actions and the update check at launch (below) |
 | `build.sh` | The player's build, shipped in the kit: checks the Mac, installs Apple's command line tools, finds the game copy (Wine bottles, CrossOver, Whisky, Kegworks, Spotlight) or downloads it from Steam with DepotDownloader and a QR sign-in, checks its hashes, asks for files the player supplies, lifts, compiles with Apple's clang and installs the app |
 | `vm-test.sh REPO...` | The whole player install, then the game's smoke cases on the installed app, then `vm-app-check.sh`, in throwaway tart VMs (deleted afterwards) |
@@ -20,6 +22,27 @@ app goes in `/Applications`, or `~/Applications` when this account can't write t
 Its executable is a starter script, `Contents/MacOS/launcher`, that passes the game folder the install saved
 (`~/Library/Application Support/<id>/game-dir`) as `--game-dir`. Logs: `~/Library/Logs/<id>-build.log` (the
 build), `~/Library/Logs/<id>.log` (the game, when started from Finder; the run before's is `<id>.log.1`).
+
+## A game repo's commands: ./recomp
+
+Every game repo has the same `./recomp` (generated from `templates/recomp`). It gets SwARc into
+`external/SwARc` if it's missing, then runs that checkout's `player/recomp.sh`, so the commands come with the
+SwARc commit the game pins, and changing them here reaches every game at its next pin.
+
+| Command | What it does |
+|---|---|
+| `./recomp setup` | Installs the Homebrew packages the game's `kit.brew` lists that are missing, then `sync` |
+| `./recomp status` | Whether SwARc is the pinned commit, the generated files are current, the kit in `dist/` is this checkout's, and which build is installed |
+| `./recomp sync` | After pulling: checks out the pinned SwARc, and rewrites the generated files if SwARc's templates changed |
+| `./recomp kit [--force]` | Builds the kit in `dist/`, only when it isn't this checkout's: its `VERSION` names the game commit and SwARc commit it was built from, and whether either had uncommitted changes |
+| `./recomp install [ARGS]` | `kit` if needed, then the game's `install.sh` with that kit, as a player would install (`ARGS` go to `build.sh`: `--no-launch`, `--game-dir DIR`) |
+| `./recomp test [ARGS]` | `kit` if needed, then `vm-test.sh` on this repo (`--keep-base`, `--keep`, `--update`, `--steam`) |
+| `./recomp uninstall` | `install.sh --uninstall` |
+| `./recomp pin [REF]` | Checks out SwARc's `REF` (default `origin/main`; it must be on the fork), pins it in `tools/swarc.sh`, then `sync`. Commit `tools/swarc.sh` and the generated files together |
+
+`kit`, `install` and `test` stop when `external/SwARc` isn't the pinned commit or has uncommitted changes, since
+the kit would then be built from something the game doesn't pin; `--allow-unpinned` goes ahead anyway, for trying
+a SwARc change before landing it.
 
 ## The installed app
 
@@ -103,8 +126,8 @@ Images without a `manifest` get an empty one.
 ## Testing
 
 ```bash
-python3 -I external/SwARc/player/kit.py build      # in the game's repo
-external/SwARc/player/vm-test.sh .                  # or several repos, one after another
+./recomp test                                       # in the game's repo: the kit if needed, then vm-test.sh
+external/SwARc/player/vm-test.sh . ../other-game    # several repos, one after another (kits built first)
 ```
 
 `vm-test.sh` needs [tart](https://tart.run) and the game copy on this Mac. The first run makes the base VM
