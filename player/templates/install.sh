@@ -7,8 +7,10 @@
 # with your Steam account, and builds @APP@.app in your Applications folder.
 # Running it again updates the kit and rebuilds. @ENV@_KIT_URL overrides the
 # kit's URL (file:// works). Arguments go to build.sh (--game-dir, --supply,
-# --no-launch). Everything is in main(), so a partly downloaded script runs
-# nothing.
+# --no-launch). --uninstall instead deletes the app and its build kit, and
+# keeps the saved games (what the app menu's Uninstall does):
+#   curl -fsSL https://raw.githubusercontent.com/@REPO@/main/install.sh | bash -s -- --uninstall
+# Everything is in main(), so a partly downloaded script runs nothing.
 #
 # Generated from SwARc's player/templates/install.sh by
 # `external/SwARc/player/kit.py sync`: change it there, not here.
@@ -19,6 +21,15 @@ main() {
   local support="$HOME/Library/Application Support/@ID@"
   local bold=$'\033[1m' red=$'\033[31m' off=$'\033[0m'
   fail() { printf '\n%sStopped:%s %s\n' "$red" "$off" "$*"; exit 1; }
+
+  if [ "${1:-}" = --uninstall ]; then
+    local d
+    for d in /Applications "$HOME/Applications"; do
+      [ -f "$d/@APP@.app/Contents/Resources/player.sh" ] &&
+        exec /bin/bash "$d/@APP@.app/Contents/Resources/player.sh" uninstall --terminal
+    done
+    fail "@APP@.app isn't in /Applications or ~/Applications (or it's from before uninstalling was added: drag it to the Trash)."
+  fi
 
   [ "$(uname -s)" = Darwin ] || fail "this is for macOS."
   [ "$(/usr/sbin/sysctl -n hw.optional.arm64 2>/dev/null)" = 1 ] ||

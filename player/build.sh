@@ -319,15 +319,28 @@ cp "$KIT/app/Info.plist" "$B/Info.plist"
 # Started from Finder, the game has no --game-dir: this starter passes the
 # folder found above (saved in $SAVED_DIR_FILE, which a later run updates).
 # Its own name: the disk ignores case, so "Soldiers" would be "soldiers".
+# Before the game starts it offers a newer release, once a day (player.sh);
+# started from Finder, the game's output goes to ~/Library/Logs/$ID.log
+# (the app menu's Show Logs), the run before's to $ID.log.1.
 cat > "$B/MacOS/launcher" <<EOF
 #!/bin/bash
 here=\$(cd "\$(dirname "\$0")" && pwd)
 dir=\${${ENV}_GAME_DIR:-\$(head -1 "\$HOME/Library/Application Support/$ID/game-dir" 2>/dev/null)}
+/bin/bash "\$here/../Resources/player.sh" launch
+[ \$? = 10 ] && exit 0  # updating instead
+if [ /dev/fd/2 -ef /dev/null ]; then
+  log="\$HOME/Library/Logs/$ID.log"
+  mkdir -p "\$(dirname "\$log")"
+  [ -f "\$log" ] && mv -f "\$log" "\$log.1"
+  exec > "\$log" 2>&1
+fi
 exec "\$here/$BINARY" --game-dir "\$dir" "\$@"
 EOF
 chmod 755 "$B/MacOS/launcher"
 run "Configuring the app" /usr/libexec/PlistBuddy -c "Set :CFBundleExecutable launcher" "$B/Info.plist"
 cp "$KIT/VERSION" "$B/Resources/kit-version"
+# The app menu's actions (SwARc's runtime adds the menu when this is there).
+cp "$KIT/player.sh" "$KIT/game.env" "$B/Resources/"
 cp "$KIT"/lib/*.dylib "$B/Frameworks/"
 cp "$KIT/licenses/THIRD-PARTY.txt" "$B/Resources/"
 run "Signing" codesign --force --sign - "$B/MacOS/$BINARY"

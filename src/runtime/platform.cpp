@@ -11,6 +11,7 @@
 #include "runtime/platform.h"
 
 #include <errno.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
@@ -21,9 +22,18 @@
 #include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <mach/thread_policy.h>
+#include <crt_externs.h>
+#include <limits.h>
+#include <mach-o/dyld.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <pthread.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <string>
+#include <thread>
 #else
 #include <sys/prctl.h>
 #endif
@@ -314,6 +324,106 @@ int PrimaryDisplayTopInset() {
   return in.top > 0 ? int(in.top * (scale > 0 ? scale : 1.0) + 0.5) : 0;
 #else
   return 0;
+#endif
+}
+
+#if defined(__APPLE__)
+namespace {
+// player.sh's path and the actions its menu items run, by item tag.
+std::string g_player_script;
+const char* const kPlayerActions[] = {"check", "saves", "logs", "uninstall"};
+
+// -[SwarcPlayerMenu run:]: runs player.sh with the item's action. The
+// script shows its own dialogs; a thread reaps it.
+void RunPlayerAction(id, SEL, id sender) {
+  const long tag = reinterpret_cast<long (*)(id, SEL)>(objc_msgSend)(sender, sel_registerName("tag"));
+  if (tag < 0 || tag >= long(sizeof kPlayerActions / sizeof *kPlayerActions)) return;
+  const std::string pid = std::to_string(getpid());
+  const char* argv[] = {"/bin/bash", g_player_script.c_str(), kPlayerActions[tag], pid.c_str(), nullptr};
+  pid_t child;
+  if (posix_spawn(&child, argv[0], nullptr, nullptr, const_cast<char* const*>(argv), *_NSGetEnviron()) == 0)
+    std::thread([child] {
+      int st;
+      waitpid(child, &st, 0);
+    }).detach();
+}
+
+id NsString(const char* s) {
+  return reinterpret_cast<id (*)(id, SEL, const char*)>(objc_msgSend)(
+      reinterpret_cast<id>(objc_getClass("NSString")), sel_registerName("stringWithUTF8String:"), s);
+}
+}  // namespace
+#endif
+
+void AddPlayerMenu() {
+#if defined(__APPLE__)
+  static bool done = false;
+  if (done) return;
+  done = true;
+  // Contents/MacOS/<binary> -> Contents/Resources/player.sh.
+  char exe[4096];
+  uint32_t size = sizeof exe;
+  if (_NSGetExecutablePath(exe, &size) != 0) return;
+  char real[PATH_MAX];
+  if (!realpath(exe, real)) return;
+  std::string script = real;
+  script = script.substr(0, script.rfind('/')) + "/../Resources/player.sh";
+  if (access(script.c_str(), R_OK) != 0) return;
+  g_player_script = script;
+
+  // Through the Objective-C runtime, as PrimaryDisplayTopInset: the app
+  // menu SDL made is [[NSApp mainMenu] itemAtIndex:0].submenu.
+  using IdFn = id (*)(id, SEL);
+  auto send = [](id o, const char* sel) { return reinterpret_cast<IdFn>(objc_msgSend)(o, sel_registerName(sel)); };
+  Class app_class = objc_getClass("NSApplication");
+  if (!app_class) return;
+  id app = send(reinterpret_cast<id>(app_class), "sharedApplication");
+  id main_menu = app ? send(app, "mainMenu") : nullptr;
+  if (!main_menu) return;
+  id app_item = reinterpret_cast<id (*)(id, SEL, long)>(objc_msgSend)(main_menu, sel_registerName("itemAtIndex:"), 0);
+  id menu = app_item ? send(app_item, "submenu") : nullptr;
+  if (!menu) return;
+
+  Class target_class = objc_getClass("SwarcPlayerMenu");
+  if (!target_class) {
+    target_class = objc_allocateClassPair(objc_getClass("NSObject"), "SwarcPlayerMenu", 0);
+    class_addMethod(target_class, sel_registerName("run:"), reinterpret_cast<IMP>(RunPlayerAction), "v@:@");
+    objc_registerClassPair(target_class);
+  }
+  id target = send(send(reinterpret_cast<id>(target_class), "alloc"), "init");  // kept for good
+
+  // The app's name as the menu shows it (CFBundleName).
+  std::string name;
+  id bundle = send(reinterpret_cast<id>(objc_getClass("NSBundle")), "mainBundle");
+  id ns_name = bundle ? reinterpret_cast<id (*)(id, SEL, id)>(objc_msgSend)(
+                            bundle, sel_registerName("objectForInfoDictionaryKey:"), NsString("CFBundleName"))
+                      : nullptr;
+  if (ns_name) name = reinterpret_cast<const char* (*)(id, SEL)>(objc_msgSend)(ns_name, sel_registerName("UTF8String"));
+  const std::string uninstall = name.empty() ? "Uninstall…" : "Uninstall " + name + "…";
+
+  // After "About <app>": Check for Updates..., then the rest in a group.
+  long at = 1;
+  auto insert = [&](id item) {
+    reinterpret_cast<void (*)(id, SEL, id, long)>(objc_msgSend)(menu, sel_registerName("insertItem:atIndex:"), item,
+                                                                at++);
+  };
+  auto item = [&](const char* title, long tag) {
+    id i = send(reinterpret_cast<id>(objc_getClass("NSMenuItem")), "alloc");
+    i = reinterpret_cast<id (*)(id, SEL, id, SEL, id)>(objc_msgSend)(
+        i, sel_registerName("initWithTitle:action:keyEquivalent:"), NsString(title), sel_registerName("run:"),
+        NsString(""));
+    reinterpret_cast<void (*)(id, SEL, id)>(objc_msgSend)(i, sel_registerName("setTarget:"), target);
+    reinterpret_cast<void (*)(id, SEL, long)>(objc_msgSend)(i, sel_registerName("setTag:"), tag);
+    insert(i);
+  };
+  auto separator = [&] { insert(send(reinterpret_cast<id>(objc_getClass("NSMenuItem")), "separatorItem")); };
+  item("Check for Updates…", 0);
+  separator();
+  item("Show Saved Games", 1);
+  item("Show Logs", 2);
+  item(uninstall.c_str(), 3);
+  fprintf(stderr, "app menu: Check for Updates, Show Saved Games, Show Logs, %s (%s)\n", uninstall.c_str(),
+               g_player_script.c_str());
 #endif
 }
 

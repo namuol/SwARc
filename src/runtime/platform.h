@@ -131,4 +131,13 @@ bool RedirectToCall(void* uc, void (*fn)());
 // system is up (SDL video).
 int PrimaryDisplayTopInset();
 
+// ---- the installed app
+// An app the player install made (player/build.sh) ships its menu's
+// actions as Contents/Resources/player.sh. On macOS this adds them to the
+// app menu (Check for Updates, Show Saved Games, Show Logs, Uninstall),
+// each running `player.sh <action> <this pid>`. Does nothing elsewhere, in
+// a build without the script (a developer's), or before the window system
+// is up. Call on the main thread once SDL video is up.
+void AddPlayerMenu();
+
 }  // namespace recomp::platform

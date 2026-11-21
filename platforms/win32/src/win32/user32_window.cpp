@@ -1056,6 +1056,7 @@ void EnsureSdlVideo() {
   SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
   if (!SDL_Init(SDL_INIT_VIDEO)) FatalF("SDL_Init: %s", SDL_GetError());
   g_sdl_up = true;
+  platform::AddPlayerMenu();  // an installed app's Check for Updates, Uninstall...
   if (const SDL_DisplayMode* m = SDL_GetDesktopDisplayMode(SDL_GetPrimaryDisplay())) {
     // Games see pixels: a scaled desktop (Wayland, macOS) reports points.
     const float d = m->pixel_density > 0 ? m->pixel_density : 1.0f;

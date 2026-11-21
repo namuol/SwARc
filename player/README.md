@@ -8,15 +8,40 @@ only describes itself, in `recomplauncher.json` at its repository's root.
 |---|---|
 | `kit.py build` | Makes `dist/<id>-kit-macos-arm64.tar.gz` in the game's repo: everything needed to build the game except the game itself (the bundled libraries, the lifter, the game's non-lifted objects, headers, CMake's flags, manifests, `game.env`, `build.sh`) |
 | `kit.py sync [--check]` | Writes the game's `install.sh` and `.github/workflows/kit.yml` from `templates/` (`--check`: fails if they're stale; CI runs it) |
+| `player.sh` | Shipped in the kit and installed in the app's `Contents/Resources`: the app menu's actions and the update check at launch (below) |
 | `build.sh` | The player's build, shipped in the kit: checks the Mac, installs Apple's command line tools, finds the game copy (Wine bottles, CrossOver, Whisky, Kegworks, Spotlight) or downloads it from Steam with DepotDownloader and a QR sign-in, checks its hashes, asks for files the player supplies, lifts, compiles with Apple's clang and installs the app |
-| `vm-test.sh REPO...` | The whole player install, then the game's smoke cases on the installed app, in throwaway tart VMs (deleted afterwards) |
+| `vm-test.sh REPO...` | The whole player install, then the game's smoke cases on the installed app, then `vm-app-check.sh`, in throwaway tart VMs (deleted afterwards) |
+| `vm-app-check.sh` | Run in the VM by `vm-test.sh`: the app's update check, menu actions and uninstall |
 | `run-installed.sh` | The run script `tools/smoke.py --run` uses to run an installed app |
 
 Players run the game's `install.sh` (`curl -fsSL https://raw.githubusercontent.com/<repo>/main/install.sh | bash`),
 which downloads the latest release's kit to `~/Library/Application Support/<id>/kit` and runs its `build.sh`. The
 app goes in `/Applications`, or `~/Applications` when this account can't write there (or wherever it was before).
 Its executable is a starter script, `Contents/MacOS/launcher`, that passes the game folder the install saved
-(`~/Library/Application Support/<id>/game-dir`) as `--game-dir`. Log: `~/Library/Logs/<id>-build.log`.
+(`~/Library/Application Support/<id>/game-dir`) as `--game-dir`. Logs: `~/Library/Logs/<id>-build.log` (the
+build), `~/Library/Logs/<id>.log` (the game, when started from Finder; the run before's is `<id>.log.1`).
+
+## The installed app
+
+Everything the game writes goes in `~/Library/Application Support/<id>/` (the runtime's `DataDir()`): the guest's
+writes to its install folder in `install/`, its other files (My Documents, AppData) in `drive_c/`, the registry in
+`registry.txt`, crash and hang reports. Neither the app nor the kit holds any of it, so updating and uninstalling
+leave the saved games alone. The same folder has `kit/`, `game-dir`, and the game copy when it came from Steam.
+
+In an app with `Contents/Resources/player.sh` (an installed one; not a developer's build), SwARc's runtime adds to
+the macOS app menu, after About:
+
+| Item | `player.sh` | What it does |
+|---|---|---|
+| Check for Updates… | `check PID` | Asks GitHub how this build's game commit (the kit's `VERSION`) compares with the latest release; if the release is newer, offers to update: quits the game and reruns `install.sh` in Terminal |
+| Show Saved Games | `saves` | Opens `~/Library/Application Support/<id>/` in Finder |
+| Show Logs | `logs` | Shows the game's log (else the build's) in Finder |
+| Uninstall <app>… | `uninstall PID` | Quits the game, deletes the app, the kit and the build cache; asks whether to delete a game copy downloaded from Steam; keeps the saved games |
+
+Before the game starts, the app's starter runs `player.sh launch`: once a day it asks GitHub too, and if a newer
+release is out offers to update (Later starts the game). Runs with `<ID>_BACKGROUND`, `<ID>_HEADLESS` or
+`<ID>_NO_UPDATE_CHECK=1` skip it. The release API needs the repository to be public. From Terminal, the installer
+uninstalls as well: `curl -fsSL https://raw.githubusercontent.com/<repo>/main/install.sh | bash -s -- --uninstall`.
 
 ## What a game needs
 

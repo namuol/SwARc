@@ -14,8 +14,8 @@ and assembles dist/<id>-kit: the libraries the game links (SwARc's and, from
 Homebrew, all they load in turn) with their install names rewritten to
 @rpath, the lifter, the game's own non-lifted objects, the SwARc headers
 lifted code includes, the compile and link flags CMake uses (read from the
-stub), pe_symbols.py, the manifests, game.env and player/build.sh. Nothing
-from the game, nor derived from it.
+stub), pe_symbols.py, the manifests, game.env, player/build.sh and
+player/player.sh. Nothing from the game, nor derived from it.
 
 Needs the game's developer setup (Homebrew packages, external/SwARc). The kit
 runs on the macOS it was built on and newer (Homebrew's libraries target
@@ -231,8 +231,9 @@ def assemble(root, c, build, kit):
     shutil.copy2(os.path.join(root, "cmake", "Info.plist.in"), os.path.join(kit, "app", "Info.plist"))
     with open(os.path.join(kit, "game.env"), "w") as f:
         f.write(game_env(c))
-    shutil.copy2(os.path.join(HERE, "build.sh"), os.path.join(kit, "build.sh"))
-    os.chmod(os.path.join(kit, "build.sh"), 0o755)
+    for script in ("build.sh", "player.sh"):  # player.sh: the app's menu actions (build.sh installs it)
+        shutil.copy2(os.path.join(HERE, script), os.path.join(kit, script))
+        os.chmod(os.path.join(kit, script), 0o755)
 
     # Licences: SwARc's, and where each bundled Homebrew library came from.
     shutil.copy2(os.path.join(SWARC, "LICENSE"), os.path.join(kit, "licenses", "SwARc-LICENSE"))
@@ -254,11 +255,13 @@ def assemble(root, c, build, kit):
     with open(os.path.join(kit, "MIN_MACOS"), "w") as f:
         f.write(minos + "\n")
 
-    # The game's commit, then SwARc's (an update is a newer game commit).
+    # The game's commit, SwARc's, then the game's in full (an update is a
+    # newer game commit: player.sh asks GitHub how this one compares).
     game_rev = run("git", "-C", root, "describe", "--always", "--dirty").strip()
     swarc_rev = run("git", "-C", SWARC, "rev-parse", "--short", "HEAD").strip()
+    game_sha = run("git", "-C", root, "rev-parse", "HEAD").strip()
     with open(os.path.join(kit, "VERSION"), "w") as f:
-        f.write("%s\n%s\n" % (game_rev, swarc_rev))
+        f.write("%s\n%s\n%s\n" % (game_rev, swarc_rev, game_sha))
     print("kit: %d libraries, needs macOS %s" % (len(names), minos))
 
 

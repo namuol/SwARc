@@ -6,8 +6,10 @@
 # the app loads nothing from outside itself; then runs the game's smoke
 # cases (smoke/cases.json, SwARc's tools/smoke.py) on the installed app,
 # wanting half the frames each case's min_frames asks for (the VM's GPU is
-# slower than the Macs the cases were made on).
-#   vm-test.sh [--steam] [--keep-base] [--keep] GAME_REPO...
+# slower than the Macs the cases were made on); then what the app does
+# besides the game (vm-app-check.sh: the update check, the app menu's
+# actions, uninstalling, which leaves the VM without the app).
+#   vm-test.sh [--steam] [--update] [--keep-base] [--keep] GAME_REPO...
 # Games run one after another, each in a new clone of the base VM
 # "swarc-player-base" (Cirrus Labs' vanilla macOS plus Apple's command line
 # tools and Pillow for smoke checks, made first if missing; RECOMP_VM_IMAGE
@@ -23,9 +25,10 @@
 # for the install's search to find; files the player supplies go in
 # ~/Player and are passed with --supply. --steam leaves the game out, so the
 # install offers the Steam download: answer it in the VM's Terminal and
-# approve the sign-in by scanning the QR code with the Steam app.
+# approve the sign-in by scanning the QR code with the Steam app. --update
+# also lets the update vm-app-check.sh starts run: a second whole build.
 #
-# Results: GAME_REPO/build/vm-test/ (install.log, smoke/). The VM's user is
+# Results: GAME_REPO/build/vm-test/ (install.log, smoke/, appcheck.log). The VM's user is
 # admin, password admin. Its screen is 1512x982 points, HiDPI.
 set -euo pipefail
 PLAYER=$(cd "$(dirname "$0")" && pwd)
@@ -38,19 +41,20 @@ TEST=swarc-player-test
 SH="/Volumes/My Shared Files"
 W_PT=1512 H_PT=982
 
-steam=0 keep_base=0 keep=0 repos=()
+steam=0 update="" keep_base=0 keep=0 repos=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --steam) steam=1 ;;
+    --update) update=" --update" ;;
     --keep-base) keep_base=1 ;;
     --keep) keep=1 ;;
-    -h|--help) sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*) echo "vm-test: unknown option $1 (try --help)"; exit 2 ;;
     *) repos+=("$(cd "$1" && pwd)") ;;
   esac
   shift
 done
-[ ${#repos[@]} -gt 0 ] || { sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+[ ${#repos[@]} -gt 0 ] || { sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 
 # --- What each game needs, from its recomplauncher.json ---------------------
 cfg() {  # cfg REPO KEY: one value of the x-swarc block, as kit.py reads it
@@ -75,8 +79,12 @@ for r in "${repos[@]}"; do
   [ -f "$r/recomplauncher.json" ] || { echo "vm-test: $r has no recomplauncher.json"; exit 1; }
   [ -f "$r/dist/$(cfg "$r" ASSET)" ] ||
     { echo "vm-test: no kit in $r/dist: run external/SwARc/player/kit.py build there first"; exit 1; }
-  tar -xzOf "$r/dist/$(cfg "$r" ASSET)" "$(cfg "$r" id)-kit/build.sh" | cmp -s - "$PLAYER/build.sh" ||
-    { echo "vm-test: $r's kit has an older player/build.sh: run external/SwARc/player/kit.py build there"; exit 1; }
+  for f in build.sh player.sh; do
+    tar -xzOf "$r/dist/$(cfg "$r" ASSET)" "$(cfg "$r" id)-kit/$f" 2>/dev/null | cmp -s - "$PLAYER/$f" ||
+      { echo "vm-test: $r's kit has an older player/$f: run external/SwARc/player/kit.py build there"; exit 1; }
+  done
+  /usr/bin/python3 -I "$PLAYER/kit.py" sync --check --root "$r" > /dev/null ||
+    { echo "vm-test: $r's install.sh is stale: run external/SwARc/player/kit.py sync there"; exit 1; }
   [ -f "$r/smoke/cases.json" ] || { echo "vm-test: $r has no smoke/cases.json"; exit 1; }
   if [ $steam = 0 ]; then
     g=$(host_game_dir "$r")
@@ -234,10 +242,17 @@ cd ~/repo && RECOMP_APP=\"\$(cat ~/app.path)\" /usr/bin/python3 -I \"$SH/swarc/t
   --run \"$SH/swarc/player/run-installed.sh\" --frames-scale 0.5 . 2>&1 | tee ~/smoke.log
 s=\${PIPESTATUS[0]}; rsync -a ~/repo/build/smoke \"$SH/out/\"; cp ~/smoke.log \"$SH/out/\"; ( exit \$s )")
     tail -15 "$OUT/smoke.log" 2>/dev/null || true
+    echo "== the app's update check, menu actions and uninstall"
+    ast=$(in_terminal appcheck "export ${env}_KIT_URL=\"file://\$HOME/Player/$asset\"
+/bin/bash \"$SH/swarc/player/vm-app-check.sh\" \"\$(cat ~/app.path)\" ~/Player/install.sh$update 2>&1 | tee ~/appcheck.log
+s=\${PIPESTATUS[0]}; cp ~/appcheck.log \"$SH/out/\"; ( exit \$s )")
+    cat "$OUT/appcheck.log" 2>/dev/null || true
     if grep -qE '^(OUTSIDE|NOAPP|UNSIGNED)' "$OUT/app.txt"; then
       results+=("FAIL  $name (the app: $OUT/app.txt)")
     elif [ "$st" != 0 ]; then
       results+=("FAIL  $name (smoke: $OUT/smoke/)")
+    elif [ "$ast" != 0 ]; then
+      results+=("FAIL  $name (the app's extras: $OUT/appcheck.log)")
     else
       results+=("PASS  $name")
     fi
