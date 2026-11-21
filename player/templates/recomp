@@ -5,7 +5,7 @@
 # commit tools/swarc.sh pins; this gets that checkout first if it's missing.
 set -euo pipefail
 cd "$(dirname "$0")"
-if [ ! -d external/SwARc/.git ]; then
+if [ ! -e external/SwARc/.git ]; then  # a folder, or a file in a git worktree
   echo "recomp: getting SwARc (tools/swarc.sh setup)" >&2
   tools/swarc.sh setup
 fi
