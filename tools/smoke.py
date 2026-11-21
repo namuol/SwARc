@@ -54,8 +54,8 @@ runs the games with <PREFIX>_HEADLESS=1 as well: their windows are never
 shown, so runs stay out of the way of someone using the Mac (frames, waits
 and shots work as shown). Use it for runs on a Mac someone is using.
 A case with no reference saves its shot as the reference (NEW: look at it).
---update replaces the references with this run's shots. References are the
-game's own pixels: keep smoke/ref/ out of git.
+--update replaces the references with this run's shots. Commit smoke/ref/ so
+every checkout compares against the same references.
 
 -j N runs up to N games at once (cases of repos without "parallel" still
 one after another). Games then load slower, so timeouts (`seconds` and the
