@@ -313,9 +313,33 @@ while IFS= read -r f; do [ -n "$f" ] && libs+=("$KIT/lib/$f"); done < "$KIT/flag
 echo "    Linking..."
 B="$WORK/$APP.app/Contents"
 mkdir -p "$B/MacOS" "$B/Frameworks" "$B/Resources"
-run "Linking" "$CXX" "${link_flags[@]}" -isysroot "$SDK" -o "$B/MacOS/$BINARY" \
+# The game's binary has the app's name: the name its process shows (Activity
+# Monitor, Force Quit, crash reports).
+run "Linking" "$CXX" "${link_flags[@]}" -isysroot "$SDK" -o "$B/MacOS/$APP" \
   "$WORK"/obj/*.o "$KIT"/obj/*.o "${libs[@]}" -Wl,-rpath,@executable_path/../Frameworks
 cp "$KIT/app/Info.plist" "$B/Info.plist"
+setp() { run "Configuring the app" /usr/bin/plutil -replace "$1" "-$2" "$3" "$B/Info.plist"; }
+# The name players see (menu bar, Dock, Finder) can have a colon, which a
+# file name can't: Finder shows the localized name when the file has the
+# plain one (CFBundleDisplayName).
+setp CFBundleName string "$DISPLAY_NAME"
+setp CFBundleDisplayName string "$APP"
+setp CFBundleDevelopmentRegion string en
+if [ "$DISPLAY_NAME" != "$APP" ]; then
+  setp LSHasLocalizedDisplayName bool YES
+  mkdir -p "$B/Resources/en.lproj"
+  esc=$(printf '%s' "$DISPLAY_NAME" | sed 's/\\/\\\\/g; s/"/\\"/g')
+  printf '"CFBundleDisplayName" = "%s";\n"CFBundleName" = "%s";\n' "$esc" "$esc" > "$B/Resources/en.lproj/InfoPlist.strings"
+fi
+# The icon: the one Windows shows for the game's program, from the player's
+# copy. Without it the app just has the generic icon.
+if [ -n "$ICON_FILE" ] && [ -f "$game/$ICON_FILE" ] &&
+   /usr/bin/python3 -I "$KIT/bin/pe_icon.py" "$game/$ICON_FILE" --icns "$B/Resources/AppIcon.icns" \
+     ${ICON_GROUP:+--group "$ICON_GROUP"} >> "$LOG" 2>&1; then
+  setp CFBundleIconFile string AppIcon
+else
+  warn "no icon from ${ICON_FILE:-the game} (the app gets the generic one; details in $LOG)"
+fi
 # Started from Finder, the game has no --game-dir: this starter passes the
 # folder found above (saved in $SAVED_DIR_FILE, which a later run updates).
 # Its own name: the disk ignores case, so "Soldiers" would be "soldiers".
@@ -334,7 +358,7 @@ if [ /dev/fd/2 -ef /dev/null ]; then
   [ -f "\$log" ] && mv -f "\$log" "\$log.1"
   exec > "\$log" 2>&1
 fi
-exec "\$here/$BINARY" --game-dir "\$dir" "\$@"
+exec "\$here/$APP" --game-dir "\$dir" "\$@"
 EOF
 chmod 755 "$B/MacOS/launcher"
 run "Configuring the app" /usr/libexec/PlistBuddy -c "Set :CFBundleExecutable launcher" "$B/Info.plist"
@@ -343,20 +367,22 @@ cp "$KIT/VERSION" "$B/Resources/kit-version"
 cp "$KIT/player.sh" "$KIT/game.env" "$B/Resources/"
 cp "$KIT"/lib/*.dylib "$B/Frameworks/"
 cp "$KIT/licenses/THIRD-PARTY.txt" "$B/Resources/"
-run "Signing" codesign --force --sign - "$B/MacOS/$BINARY"
+run "Signing" codesign --force --sign - "$B/MacOS/$APP"
 run "Signing" codesign --force --sign - "$WORK/$APP.app"
 ok "Built in $(( (SECONDS - started) / 60 )) min $(( (SECONDS - started) % 60 )) s"
 
 # --- Install ---------------------------------------------------------------
 ours() { [ "$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$1/Contents/Info.plist" 2>/dev/null)" = "$BUNDLE_ID" ]; }
-# Where it was installed before, else /Applications when this account can
-# write there, else ~/Applications. RECOMP_APPS_DIR overrides (for tests).
+# Where it was installed before (perhaps under an older name: the same
+# bundle ID), else /Applications when this account can write there, else
+# ~/Applications. RECOMP_APPS_DIR overrides (for tests).
+earlier=() dirs=(/Applications "$HOME/Applications")
+[ -n "${RECOMP_APPS_DIR:-}" ] && dirs=("$RECOMP_APPS_DIR")
+for d in "${dirs[@]}"; do
+  for a in "$d"/*.app; do [ -d "$a" ] && ours "$a" && earlier+=("$a"); done
+done
 apps=${RECOMP_APPS_DIR:-}
-if [ -z "$apps" ]; then
-  for d in /Applications "$HOME/Applications"; do
-    if [ -d "$d/$APP.app" ] && ours "$d/$APP.app"; then apps=$d; break; fi
-  done
-fi
+if [ -z "$apps" ] && [ ${#earlier[@]} -gt 0 ]; then apps=$(dirname "${earlier[0]}"); fi
 if [ -z "$apps" ]; then
   if [ -w /Applications ] && [ ! -e "/Applications/$APP.app" ]; then apps=/Applications; else apps="$HOME/Applications"; fi
 fi
@@ -367,16 +393,19 @@ fi
 mkdir -p "$apps"
 rm -rf "$APP_PATH"
 run "Installing" mv "$WORK/$APP.app" "$APP_PATH"
+for a in ${earlier[@]+"${earlier[@]}"}; do  # an install under an older name
+  [ "$a" != "$APP_PATH" ] && [ -d "$a" ] && { rm -rf "$a"; echo "    Removed $a (the earlier install, under its old name)"; }
+done
 rm -rf "$WORK"  # the translated code: derived from the game, and large
 ok "$APP_PATH"
 echo
 if [ "$apps" = "$HOME/Applications" ]; then
-  echo "${green}${bold}Done.${off} ${bold}$APP${off} is in the Applications folder inside your home folder"
+  echo "${green}${bold}Done.${off} ${bold}$DISPLAY_NAME${off} is in the Applications folder inside your home folder"
   echo "(~/Applications). To open it in Finder: Go > Home, then open Applications."
 else
-  echo "${green}${bold}Done.${off} ${bold}$APP${off} is in $apps."
+  echo "${green}${bold}Done.${off} ${bold}$DISPLAY_NAME${off} is in $apps."
 fi
-echo "Or press Cmd-Space, type $APP and press Return."
+echo "Or press Cmd-Space, type $DISPLAY_NAME and press Return."
 if [ $launch = 1 ]; then
   echo "Starting the game..."
   open "$APP_PATH"

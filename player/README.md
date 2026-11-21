@@ -28,6 +28,11 @@ writes to its install folder in `install/`, its other files (My Documents, AppDa
 `registry.txt`, crash and hang reports. Neither the app nor the kit holds any of it, so updating and uninstalling
 leave the saved games alone. The same folder has `kit/`, `game-dir`, and the game copy when it came from Steam.
 
+The app's icon is the one Windows shows for the game's program: `build.sh` extracts it from the player's copy
+with `tools/pe_icon.py` (the first icon group; 1–32-bit and PNG images; sizes the program lacks are scaled from
+its largest, by repeating pixels, so pixel art stays sharp). The name players see is `display_name`; the file is
+`<app>.app`, with the same name for the game's binary inside it, so its process shows that name too.
+
 In an app with `Contents/Resources/player.sh` (an installed one; not a developer's build), SwARc's runtime adds to
 the macOS app menu, after About:
 
@@ -50,7 +55,8 @@ uninstalls as well: `curl -fsSL https://raw.githubusercontent.com/<repo>/main/in
   `<name>_host`, `recomp_lift` and the libraries the game links), where `<name>` is `cmake_name` (default: `binary`),
   and a `<ID>_GENERATED_DIR` cache variable naming the lifted code's folder. `<ID>` is the id in upper case.
 - `cmake/Info.plist.in`, used as it is (no CMake variables in it). Its `CFBundleIdentifier` tells an install
-  of this game from another app of the same name.
+  of this game from another app of the same name, and finds an install under an older name (which the new one
+  replaces). `build.sh` sets the names in it from `app` and `display_name`.
 - The game binary takes `--game-dir DIR`.
 - `tools/swarc.sh setup` (CI uses it to fetch SwARc) and `smoke/cases.json` (for `vm-test.sh`).
 
@@ -64,11 +70,13 @@ A [RecompLauncher](https://github.com/elripalda/RecompLauncher) profile; SwARc r
   "format": 1,
   "name": "Soldiers: Heroes of World War II",
   "game": { "kind": "folder", "check": { "file": "Soldiers.exe" } },
-  "start": { "macos": { "program": ["Soldiers.app"] } },
+  "start": { "macos": { "program": ["Soldiers - Heroes of WWII.app"] } },
   "x-swarc": {
     "id": "soldiers",                  // folders, logs, env prefix (SOLDIERS_), kit name
-    "app": "Soldiers",                 // Soldiers.app
-    "binary": "soldiers",              // CMake target and executable
+    "app": "Soldiers - Heroes of WWII",        // the app's file name (no colons), and its game binary's
+    "display_name": "Soldiers: Heroes of WWII", // optional: the name players see (menu bar, Dock, Finder; default: app)
+    "binary": "soldiers",              // CMake target (the developer build's executable)
+    "icon": { "file": "Soldiers.exe", "group": 1 },  // optional: whose icon (default: the first .exe in files)
     "cmake_name": "soldiers",          // optional: <cmake_name>_host and _kit_parts (default: binary)
     "repo": "namuol/soldiers-heroes-of-wwii-recomp",
     "steam": { "appid": 11480, "depot": 11481, "manifest": "<depot manifest ID>", "build": "21022753",

@@ -3,7 +3,8 @@
 # starter build.sh writes), on a Mac that a player install just set up:
 # vm-test.sh runs it in the VM after the smoke cases.
 #   vm-app-check.sh APP_PATH INSTALL_SH [--update]
-# - the app has player.sh, game.env and a three-line kit-version;
+# - the app has player.sh, game.env and a three-line kit-version, the game's
+#   icon, and the names: Finder's is display_name, the binary's is app;
 # - started from Finder, the game writes ~/Library/Logs/<id>.log, and the
 #   runtime adds the app menu's actions;
 # - the update check at launch, against a stand-in for GitHub's API: no
@@ -26,11 +27,11 @@ fails=0
 ok() { echo "ok    $*"; }
 fail() { echo "FAIL  $*"; fails=$((fails + 1)); }
 check() { local what=$1; shift; if "$@"; then ok "$what"; else fail "$what"; fi; }
-game_running() { pgrep -f "$APP_PATH/Contents/MacOS/$BINARY" > /dev/null; }
+game_running() { pgrep -f "$APP_PATH/Contents/MacOS/$APP" > /dev/null; }
 stop_game() {
-  pkill -f "$APP_PATH/Contents/MacOS/$BINARY"
+  pkill -f "$APP_PATH/Contents/MacOS/$APP"
   for _ in $(seq 20); do game_running || return 0; sleep 0.5; done
-  pkill -9 -f "$APP_PATH/Contents/MacOS/$BINARY"
+  pkill -9 -f "$APP_PATH/Contents/MacOS/$APP"
 }
 pe() { eval "export ${ENV}_$1=\"\$2\""; }   # pe NAME VALUE: exports <ENV>_NAME
 ue() { unset "${ENV}_$1"; }
@@ -39,6 +40,11 @@ ue() { unset "${ENV}_$1"; }
 check "player.sh, game.env and kit-version in Resources" test -x "$R/player.sh" -a -f "$R/game.env" -a -f "$R/kit-version"
 check "kit-version has the full game commit" test "$(sed -n 3p "$R/kit-version" | wc -c | tr -d ' ')" = 41
 rev=$(sed -n 3p "$R/kit-version")
+check "the game's icon (AppIcon.icns, from its program)" test -s "$R/AppIcon.icns" -a "$(/usr/bin/plutil -extract CFBundleIconFile raw -o - "$APP_PATH/Contents/Info.plist" 2>/dev/null)" = AppIcon
+check "the game's binary is named $APP" test -x "$APP_PATH/Contents/MacOS/$APP"
+shown=$(/usr/bin/osascript -l JavaScript -e 'function run(a) { ObjC.import("AppKit"); return $.NSFileManager.defaultManager.displayNameAtPath(a[0]).js }' "$APP_PATH" 2>&1)
+check "Finder shows it as $DISPLAY_NAME (shows: $shown)" test "${shown%.app}" = "$DISPLAY_NAME"
+check "the menu bar's name is $DISPLAY_NAME" test "$(/usr/bin/plutil -extract CFBundleName raw -o - "$APP_PATH/Contents/Info.plist")" = "$DISPLAY_NAME"
 
 # --- the update check at launch, against a stand-in for GitHub's API
 api=$(mktemp -d)
@@ -102,7 +108,7 @@ grep "app menu:" "$LOG" | head -1 | sed 's/^/      /'
 check "Show Saved Games" /bin/bash "$R/player.sh" saves
 check "Show Logs" /bin/bash "$R/player.sh" logs
 stop_game
-check "the game stopped" sh -c '! pgrep -f "$0/Contents/MacOS/$1" > /dev/null' "$APP_PATH" "$BINARY"
+check "the game stopped" sh -c '! pgrep -f "$0/Contents/MacOS/$1" > /dev/null' "$APP_PATH" "$APP"
 
 # --- install.sh --uninstall, answering its question
 mkdir -p "$SUPPORT/drive_c"

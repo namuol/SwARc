@@ -23,10 +23,11 @@ main() {
   fail() { printf '\n%sStopped:%s %s\n' "$red" "$off" "$*"; exit 1; }
 
   if [ "${1:-}" = --uninstall ]; then
-    local d
-    for d in /Applications "$HOME/Applications"; do
-      [ -f "$d/@APP@.app/Contents/Resources/player.sh" ] &&
-        exec /bin/bash "$d/@APP@.app/Contents/Resources/player.sh" uninstall --terminal
+    local a
+    # The game's app, whatever its name: its game.env names this game.
+    for a in /Applications/*.app "$HOME"/Applications/*.app; do
+      [ -f "$a/Contents/Resources/player.sh" ] && (. "$a/Contents/Resources/game.env" && [ "$ID" = @ID@ ]) &&
+        exec /bin/bash "$a/Contents/Resources/player.sh" uninstall --terminal
     done
     fail "@APP@.app isn't in /Applications or ~/Applications (or it's from before uninstalling was added: drag it to the Trash)."
   fi

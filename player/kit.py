@@ -14,7 +14,7 @@ and assembles dist/<id>-kit: the libraries the game links (SwARc's and, from
 Homebrew, all they load in turn) with their install names rewritten to
 @rpath, the lifter, the game's own non-lifted objects, the SwARc headers
 lifted code includes, the compile and link flags CMake uses (read from the
-stub), pe_symbols.py, the manifests, game.env, player/build.sh and
+stub), pe_symbols.py, pe_icon.py, the manifests, game.env, player/build.sh and
 player/player.sh. Nothing from the game, nor derived from it.
 
 Needs the game's developer setup (Homebrew packages, external/SwARc). The kit
@@ -61,6 +61,15 @@ def load_config(root):
     c["env"] = x["id"].upper().replace("-", "_")
     c["cmake_name"] = x.get("cmake_name", x["binary"])  # <cmake_name>_host, <cmake_name>_kit_parts
     c["kit_name"] = "%s-kit" % x["id"]
+    # The app's name as players see it (menu bar, Dock, Finder); its file
+    # name ("app") can't hold a colon, which Finder shows as "/".
+    c["display_name"] = x.get("display_name", x["app"])
+    if ":" in x["app"] or "/" in x["app"]:
+        sys.exit("kit: %s: x-swarc.app is a file name: no colons or slashes (display_name can have them)" % path)
+    # The icon: from the game's own program, as Windows shows it.
+    icon = x.get("icon", {})
+    c["icon_file"] = icon.get("file") or next((f for f in x["files"] if f.lower().endswith(".exe")), "")
+    c["icon_group"] = icon.get("group", "")
     c["asset"] = "%s-kit-macos-arm64.tar.gz" % x["id"]
     c.setdefault("kit", {})
     return c
@@ -82,7 +91,10 @@ def game_env(c):
     var("ENV", c["env"])
     var("NAME", c["name"])
     var("APP", c["app"])
+    var("DISPLAY_NAME", c["display_name"])
     var("BINARY", c["binary"])
+    var("ICON_FILE", c["icon_file"])
+    var("ICON_GROUP", c["icon_group"])
     var("REPO", c["repo"])
     var("FIND", c["find"])
     var("STEAM_APP", steam["appid"])
@@ -221,6 +233,8 @@ def assemble(root, c, build, kit):
 
     # The lifter's symbols are made by build.sh from the player's own files.
     shutil.copy2(os.path.join(SWARC, "tools", "pe_symbols.py"), os.path.join(kit, "bin"))
+    # ... and the app's icon, from the player's copy of the game.
+    shutil.copy2(os.path.join(SWARC, "tools", "pe_icon.py"), os.path.join(kit, "bin"))
     open(os.path.join(kit, "data", "empty.manifest"), "w").close()
     for img in c["lift"]["images"]:
         if "manifest" in img:  # into data/ by its name alone (game.env names it so)
@@ -287,7 +301,7 @@ def render(template, c):
     with open(os.path.join(HERE, "templates", template)) as f:
         text = f.read()
     values = {
-        "ID": c["id"], "ENV": c["env"], "NAME": c["name"], "APP": c["app"], "REPO": c["repo"],
+        "ID": c["id"], "ENV": c["env"], "NAME": c["name"], "APP": c["app"], "DISPLAY_NAME": c["display_name"], "REPO": c["repo"],
         "KIT": c["kit_name"], "ASSET": c["asset"], "BREW": " ".join(c["kit"].get("brew", [])),
         "RUNNER": c["kit"].get("runner", "macos-15"),
     }
