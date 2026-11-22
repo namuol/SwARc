@@ -63,6 +63,8 @@ gfx::Format FormatFromD3D(uint32_t f) {
     case D3DFMT_R32F: return F::R32F;
     case D3DFMT_G32R32F: return F::G32R32F;
     case D3DFMT_A32B32G32R32F: return F::A32B32G32R32F;
+    // 16-bit unsigned normalised RGBA, red first in memory as the GPU's.
+    case D3DFMT_A16B16G16R16: return F::R16G16B16A16;
     default: return F::Unknown;
   }
 }
@@ -552,9 +554,16 @@ HLE_NAMED("d3d9.dll", "IDirect3D9::CheckDeviceFormat", D3D9_CheckDeviceFormat, 7
   else if (ok && (usage & D3DUSAGE_DEPTHSTENCIL))
     ok = false;
   if (ok && (usage & D3DUSAGE_RENDERTARGET)) ok = IsRenderTargetFormat(fmt);
-  if (ok && (usage & (D3DUSAGE_QUERY_SRGBREAD | D3DUSAGE_QUERY_SRGBWRITE |
-                      D3DUSAGE_QUERY_VERTEXTEXTURE)))
-    ok = false;
+  // sRGB reads (SRGBTEXTURE) of 8-bit colour and block-compressed
+  // formats, and sRGB writes (SRGBWRITEENABLE) to 32-bit RGB targets: the
+  // translated shaders decode and encode (gfx). No vertex textures.
+  const bool srgb_read = fmt == D3DFMT_A8R8G8B8 || fmt == D3DFMT_X8R8G8B8 ||
+                         fmt == D3DFMT_DXT1 || fmt == D3DFMT_DXT2 || fmt == D3DFMT_DXT3 ||
+                         fmt == D3DFMT_DXT4 || fmt == D3DFMT_DXT5;
+  const bool srgb_write = fmt == D3DFMT_A8R8G8B8 || fmt == D3DFMT_X8R8G8B8;
+  if (ok && (usage & D3DUSAGE_QUERY_SRGBREAD) && !srgb_read) ok = false;
+  if (ok && (usage & D3DUSAGE_QUERY_SRGBWRITE) && !srgb_write) ok = false;
+  if (ok && (usage & D3DUSAGE_QUERY_VERTEXTEXTURE)) ok = false;
   if (ok && rtype != D3DRTYPE_SURFACE && rtype != D3DRTYPE_TEXTURE &&
       rtype != D3DRTYPE_CUBETEXTURE)
     ok = false;

@@ -687,7 +687,7 @@ class GpuDevice final : public Device {
       QueueUpload(t.tex, level, c.left, c.top, w, h, s, pitch, rows, row, false, true, layer);
       return;
     }
-    if (IsFloat(t.fmt)) {  // same layout as the GPU format
+    if (IsFloat(t.fmt) || t.fmt == Format::R16G16B16A16) {  // same layout as the GPU format
       QueueUpload(t.tex, level, c.left, c.top, w, h, s, pitch, uint32_t(h),
                   RowPitch(t.fmt, uint32_t(w)), false, false, layer);
       return;
@@ -1194,6 +1194,9 @@ class GpuDevice final : public Device {
     float fog_color[4];
     float fog[4];          // FOGSTART, FOGEND, FOGDENSITY
     int32_t fog_mode[4];   // 0 off, 1 vertex (the FOG varying), 2 table; FOGTABLEMODE
+    // Bit per sampler register: SRGBTEXTURE (texels decoded from sRGB);
+    // SRGBWRITEENABLE (the colour output encoded to sRGB).
+    int32_t srgb[4];
   };
 
   static std::string Prelude(hlsl::Stage stage, uint32_t samplers) {
@@ -1275,7 +1278,22 @@ vec4 r_position(vec4 p) {
       p += std::string("#define R_SAMPLER_BINDING(n) set = ") + (metal ? "0" : "2") + ", binding = n\n";
       p += "layout(std140, " + binding(3, 2) +
            ") uniform r_ps_state { ivec4 r_alpha; vec4 r_bias[4]; vec4 r_fogc; vec4 r_fogp;"
-           " ivec4 r_fogm; };\n";
+           " ivec4 r_fogm; ivec4 r_srgb; };\n";
+      p += R"(// sRGB reads (SRGBTEXTURE) and writes (SRGBWRITEENABLE): the texel
+// decoded after filtering, the output encoded before blending, as
+// Direct3D 9 hardware did them.
+vec3 r_to_linear(vec3 c) {
+  return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), c));
+}
+vec3 r_to_srgb(vec3 c) {
+  c = clamp(c, 0.0, 1.0);
+  return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), c));
+}
+vec4 r_srgb_in(int n, vec4 c) {
+  return (r_srgb.x & (1 << n)) != 0 ? vec4(r_to_linear(c.rgb), c.a) : c;
+}
+#define R_SRGB(n, c) r_srgb_in(n, c)
+)";
       // Metal samplers have no LOD bias (SDL_GPU drops it there): the
       // shader adds it where the level is implicit. Vulkan's apply it.
       p += metal ? "#define R_BIAS(n) r_bias[(n) >> 2][(n) & 3]\n" : "#define R_BIAS(n) 0.0\n";
@@ -1309,6 +1327,7 @@ void r_color0(inout vec4 c) {
     case 7: pass = a >= ref; break;
   }
   if (!pass) discard;
+  if (r_srgb.y != 0) c.rgb = r_to_srgb(c.rgb);
 }
 )";
     }
@@ -1329,6 +1348,17 @@ void r_color0(inout vec4 c) {
     }
     bool vertex = prog.stage == hlsl::Stage::Vertex;
     std::string glsl = "#version 450\n" + Prelude(prog.stage, sh.samplers) + prog.glsl;
+    // Dev aid: <ID>_SHADER_DUMP=DIR writes each translated shader's GLSL
+    // there, as vs_NNNNN.glsl / ps_NNNNN.glsl in creation order.
+    if (const char* dir = Env("SHADER_DUMP")) {
+      static int n = 0;
+      char path[1024];
+      std::snprintf(path, sizeof path, "%s/%s_%05d.glsl", dir, vertex ? "vs" : "ps", n++);
+      if (std::FILE* f = std::fopen(path, "w")) {
+        std::fwrite(glsl.data(), 1, glsl.size(), f);
+        std::fclose(f);
+      }
+    }
     std::vector<uint32_t> spirv;
     std::string log;
     if (!GlslToSpirv(glsl, vertex ? ShaderStage::Vertex : ShaderStage::Fragment, &spirv, &log)) {
@@ -1511,6 +1541,9 @@ void r_color0(inout vec4 c) {
     }
     Argb(pst.fog_color, state.rs[34]);
     for (int i = 0; i < 3; i++) pst.fog[i] = AsFloat(state.rs[36 + i]);
+    for (uint32_t r = 0; r < 16 && d.sampler_states; r++)
+      if (d.sampler_states[r][11]) pst.srgb[0] |= 1 << r;  // SRGBTEXTURE
+    pst.srgb[1] = state.rs[194] ? 1 : 0;                     // SRGBWRITEENABLE
     PushUniform(sc, 5, &pst, sizeof pst);
 
     // Samplers: pixel 0-15 at 0-15, vertex 0-3 at 16-19.
@@ -4052,7 +4085,7 @@ void r_color0(inout vec4 c) {
       const char* name;
     };
     static const Check kChecks[] = {
-        {185, "TWOSIDEDSTENCILMODE"}, {194, "SRGBWRITEENABLE"},
+        {185, "TWOSIDEDSTENCILMODE"},
     };
     for (const Check& ch : kChecks) {
       if (!st.rs[ch.rs] || (warned_rs_ & (1ull << (&ch - kChecks)))) continue;

@@ -519,28 +519,34 @@ class Translator {
         std::string co = ty == ParamType::Sampler2D ? "(" + c + ").xy" : "(" + c + ").xyz";
         // The sampler's LOD bias (R_BIAS, hlsl.h); texld is pixel-only.
         std::string b = "R_BIAS(" + std::to_string(s[1].num) + ")";
+        // The sampler's SRGBTEXTURE (R_SRGB, the device's prelude): the
+        // texel decoded from sRGB to linear.
+        const std::string n = std::to_string(s[1].num);
+        auto srgb = [&](const std::string& e) { return "R_SRGB(" + n + ", " + e + ")"; };
         if (in.ctl == 1) {  // texldp
-          if (ty == ParamType::Sampler2D) return "textureProj(" + smp + ", " + c + ", " + b + ")";
-          return "texture(" + smp + ", (" + c + ").xyz / (" + c + ").w, " + b + ")";
+          if (ty == ParamType::Sampler2D) return srgb("textureProj(" + smp + ", " + c + ", " + b + ")");
+          return srgb("texture(" + smp + ", (" + c + ").xyz / (" + c + ").w, " + b + ")");
         }
         if (in.ctl == 2)  // texldb
-          return "texture(" + smp + ", " + co + ", (" + c + ").w + " + b + ")";
-        return "texture(" + smp + ", " + co + ", " + b + ")";
+          return srgb("texture(" + smp + ", " + co + ", (" + c + ").w + " + b + ")");
+        return srgb("texture(" + smp + ", " + co + ", " + b + ")");
       }
       case TEXLDL: {
         need(2);
         ParamType ty = sampler_type_.count(s[1].num) ? sampler_type_[s[1].num] : ParamType::Sampler2D;
         std::string smp = SamplerName(s[1].num), c = S(s[0]);
         std::string co = ty == ParamType::Sampler2D ? "(" + c + ").xy" : "(" + c + ").xyz";
-        return "textureLod(" + smp + ", " + co + ", (" + c + ").w)";
+        std::string e = "textureLod(" + smp + ", " + co + ", (" + c + ").w)";
+        return pixel_ ? "R_SRGB(" + std::to_string(s[1].num) + ", " + e + ")" : e;
       }
       case TEXLDD: {
         need(4);
         ParamType ty = sampler_type_.count(s[1].num) ? sampler_type_[s[1].num] : ParamType::Sampler2D;
         std::string smp = SamplerName(s[1].num);
         const char* sw = ty == ParamType::Sampler2D ? ".xy" : ".xyz";
-        return "textureGrad(" + smp + ", (" + S(s[0]) + ")" + sw + ", (" + S(s[2]) + ")" + sw +
-               ", (" + S(s[3]) + ")" + sw + ")";
+        std::string e = "textureGrad(" + smp + ", (" + S(s[0]) + ")" + sw + ", (" + S(s[2]) + ")" +
+                        sw + ", (" + S(s[3]) + ")" + sw + ")";
+        return pixel_ ? "R_SRGB(" + std::to_string(s[1].num) + ", " + e + ")" : e;
       }
       default:
         Fail("unsupported opcode " + std::to_string(in.op) + " in " +
