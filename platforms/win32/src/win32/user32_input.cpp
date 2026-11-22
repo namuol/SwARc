@@ -131,7 +131,9 @@ std::atomic<RawInputSink> g_raw_sink{nullptr};
 void SetRawInputSink(RawInputSink sink) { g_raw_sink = sink; }
 
 void EmitRawInput(RawInput::Kind kind, uint8_t code, int32_t value) {
-  if (RawInputSink sink = g_raw_sink) sink({kind, code, value, TickCount()});
+  RawInput in{kind, code, value, TickCount()};
+  if (RawInputSink sink = g_raw_sink) sink(in);
+  RawInputMessage(in);
 }
 
 uint8_t ScanCodeForVk(uint8_t vk, bool* ext) {
@@ -554,6 +556,7 @@ HLE("user32.dll", SetCursor, 1) {
   static uint32_t cur = 0;
   uint32_t old = cur;
   cur = Arg(c, 0);
+  SetCursorNone(cur == 0);
   return old;
 }
 

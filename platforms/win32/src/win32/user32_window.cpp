@@ -600,6 +600,87 @@ void ActivateApp(uint32_t hwnd, bool active) {
   Post(hwnd, active ? WM_SETFOCUS : WM_KILLFOCUS, 0, 0);
 }
 
+// Mouse look in a window: a game that hides its cursor (ShowCursor below
+// 0, or SetCursor(NULL)) and re-centres it with SetCursorPos steers by the
+// difference, as it would in exclusive mode. The window's cursor is then
+// virtual (motion moves it within the client area, HandleSdlEvent) and
+// the host pointer is grabbed (SDL's relative mode), until the cursor
+// shows again (a menu) or the window goes.
+bool g_cursor_none = false;  // SetCursor(NULL)
+uint32_t g_look = 0;         // the window in mouse look, or 0
+
+bool CursorHidden() { return g_cursor_count < 0 || g_cursor_none; }
+
+void ApplyHostCursor() {
+  if (!g_sdl_up || Background()) return;
+  if (CursorHidden())
+    SDL_HideCursor();
+  else
+    SDL_ShowCursor();
+}
+
+void EndMouseLook() {
+  SDL_Window* release = nullptr;
+  {
+    std::lock_guard<std::recursive_mutex> l(g_mu);
+    if (!g_look) return;
+    Window* w = Win(g_look);
+    bool clip_holds = g_clip.on && g_clip.hwnd == g_look;
+    if (w && w->sdl && !clip_holds) release = w->sdl;
+    g_look = 0;
+  }
+  if (release && !Background()) SDL_SetWindowRelativeMouseMode(release, false);
+}
+
+// SetCursorPos while the cursor is hidden: mouse look in the active window.
+void StartMouseLook() {
+  SDL_Window* grab = nullptr;
+  {
+    std::lock_guard<std::recursive_mutex> l(g_mu);
+    if ((g_look && Win(g_look)) || !g_active) return;  // a destroyed one ended it
+    Window* w = Win(g_active);
+    if (!w || !w->sdl || w->mode_w) return;  // exclusive mode has its own
+    g_look = g_active;
+    grab = w->sdl;
+  }
+  if (!Background()) SDL_SetWindowRelativeMouseMode(grab, true);
+}
+
+
+// The client size the virtual cursor of mouse look keeps within.
+bool LookSize(uint32_t hwnd, int* w, int* h) {
+  std::lock_guard<std::recursive_mutex> l(g_mu);
+  if (hwnd != g_look) return false;
+  Window* win = Win(hwnd);
+  if (!win) return false;
+  GameClientSize(*win, w, h);
+  return true;
+}
+
+
+// ---- Raw Input (the mouse) -----------------------------------------------------------
+// RegisterRawInputDevices for the mouse (usage page 1, usage 2) makes the
+// host's raw mouse input (motion in mickeys, buttons, the wheel; the same
+// as DirectInput's, EmitRawInput) arrive as WM_INPUT, one RAWINPUT each,
+// read back with GetRawInputData. RIDEV_NOLEGACY (0x30) is not applied:
+// the legacy mouse messages keep coming, which games that use raw input
+// for motion ignore while they do. Records live in a ring of the last 256.
+constexpr uint32_t WM_INPUT = 0x00FF;
+struct RawMouseReg {
+  bool on = false;
+  uint32_t flags = 0, target = 0;  // hwndTarget; 0: the focus window
+};
+RawMouseReg g_raw_mouse;
+struct RawRecord {
+  uint16_t flags = 0;          // RAWMOUSE usFlags: MOUSE_MOVE_RELATIVE (0)
+  uint16_t button_flags = 0;   // RI_MOUSE_*
+  uint16_t button_data = 0;    // the wheel delta
+  int32_t dx = 0, dy = 0;
+};
+constexpr uint32_t kRawRing = 256, kRawHandleBase = 0x7A000000;
+RawRecord g_raw_ring[kRawRing];
+uint32_t g_raw_next = 0;  // under g_mu
+
 void HandleSdlEvent(const SDL_Event& e) {
   switch (e.type) {
     case SDL_EVENT_QUIT: {
@@ -705,7 +786,7 @@ void HandleSdlEvent(const SDL_Event& e) {
       // onto its screen, so its own cursor stays under the real one.
       bool relative = e.motion.which == kTestRelative ||
                       int64_t(TickCount()) - g_last_recentre_ms <= 250;
-      if (clipped || (relative && ExclusiveSize(h, &mw, &mh))) {
+      if (clipped || (relative && (ExclusiveSize(h, &mw, &mh) || LookSize(h, &mw, &mh)))) {
         // Virtual cursor: the game recentres it with SetCursorPos every
         // frame and steers its own pointer by the difference, as on a
         // fullscreen Windows desktop. Real motion moves the virtual
@@ -1038,6 +1119,43 @@ void UpdateFullscreenAll() {
 }
 
 }  // namespace
+
+void SetCursorNone(bool none) {
+  if (none == g_cursor_none) return;
+  g_cursor_none = none;
+  ApplyHostCursor();
+  if (!CursorHidden()) EndMouseLook();
+  else if (g_raw_mouse.on) StartMouseLook();  // steering by raw input
+}
+
+void RawInputMessage(const RawInput& in) {
+  uint32_t target, h;
+  {
+    std::lock_guard<std::recursive_mutex> l(g_mu);
+    if (!g_raw_mouse.on || in.kind == RawInput::Key) return;
+    target = g_raw_mouse.target ? g_raw_mouse.target : g_focus;
+    if (!target || !Win(target)) return;
+    RawRecord r;
+    switch (in.kind) {
+      case RawInput::MouseX: r.dx = in.value; break;
+      case RawInput::MouseY: r.dy = in.value; break;
+      case RawInput::Wheel:
+        r.button_flags = 0x0400;  // RI_MOUSE_WHEEL
+        r.button_data = uint16_t(int16_t(in.value));
+        break;
+      case RawInput::MouseButton:
+        // RI_MOUSE_BUTTON_n_DOWN = 1 << 2n, _UP = 2 << 2n (left, right,
+        // middle, X1, X2).
+        r.button_flags = uint16_t((in.value ? 1u : 2u) << (2 * in.code));
+        break;
+      default: return;
+    }
+    h = kRawHandleBase + g_raw_next;
+    g_raw_ring[g_raw_next % kRawRing] = r;
+    g_raw_next++;
+  }
+  Post(target, WM_INPUT, 0 /* RIM_INPUT */, h);
+}
 
 bool OnMainThread() { return std::this_thread::get_id() == g_main_thread_id; }
 
@@ -2225,11 +2343,27 @@ HLE("user32.dll", SetWindowPos, 7) {
             int32_t(Arg(c, 5)), !nomove, !nosize);
   if (flags & 0x40) {  // SWP_SHOWWINDOW
     if (SDL_Window* s = SdlWindowFor(hwnd); s && !Headless()) SDL_ShowWindow(s);
+    // Shown without SWP_NOACTIVATE (0x10), a top-level window becomes the
+    // active one, as from ShowWindow: Source creates its window hidden and
+    // shows it this way, and learns it is the active app only from this.
+    bool activate = false;
     {
       std::lock_guard<std::recursive_mutex> l(g_mu);
-      if (Window* w = Win(hwnd)) w->visible = true;
+      if (Window* w = Win(hwnd)) {
+        w->visible = true;
+        if (!(flags & 0x10) && w->sdl && !(w->style & WS_CHILD) && g_active != hwnd) {
+          g_active = g_focus = hwnd;
+          activate = true;
+        }
+      }
     }
     UpdateFullscreen(hwnd);
+    if (activate) {
+      WatchdogAppActive(true);
+      Send(hwnd, WM_ACTIVATEAPP, 1, 0);
+      Send(hwnd, WM_ACTIVATE, 1, 0);
+      Send(hwnd, WM_SETFOCUS, 0, 0);
+    }
   }
   return 1;
 }
@@ -4121,12 +4255,8 @@ HLE64("user32.dll", CallNextHookEx, 4) {
 
 HLE("user32.dll", ShowCursor, 1) {
   g_cursor_count += Arg(c, 0) ? 1 : -1;
-  if (g_sdl_up && !Background()) {
-    if (g_cursor_count >= 0)
-      SDL_ShowCursor();
-    else
-      SDL_HideCursor();
-  }
+  ApplyHostCursor();
+  if (!CursorHidden()) EndMouseLook();
   return uint32_t(g_cursor_count);
 }
 
@@ -4191,10 +4321,84 @@ HLE("user32.dll", mouse_event, 5) {
   return 0;
 }
 
+// RegisterRawInputDevices(RAWINPUTDEVICE* {usUsagePage, usUsage, dwFlags,
+// hwndTarget}, count, cbSize): the mouse (page 1, usage 2) only; others
+// (the keyboard, game controllers) are accepted and get no input.
+// RIDEV_REMOVE (1) unregisters.
+HLE("user32.dll", RegisterRawInputDevices, 3) {
+  gaddr devs = Arg(c, 0);
+  uint32_t n = Arg(c, 1), size = Arg(c, 2);
+  if (size != 12 || !n) {
+    SetLastError(kErrorInvalidParameter);
+    return 0;
+  }
+  bool look = false;
+  for (uint32_t i = 0; i < n; i++) {
+    gaddr d = devs + 12 * i;
+    if (Rd16(d) != 1 || Rd16(d + 2) != 2) continue;
+    std::lock_guard<std::recursive_mutex> l(g_mu);
+    uint32_t flags = Rd32(d + 4);
+    if (flags & 1) {
+      g_raw_mouse = {};
+    } else {
+      g_raw_mouse = {true, flags, Rd32(d + 8)};
+      look = CursorHidden();
+    }
+  }
+  if (look) StartMouseLook();
+  return 1;
+}
+
+// GetRawInputData(HRAWINPUT, RID_INPUT 0x10000003 / RID_HEADER 0x10000005,
+// data, UINT* size, cbSizeHeader 16): the record (RAWINPUTHEADER {dwType
+// RIM_TYPEMOUSE 0, dwSize, hDevice, wParam} then RAWMOUSE {usFlags, pad,
+// usButtonFlags, usButtonData, ulRawButtons, lLastX, lLastY,
+// ulExtraInformation}), or with data null its size in *size.
+HLE("user32.dll", GetRawInputData, 5) {
+  uint32_t h = Arg(c, 0), cmd = Arg(c, 1), size_va = Arg(c, 3);
+  gaddr data = Arg(c, 2);
+  if (Arg(c, 4) != 16 || !size_va) {
+    SetLastError(kErrorInvalidParameter);
+    return 0xFFFFFFFF;
+  }
+  const uint32_t need = cmd == 0x10000005 ? 16 : 40;
+  if (!data) {
+    Wr32(size_va, need);
+    return 0;
+  }
+  RawRecord r;
+  {
+    std::lock_guard<std::recursive_mutex> l(g_mu);
+    uint32_t i = h - kRawHandleBase;
+    if (h < kRawHandleBase || i >= g_raw_next || g_raw_next - i > kRawRing) {
+      SetLastError(kErrorInvalidHandle);
+      return 0xFFFFFFFF;
+    }
+    r = g_raw_ring[i % kRawRing];
+  }
+  if (Rd32(size_va) < need) {
+    SetLastError(122);  // ERROR_INSUFFICIENT_BUFFER
+    return 0xFFFFFFFF;
+  }
+  std::memset(GPtr(data), 0, need);
+  Wr32(data + 0, 0);       // RIM_TYPEMOUSE
+  Wr32(data + 4, 40);      // dwSize
+  Wr32(data + 8, 0x1001);  // hDevice: the one mouse
+  if (cmd != 0x10000005) {
+    Wr16(data + 16, r.flags);
+    Wr16(data + 20, r.button_flags);
+    Wr16(data + 22, r.button_data);
+    Wr32(data + 28, uint32_t(r.dx));
+    Wr32(data + 32, uint32_t(r.dy));
+  }
+  return need;
+}
+
 HLE("user32.dll", SetCursorPos, 2) {
   g_mouse_x = g_recentre_x = int32_t(Arg(c, 0));
   g_mouse_y = g_recentre_y = int32_t(Arg(c, 1));
   g_last_recentre_ms = TickCount();
+  if (CursorHidden()) StartMouseLook();
   return 1;
 }
 
