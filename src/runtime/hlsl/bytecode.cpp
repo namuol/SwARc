@@ -1031,6 +1031,9 @@ class Translator {
       if ((out_->color_outputs & 1) && major_ < 3)
         post += "  r_fog(r_c0, " + Varying({kFog, 0}, false) + ".x);\n";
       if (out_->color_outputs & 1) post += "  r_color0(r_c0);\n";
+      // An occlusion query's pixel count (a backend's variant defines it),
+      // after everything that can discard.
+      post += "#ifdef R_OCCL_COUNT\n  R_OCCL_COUNT();\n#endif\n";
     }
     pre = "  for (int i = 0; i < " + std::to_string(std::max(temps_, 1u)) + "; i++) r_t[i] = vec4(0.0);\n" + pre;
 

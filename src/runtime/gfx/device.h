@@ -503,6 +503,18 @@ class Device {
   // order, those the GPU has run (all of them, waiting, with wait).
   virtual uint64_t WritesQueued();
   virtual uint64_t LandWrites(bool wait);
+  // Occlusion queries (Direct3D 9's): the shader draws between
+  // BeginOcclusion and EndOcclusion count the pixels that pass the depth
+  // and stencil tests (and the shader's discards and alpha test). A
+  // backend without them returns 0 from BeginOcclusion; the caller then
+  // reports the query type as unavailable. One query is open at a time.
+  virtual bool SupportsOcclusion();
+  virtual uint32_t BeginOcclusion();  // an id, never 0
+  virtual void EndOcclusion(uint32_t id);
+  // The count once the GPU has run the query's draws: true; with wait it
+  // waits for that (submitting what is recorded). Each id is asked until
+  // it answers, then forgotten.
+  virtual bool OcclusionResult(uint32_t id, uint64_t* count, bool wait);
   // Draws `r` of a level 0 colour image into the back buffer from its
   // top-left corner, for Present to show: its texels as they are stored,
   // so an sRGB image's encoded values.

@@ -173,6 +173,10 @@ struct Shader final : com::Object {
 struct Query final : com::Object {
   uint32_t device = 0;
   uint32_t type = 0;
+  uint32_t occlusion = 0;  // the gfx device's query (OCCLUSION), 0 before a BEGIN
+  bool ended = false;      // its END was issued
+  uint64_t pixels = 0;     // its count, once known
+  bool known = false;
 };
 
 struct Device : com::Object {

@@ -541,8 +541,11 @@ class GpuDevice final : public Device {
     for (auto& b : blit_pool_) SDL_ReleaseGPUTexture(dev_, b.tex);
     for (SDL_GPUBuffer* b : {vbuf_, ibuf_, pbuf_, cro_, crw_, heap_, pvbuf_})
       if (b) SDL_ReleaseGPUBuffer(dev_, b);
-    for (SDL_GPUTransferBuffer* b : {upload_tb_, download_tb_})
+    for (SDL_GPUTransferBuffer* b : {upload_tb_, download_tb_, occl_zeros_})
       if (b) SDL_ReleaseGPUTransferBuffer(dev_, b);
+    if (occl_buf_) SDL_ReleaseGPUBuffer(dev_, occl_buf_);
+    for (const OcclRead& r : occl_reads_) SDL_ReleaseGPUTransferBuffer(dev_, r.tb);
+    for (SDL_GPUTransferBuffer* b : occl_free_) SDL_ReleaseGPUTransferBuffer(dev_, b);
     if (vs_) SDL_ReleaseGPUShader(dev_, vs_);
     if (fs_) SDL_ReleaseGPUShader(dev_, fs_);
     if (fs_alpha_test_) SDL_ReleaseGPUShader(dev_, fs_alpha_test_);
@@ -1197,9 +1200,13 @@ class GpuDevice final : public Device {
     // Bit per sampler register: SRGBTEXTURE (texels decoded from sRGB);
     // SRGBWRITEENABLE (the colour output encoded to sRGB).
     int32_t srgb[4];
+    int32_t occl[4];  // the occlusion query's counter (r_oq), in a counting variant
   };
 
-  static std::string Prelude(hlsl::Stage stage, uint32_t samplers) {
+  // occl: a pixel shader's occlusion-counting variant (Occlusion below):
+  // early depth and stencil tests, and R_OCCL_COUNT, which the translated
+  // shader calls last, adds 1 to the query's counter.
+  static std::string Prelude(hlsl::Stage stage, uint32_t samplers, bool occl = false) {
 #if defined(__APPLE__)
     const bool metal = true;
 #else
@@ -1278,7 +1285,13 @@ vec4 r_position(vec4 p) {
       p += std::string("#define R_SAMPLER_BINDING(n) set = ") + (metal ? "0" : "2") + ", binding = n\n";
       p += "layout(std140, " + binding(3, 2) +
            ") uniform r_ps_state { ivec4 r_alpha; vec4 r_bias[4]; vec4 r_fogc; vec4 r_fogp;"
-           " ivec4 r_fogm; ivec4 r_srgb; };\n";
+           " ivec4 r_fogm; ivec4 r_srgb; ivec4 r_occl; };\n";
+      if (occl) {
+        p += "layout(early_fragment_tests) in;\n";
+        p += "layout(std430, " + binding(2, metal ? 3 : int(samplers)) +
+             ") buffer r_occl_counts { uint r_oq[]; };\n";
+        p += "#define R_OCCL_COUNT() atomicAdd(r_oq[r_occl.x], 1u)\n";
+      }
       p += R"(// sRGB reads (SRGBTEXTURE) and writes (SRGBWRITEENABLE): the texel
 // decoded after filtering, the output encoded before blending, as
 // Direct3D 9 hardware did them.
@@ -1358,7 +1371,17 @@ void r_color0(inout vec4 c) {
       sh.samplers = std::max(sh.samplers, smp.reg + 1);
     }
     bool vertex = prog.stage == hlsl::Stage::Vertex;
-    std::string glsl = "#version 450\n" + Prelude(prog.stage, sh.samplers) + prog.glsl;
+    if (!vertex) sh.glsl = prog.glsl;  // for its occlusion-counting variant
+    sh.sh = CompileShader(prog.stage, sh.samplers, prog.glsl, false);
+    ShaderId id = next_id_++;
+    shaders_[id] = std::move(sh);
+    return id;
+  }
+
+  SDL_GPUShader* CompileShader(hlsl::Stage stage, uint32_t samplers, const std::string& body,
+                               bool occl) {
+    bool vertex = stage == hlsl::Stage::Vertex;
+    std::string glsl = "#version 450\n" + Prelude(stage, samplers, occl) + body;
     // Dev aid: <ID>_SHADER_DUMP=DIR writes each translated shader's GLSL
     // there, as vs_NNNNN.glsl / ps_NNNNN.glsl in creation order.
     if (const char* dir = Env("SHADER_DUMP")) {
@@ -1391,13 +1414,24 @@ void r_color0(inout vec4 c) {
     si.format = SDL_GPU_SHADERFORMAT_SPIRV;
 #endif
     si.stage = vertex ? SDL_GPU_SHADERSTAGE_VERTEX : SDL_GPU_SHADERSTAGE_FRAGMENT;
-    si.num_samplers = sh.samplers;
-    si.num_storage_buffers = vertex ? 1 : 0;
+    si.num_samplers = samplers;
+    si.num_storage_buffers = vertex || occl ? 1 : 0;
     si.num_uniform_buffers = 3;
-    sh.sh = SDL_CreateGPUShader(dev_, &si);
-    if (!sh.sh) FatalF("gfx: SDL_CreateGPUShader (translated): %s", SDL_GetError());
+    SDL_GPUShader* sh = SDL_CreateGPUShader(dev_, &si);
+    if (!sh) FatalF("gfx: SDL_CreateGPUShader (translated): %s", SDL_GetError());
+    return sh;
+  }
+
+  // A pixel shader's occlusion-counting variant, made on first use.
+  ShaderId OcclVariant(ShaderId ps) {
+    Shader& sh = shaders_.at(ps);
+    if (sh.occl) return sh.occl;
+    Shader v = sh;
+    v.glsl.clear();
+    v.sh = CompileShader(sh.stage, sh.samplers, sh.glsl, true);
     ShaderId id = next_id_++;
-    shaders_[id] = sh;
+    sh.occl = id;
+    shaders_[id] = std::move(v);
     return id;
   }
 
@@ -1415,8 +1449,10 @@ void r_color0(inout vec4 c) {
         ++p;
       }
     }
+    const ShaderId variant = it->second.occl;
     SDL_ReleaseGPUShader(dev_, it->second.sh);
     shaders_.erase(it);
+    if (variant) DestroyShader(variant);
   }
 
   void DrawShader(const ShaderDraw& d) override {
@@ -1456,6 +1492,11 @@ void r_color0(inout vec4 c) {
     for (int i = 1; i < 4; i++) k.mask[i - 1] = i < pass_targets_ ? uint8_t(state.rs[189 + i] & 0xF) : 0;
     sc.key.vs = d.vs;
     sc.key.ps = d.ps;
+    if (occl_open_) {
+      sc.key.ps = OcclVariant(d.ps);
+      sc.occl = true;
+      occl_draws_ = true;
+    }
     if (k.blend && state.rs[206]) {  // SEPARATEALPHABLENDENABLE
       sc.key.src_a = uint8_t(D3DBlendFactor(state.rs[207], pass_alpha_));
       sc.key.dst_a = uint8_t(D3DBlendFactor(state.rs[208], pass_alpha_));
@@ -1555,6 +1596,7 @@ void r_color0(inout vec4 c) {
     for (uint32_t r = 0; r < 16 && d.sampler_states; r++)
       if (d.sampler_states[r][11]) pst.srgb[0] |= 1 << r;  // SRGBTEXTURE
     pst.srgb[1] = state.rs[194] ? 1 : 0;                     // SRGBWRITEENABLE
+    if (occl_open_) pst.occl[0] = int32_t(occl_.at(occl_open_).slot);
     PushUniform(sc, 5, &pst, sizeof pst);
 
     // Samplers: pixel 0-15 at 0-15, vertex 0-3 at 16-19.
@@ -2093,6 +2135,110 @@ void r_color0(inout vec4 c) {
     }
   }
 
+  // ---- occlusion queries (see occl_buf_). Metal only: SDL_GPU gives
+  // graphics shaders read-only storage buffers; Metal lets them write
+  // (Vulkan would need fragmentStoresAndAtomics, which SDL may not enable).
+  bool SupportsOcclusion() override {
+#if defined(__APPLE__)
+    return true;
+#else
+    return false;
+#endif
+  }
+
+  uint32_t BeginOcclusion() override {
+    std::lock_guard<std::recursive_mutex> l(mu_);
+    if (!SupportsOcclusion()) return 0;
+    if (!occl_buf_) {
+      SDL_GPUBufferCreateInfo bi{};
+      bi.usage = SDL_GPU_BUFFERUSAGE_GRAPHICS_STORAGE_READ;
+      bi.size = kOcclSlots * 4;
+      occl_buf_ = SDL_CreateGPUBuffer(dev_, &bi);
+      SDL_GPUTransferBufferCreateInfo ti{};
+      ti.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
+      ti.size = 4;
+      occl_zeros_ = SDL_CreateGPUTransferBuffer(dev_, &ti);
+      if (!occl_buf_ || !occl_zeros_) FatalF("gfx: occlusion counters: %s", SDL_GetError());
+      std::memset(SDL_MapGPUTransferBuffer(dev_, occl_zeros_, false), 0, 4);
+      SDL_UnmapGPUTransferBuffer(dev_, occl_zeros_);
+    }
+    if (occl_open_) EndOcclusion(occl_open_);
+    uint32_t id = occl_next_id_++;
+    if (!id) id = occl_next_id_++;  // never 0
+    const uint32_t slot = occl_next_slot_++ % kOcclSlots;
+    occl_[id] = {slot, 0};
+    occl_zero_.push_back(slot);
+    occl_open_ = id;
+    return id;
+  }
+
+  void EndOcclusion(uint32_t id) override {
+    std::lock_guard<std::recursive_mutex> l(mu_);
+    auto it = occl_.find(id);
+    if (it == occl_.end() || it->second.end_flush) return;
+    it->second.end_flush = flushes_ + 1;  // the next flush draws what it counted
+    if (occl_open_ == id) occl_open_ = 0;
+  }
+
+  bool OcclusionResult(uint32_t id, uint64_t* count, bool wait) override {
+    std::lock_guard<std::recursive_mutex> l(mu_);
+    *count = 0;
+    auto it = occl_.find(id);
+    if (it == occl_.end()) return true;
+    if (!it->second.end_flush) EndOcclusion(id);
+    const OcclQuery q = it->second;
+    // Its draws are recorded but not flushed: flush them (D3D9's
+    // GetData flushes too), so that the GPU starts on them.
+    if (q.end_flush > flushes_) Flush();
+    const OcclRead* r = nullptr;
+    for (const OcclRead& o : occl_reads_)
+      if (o.flush >= q.end_flush) {
+        r = &o;
+        break;
+      }
+    if (!r) return true;  // nothing was flushed for it (cannot happen): 0
+    if (r->submission > submitted_) {  // still in the open command buffer
+      if (!wait) {
+        SubmitOpen();  // started, not waited for
+        return false;
+      }
+      SubmitOpen();
+    }
+    while (!in_flight_.empty() && in_flight_.front().submission <= r->submission &&
+           (wait || SDL_QueryGPUFence(dev_, in_flight_.front().fence)))
+      Retire();
+    if (r->submission > retired_) return false;
+    const auto* counts = static_cast<const uint32_t*>(SDL_MapGPUTransferBuffer(dev_, r->tb, false));
+    *count = counts ? counts[q.slot] : 0;
+    SDL_UnmapGPUTransferBuffer(dev_, r->tb);
+    occl_.erase(it);
+    // Reads no query still needs (all before the oldest one waiting's
+    // flush, keeping the newest) go back to the pool.
+    uint64_t oldest = ~0ull;
+    for (const auto& [qid, oq] : occl_) oldest = std::min(oldest, oq.end_flush ? oq.end_flush : ~0ull);
+    while (occl_reads_.size() > 1 && occl_reads_.front().flush < oldest &&
+           occl_reads_.front().submission <= retired_) {
+      occl_free_.push_back(occl_reads_.front().tb);
+      occl_reads_.pop_front();
+    }
+    return true;
+  }
+
+  // A download transfer buffer for the counters, from the pool.
+  SDL_GPUTransferBuffer* OcclTransfer() {
+    if (!occl_free_.empty()) {
+      SDL_GPUTransferBuffer* tb = occl_free_.back();
+      occl_free_.pop_back();
+      return tb;
+    }
+    SDL_GPUTransferBufferCreateInfo ti{};
+    ti.usage = SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD;
+    ti.size = kOcclSlots * 4;
+    SDL_GPUTransferBuffer* tb = SDL_CreateGPUTransferBuffer(dev_, &ti);
+    if (!tb) FatalF("gfx: occlusion read-back: %s", SDL_GetError());
+    return tb;
+  }
+
   void DrawImage(TextureId id, const Rect& r) override {
     std::lock_guard<std::recursive_mutex> l(mu_);
     auto it = textures_.find(id);
@@ -2209,6 +2355,7 @@ void r_color0(inout vec4 c) {
     uint32_t uoff[6] = {}, ulen[6] = {};
     SDL_FColor blend_constant{};
     ShaderKey key{};
+    bool occl = false;  // counts for an occlusion query (binds occl_buf_)
   };
   struct Shader {
     SDL_GPUShader* sh = nullptr;
@@ -2217,6 +2364,8 @@ void r_color0(inout vec4 c) {
     std::array<hlsl::ParamType, 16> sampler_type{};  // per register; Void if unused
     uint32_t samplers = 0;  // highest register used + 1
     uint32_t float_regs = 0;
+    std::string glsl;    // a pixel shader's translation (for its variant)
+    ShaderId occl = 0;   // its occlusion-counting variant, once made
   };
   struct BlitTex {
     SDL_GPUTexture* tex;
@@ -2545,7 +2694,8 @@ void r_color0(inout vec4 c) {
 
   void Flush() {
     bool draw = !cmds_.empty() || pass_clear_color_ || pass_clear_depth_ || pass_clear_stencil_;
-    if (!draw && uploads_.empty()) return;
+    if (!draw && uploads_.empty() && occl_zero_.empty()) return;
+    const bool occl = !occl_zero_.empty() || occl_draws_;
     SDL_GPUCommandBuffer* cmd = nullptr;
     size_t vbytes = verts_.size(), ibytes = indices_.size() * 4, pbytes = pmem_.size();
     size_t ubytes = (upload_bytes_.size() + 15) & ~size_t(15);
@@ -2618,6 +2768,16 @@ void r_color0(inout vec4 c) {
     }
 
     if (!cmd) cmd = Begin();
+    if (!occl_zero_.empty()) {  // the queries begun since: their counters from 0
+      SDL_GPUCopyPass* cp = SDL_BeginGPUCopyPass(cmd);
+      for (uint32_t slot : occl_zero_) {
+        SDL_GPUTransferBufferLocation src{occl_zeros_, 0};
+        SDL_GPUBufferRegion dst{occl_buf_, slot * 4, 4};
+        SDL_UploadToGPUBuffer(cp, &src, &dst, false);
+      }
+      SDL_EndGPUCopyPass(cp);
+      occl_zero_.clear();
+    }
     if (draw && (pass_color_ || pass_depth_)) {
       // A clear clears every target, as D3D9's does.
       SDL_GPUColorTargetInfo cts[4]{};
@@ -2766,6 +2926,7 @@ void r_color0(inout vec4 c) {
             pushed[i] = sc.uoff[i];
           }
           vs = fs = vl = -1;  // the fixed-function uniforms' slots were overwritten
+          if (sc.occl) SDL_BindGPUFragmentStorageBuffers(rp, 0, &occl_buf_, 1);
           SDL_GPUTextureSamplerBinding tb[20];
           for (uint32_t i = 0; i < 20; i++) tb[i] = {sc.tex[i], sc.smp[i]};
           if (sc.nvs) SDL_BindGPUVertexSamplers(rp, 0, tb + 16, sc.nvs);
@@ -2818,6 +2979,17 @@ void r_color0(inout vec4 c) {
       }
       SDL_EndGPURenderPass(rp);
       if (Labels()) SDL_PopGPUDebugGroup(cmd);
+    }
+    flushes_++;
+    if (occl) {  // the counters as this flush leaves them
+      OcclRead r{flushes_, submitted_ + 1, OcclTransfer()};
+      SDL_GPUCopyPass* cp = SDL_BeginGPUCopyPass(cmd);
+      SDL_GPUBufferRegion src{occl_buf_, 0, kOcclSlots * 4};
+      SDL_GPUTransferBufferLocation dst{r.tb, 0};
+      SDL_DownloadFromGPUBuffer(cp, &src, &dst);
+      SDL_EndGPUCopyPass(cp);
+      occl_reads_.push_back(r);
+      occl_draws_ = false;
     }
     Submit(cmd);
 
@@ -4732,6 +4904,30 @@ void r_color0(inout vec4 c) {
     bool later = false;  // land_later
     std::vector<Out> out;
   };
+  // ---- occlusion queries: a counter per query in occl_buf_ (a ring of
+  // kOcclSlots), zeroed by the flush after its BeginOcclusion, added to by
+  // the counting variants of the pixel shaders drawn while it is open, and
+  // read back by every flush that zeroed or counted (occl_reads_).
+  static constexpr uint32_t kOcclSlots = 4096;
+  struct OcclQuery {
+    uint32_t slot = 0;
+    uint64_t end_flush = 0;  // the flush its last draw is in (0: still open)
+  };
+  struct OcclRead {
+    uint64_t flush = 0;       // the flush whose counters it holds
+    uint64_t submission = 0;  // the submission that copies them
+    SDL_GPUTransferBuffer* tb = nullptr;
+  };
+  SDL_GPUBuffer* occl_buf_ = nullptr;
+  SDL_GPUTransferBuffer* occl_zeros_ = nullptr;
+  std::unordered_map<uint32_t, OcclQuery> occl_;
+  std::vector<uint32_t> occl_zero_;  // slots to zero before the next flush's draws
+  std::deque<OcclRead> occl_reads_;
+  std::vector<SDL_GPUTransferBuffer*> occl_free_;
+  uint32_t occl_open_ = 0, occl_next_id_ = 1, occl_next_slot_ = 0;
+  bool occl_draws_ = false;  // this flush has counting draws
+  uint64_t flushes_ = 0;
+
   std::deque<Landing> landings_;
   std::vector<Landing> download_pool_;  // their transfer buffers, free
   uint64_t writes_queued_ = 0, writes_landed_ = 0;

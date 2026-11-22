@@ -36,7 +36,9 @@ constexpr GUID kIID_IDirect3DIndexBuffer9 = {0x7C9DD65E, 0xD3F7, 0x4529, {0xAC, 
 
 // D3DQUERYTYPE
 constexpr uint32_t D3DQUERYTYPE_EVENT = 8;
+constexpr uint32_t D3DQUERYTYPE_OCCLUSION = 9;
 constexpr uint32_t D3DISSUE_END = 0x1;
+constexpr uint32_t D3DISSUE_BEGIN = 0x2;
 
 uint32_t SurfaceVtable() {
   return com::Vtable(
@@ -588,10 +590,12 @@ HLE_NAMED("d3d9.dll", "IDirect3DDevice9::CreatePixelShader", D3DDev9_CreatePixel
 }
 
 // (Type, ppQuery): null ppQuery only asks whether the type is supported.
-// Only EVENT so far: it is signalled at once (draws are not tracked).
+// EVENT (signalled at once: draws are not tracked) and OCCLUSION, where the
+// gfx device counts pixels (gfx::Device::BeginOcclusion).
 HLE_NAMED("d3d9.dll", "IDirect3DDevice9::CreateQuery", D3DDev9_CreateQuery, 3) {
   uint32_t type = Arg(c, 1), out = Arg(c, 2);
-  if (type != D3DQUERYTYPE_EVENT) {
+  const bool occlusion = type == D3DQUERYTYPE_OCCLUSION && Dev(c)->gfx && Dev(c)->gfx->SupportsOcclusion();
+  if (type != D3DQUERYTYPE_EVENT && !occlusion) {
     RECOMP_TRACE("  CreateQuery type %u: not available\n", type);
     if (out) Wr32(out, 0);
     return D3DERR_NOTAVAILABLE;
@@ -1216,14 +1220,49 @@ HLE_NAMED("d3d9.dll", "IDirect3DQuery9::GetType", D3DQuery9_GetType, 1) {
   return Obj<Query>(c, "IDirect3DQuery9")->type;
 }
 HLE_NAMED("d3d9.dll", "IDirect3DQuery9::GetDataSize", D3DQuery9_GetDataSize, 1) {
-  return sizeof(BOOL);  // EVENT
+  return sizeof(uint32_t);  // EVENT: a BOOL; OCCLUSION: a DWORD
 }
+// (dwIssueFlags): an OCCLUSION query counts between BEGIN and END; a new
+// BEGIN starts it again. An EVENT takes END only.
 HLE_NAMED("d3d9.dll", "IDirect3DQuery9::Issue", D3DQuery9_Issue, 2) {
-  return Arg(c, 1) == D3DISSUE_END ? D3D_OK : D3DERR_INVALIDCALL;
+  Query* q = Obj<Query>(c, "IDirect3DQuery9");
+  const uint32_t flags = Arg(c, 1);
+  if (q->type != D3DQUERYTYPE_OCCLUSION) return flags == D3DISSUE_END ? D3D_OK : D3DERR_INVALIDCALL;
+  gfx::Device* g = DeviceOf(q->device)->gfx.get();
+  if (flags & D3DISSUE_BEGIN) {
+    if (q->occlusion && !q->known) {  // its earlier count is dropped
+      uint64_t unused;
+      g->EndOcclusion(q->occlusion);
+      g->OcclusionResult(q->occlusion, &unused, true);
+    }
+    q->occlusion = g->BeginOcclusion();
+    q->ended = q->known = false;
+    q->pixels = 0;
+  }
+  if (flags & D3DISSUE_END) {
+    if (!q->occlusion) q->occlusion = g->BeginOcclusion();  // END alone: nothing drawn
+    g->EndOcclusion(q->occlusion);
+    q->ended = true;
+  }
+  return D3D_OK;
 }
-// (pData, dwSize, dwGetDataFlags): an EVENT is always signalled.
+// (pData, dwSize, dwGetDataFlags): an EVENT is always signalled; an
+// OCCLUSION query's count once the GPU has drawn its draws (S_FALSE until
+// then, as D3D9's).
 HLE_NAMED("d3d9.dll", "IDirect3DQuery9::GetData", D3DQuery9_GetData, 4) {
-  if (Arg(c, 1) && Arg(c, 2) >= sizeof(BOOL)) Wr32(Arg(c, 1), 1);
+  Query* q = Obj<Query>(c, "IDirect3DQuery9");
+  const uint32_t data = Arg(c, 1), size = Arg(c, 2);
+  if (q->type != D3DQUERYTYPE_OCCLUSION) {
+    if (data && size >= sizeof(BOOL)) Wr32(data, 1);
+    return D3D_OK;
+  }
+  if (!q->ended) return D3DERR_INVALIDCALL;
+  if (!q->known) {
+    gfx::Device* g = DeviceOf(q->device)->gfx.get();
+    if (!g->OcclusionResult(q->occlusion, &q->pixels, false)) return S_FALSE;
+    q->known = true;
+  }
+  if (data && size >= sizeof(uint32_t)) Wr32(data, uint32_t(std::min<uint64_t>(q->pixels, 0xFFFFFFFFu)));
   return D3D_OK;
 }
 

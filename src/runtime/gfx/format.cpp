@@ -33,6 +33,13 @@ void Device::DrawProgram(const ProgramDraw&) {}
 void Device::DispatchProgram(const ProgramDispatch&) {}
 uint64_t Device::WritesQueued() { return 0; }
 uint64_t Device::LandWrites(bool) { return 0; }
+bool Device::SupportsOcclusion() { return false; }
+uint32_t Device::BeginOcclusion() { return 0; }
+void Device::EndOcclusion(uint32_t) {}
+bool Device::OcclusionResult(uint32_t, uint64_t* count, bool) {
+  *count = 0;
+  return true;
+}
 void Device::DrawImage(TextureId, const Rect&) {}
 
 uint32_t BitsPerPixel(Format f) {
