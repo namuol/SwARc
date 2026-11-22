@@ -37,6 +37,11 @@ bool ShotPending();
 // Frames presented so far (back or front buffer).
 int FramesPresented();
 
+// The gamma ramp a device applies to what it shows (Device::SetGammaRamp):
+// the test aids' shots and probes apply it too, so they hold what is shown.
+// 256 red, green and blue 16-bit entries; null: none.
+void NoteShownGamma(const uint16_t* ramp);
+
 // For front ends that present outside gfx::Device (a game's own Vulkan
 // swapchain): call once per presented w x h frame. Services TEST_INPUT's
 // named shots and probes and counts the frame; `read` (a rect of the

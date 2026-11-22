@@ -37,6 +37,7 @@
 #include <vector>
 
 #include "runtime/gfx/device.h"
+#include "runtime/gfx/present.h"
 #include "runtime/env.h"
 #include "runtime/gfx/shader_compile.h"
 #include "runtime/log.h"
@@ -530,6 +531,9 @@ class GpuDevice final : public Device {
     for (auto& [k, p] : program_pipelines_) SDL_ReleaseGPUGraphicsPipeline(dev_, p);
     for (auto& [id, pr] : programs_) ReleaseProgram(pr);
     if (present_pipeline_) SDL_ReleaseGPUGraphicsPipeline(dev_, present_pipeline_);
+    if (gamma_pipeline_) SDL_ReleaseGPUGraphicsPipeline(dev_, gamma_pipeline_);
+    if (gamma_tex_) SDL_ReleaseGPUTexture(dev_, gamma_tex_);
+    if (gamma_tb_) SDL_ReleaseGPUTransferBuffer(dev_, gamma_tb_);
     for (auto& [k, s] : program_samplers_) SDL_ReleaseGPUSampler(dev_, s);
     for (auto& [id, sh] : shaders_) SDL_ReleaseGPUShader(dev_, sh.sh);
     for (auto& [k, s] : samplers_) SDL_ReleaseGPUSampler(dev_, s);
@@ -2239,6 +2243,22 @@ void r_color0(inout vec4 c) {
     return tb;
   }
 
+  void SetGammaRamp(const uint16_t ramp[3 * 256]) override {
+    std::lock_guard<std::recursive_mutex> l(mu_);
+    bool identity = true;
+    for (int i = 0; i < 3 * 256; i++) identity = identity && ramp[i] / 257 == i % 256;
+    gamma_on_ = !identity;
+    NoteShownGamma(ramp);
+    // As a 256 x 1 RGBA16 texture: texel i holds entry i of each channel.
+    for (int i = 0; i < 256; i++) {
+      gamma_lut_[i * 4 + 0] = ramp[i];
+      gamma_lut_[i * 4 + 1] = ramp[256 + i];
+      gamma_lut_[i * 4 + 2] = ramp[512 + i];
+      gamma_lut_[i * 4 + 3] = 65535;
+    }
+    gamma_dirty_ = true;
+  }
+
   void DrawImage(TextureId id, const Rect& r) override {
     std::lock_guard<std::recursive_mutex> l(mu_);
     auto it = textures_.find(id);
@@ -3061,8 +3081,127 @@ void r_color0(inout vec4 c) {
       b.load_op = SDL_GPU_LOADOP_LOAD;
     }
     b.filter = (w == bb_w_ && h == bb_h_) ? SDL_GPU_FILTER_NEAREST : SDL_GPU_FILTER_LINEAR;
-    SDL_BlitGPUTexture(cmd, &b);
+    if (gamma_on_) ShowGamma(cmd, sc, r, b.filter, b.load_op);
+    else SDL_BlitGPUTexture(cmd, &b);
     NotePresentation({bb_w_, bb_h_, int(sw), int(sh), r});
+  }
+
+  // Show's blit through the gamma ramp (SetGammaRamp): the front buffer
+  // drawn over `r` of the swap chain image, each channel looked up in the
+  // ramp (between its entries, as the 8-bit value lands on one).
+  void ShowGamma(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* sc, const Rect& r, SDL_GPUFilter filter,
+                 SDL_GPULoadOp load) {
+    if (!gamma_tex_) {
+      SDL_GPUTextureCreateInfo ti{};
+      ti.type = SDL_GPU_TEXTURETYPE_2D;
+      ti.format = SDL_GPU_TEXTUREFORMAT_R16G16B16A16_UNORM;
+      ti.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER;
+      ti.width = 256;
+      ti.height = 1;
+      ti.layer_count_or_depth = 1;
+      ti.num_levels = 1;
+      gamma_tex_ = SDL_CreateGPUTexture(dev_, &ti);
+      SDL_GPUTransferBufferCreateInfo bi{};
+      bi.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
+      bi.size = sizeof gamma_lut_;
+      gamma_tb_ = SDL_CreateGPUTransferBuffer(dev_, &bi);
+      if (!gamma_tex_ || !gamma_tb_) FatalF("gfx: the gamma ramp: %s", SDL_GetError());
+    }
+    const SDL_GPUTextureFormat fmt = SDL_GetGPUSwapchainTextureFormat(dev_, window_);
+    if (!gamma_pipeline_ || gamma_format_ != fmt) CreateGammaPipeline(fmt);
+    if (gamma_dirty_) {
+      std::memcpy(SDL_MapGPUTransferBuffer(dev_, gamma_tb_, true), gamma_lut_, sizeof gamma_lut_);
+      SDL_UnmapGPUTransferBuffer(dev_, gamma_tb_);
+      SDL_GPUCopyPass* cp = SDL_BeginGPUCopyPass(cmd);
+      SDL_GPUTextureTransferInfo src{gamma_tb_, 0, 256, 1};
+      SDL_GPUTextureRegion dst{};
+      dst.texture = gamma_tex_;
+      dst.w = 256;
+      dst.h = 1;
+      dst.d = 1;
+      SDL_UploadToGPUTexture(cp, &src, &dst, true);
+      SDL_EndGPUCopyPass(cp);
+      gamma_dirty_ = false;
+    }
+    SDL_GPUColorTargetInfo t{};
+    t.texture = sc;
+    t.load_op = load == SDL_GPU_LOADOP_LOAD ? SDL_GPU_LOADOP_LOAD : SDL_GPU_LOADOP_DONT_CARE;
+    t.store_op = SDL_GPU_STOREOP_STORE;
+    SDL_GPURenderPass* rp = SDL_BeginGPURenderPass(cmd, &t, 1, nullptr);
+    SDL_BindGPUGraphicsPipeline(rp, gamma_pipeline_);
+    SamplerKey fk{};
+    if (filter == SDL_GPU_FILTER_LINEAR) fk.mag = fk.min = SDL_GPU_FILTER_LINEAR;
+    SamplerKey lk{};
+    lk.mag = lk.min = SDL_GPU_FILTER_LINEAR;
+    SDL_GPUTextureSamplerBinding tb[2] = {{front_, Sampler(fk)}, {gamma_tex_, Sampler(lk)}};
+    SDL_BindGPUFragmentSamplers(rp, 0, tb, 2);
+    SDL_GPUViewport vp{float(r.left), float(r.top), float(r.right - r.left), float(r.bottom - r.top), 0, 1};
+    SDL_SetGPUViewport(rp, &vp);
+    SDL_DrawGPUPrimitives(rp, 3, 1, 0, 0);
+    SDL_EndGPURenderPass(rp);
+  }
+
+  void CreateGammaPipeline(SDL_GPUTextureFormat fmt) {
+    if (gamma_pipeline_) SDL_ReleaseGPUGraphicsPipeline(dev_, gamma_pipeline_);
+    static const char* kVs =
+        "#version 450\n"
+        "layout(location = 0) out vec2 uv;\n"
+        "void main() {\n"
+        "  vec2 p = vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2);\n"
+        "  uv = p;\n"
+        "  gl_Position = vec4(p * vec2(2, -2) + vec2(-1, 1), 0, 1);\n"
+        "}\n";
+    static const char* kFs =
+        "#version 450\n"
+        "layout(set = 2, binding = 0) uniform sampler2D img;\n"
+        "layout(set = 2, binding = 1) uniform sampler2D ramp;\n"
+        "layout(location = 0) in vec2 uv;\n"
+        "layout(location = 0) out vec4 o;\n"
+        "void main() {\n"
+        "  vec4 c = texture(img, uv);\n"
+        "  vec3 at = (clamp(c.rgb, 0.0, 1.0) * 255.0 + 0.5) / 256.0;\n"
+        "  o = vec4(texture(ramp, vec2(at.r, 0.5)).r, texture(ramp, vec2(at.g, 0.5)).g,\n"
+        "           texture(ramp, vec2(at.b, 0.5)).b, c.a);\n"
+        "}\n";
+    SDL_GPUShader* sh[2];
+    for (int i = 0; i < 2; i++) {
+      std::vector<uint32_t> spirv;
+      std::string log;
+      if (!GlslToSpirv(i ? kFs : kVs, i ? ShaderStage::Fragment : ShaderStage::Vertex, &spirv, &log))
+        FatalF("gfx: the gamma shader: %s", log.c_str());
+      SDL_GPUShaderCreateInfo si{};
+#if defined(__APPLE__)
+      std::string msl;
+      if (!SpirvToMsl(spirv, &msl, &log)) FatalF("gfx: the gamma shader: %s", log.c_str());
+      si.code = reinterpret_cast<const Uint8*>(msl.c_str());
+      si.code_size = msl.size();
+      si.entrypoint = "main0";
+      si.format = SDL_GPU_SHADERFORMAT_MSL;
+#else
+      si.code = reinterpret_cast<const Uint8*>(spirv.data());
+      si.code_size = spirv.size() * 4;
+      si.entrypoint = "main";
+      si.format = SDL_GPU_SHADERFORMAT_SPIRV;
+#endif
+      si.stage = i ? SDL_GPU_SHADERSTAGE_FRAGMENT : SDL_GPU_SHADERSTAGE_VERTEX;
+      si.num_samplers = i ? 2 : 0;
+      sh[i] = SDL_CreateGPUShader(dev_, &si);
+      if (!sh[i]) FatalF("gfx: the gamma shader: %s", SDL_GetError());
+    }
+    SDL_GPUGraphicsPipelineCreateInfo pi{};
+    pi.vertex_shader = sh[0];
+    pi.fragment_shader = sh[1];
+    pi.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
+    pi.multisample_state.sample_count = SDL_GPU_SAMPLECOUNT_1;
+    SDL_GPUColorTargetDescription cd{};
+    cd.format = fmt;
+    pi.target_info.color_target_descriptions = &cd;
+    pi.target_info.num_color_targets = 1;
+    gamma_pipeline_ = SDL_CreateGPUGraphicsPipeline(dev_, &pi);
+    if (!gamma_pipeline_) FatalF("gfx: the gamma pipeline: %s", SDL_GetError());
+    gamma_format_ = fmt;
+    SDL_ReleaseGPUShader(dev_, sh[0]);
+    SDL_ReleaseGPUShader(dev_, sh[1]);
   }
 
   void ReadTexture(SDL_GPUTexture* tex, SDL_GPUTextureFormat tex_fmt, int tw, int th, const Rect& r,
@@ -4985,6 +5124,13 @@ void r_color0(inout vec4 c) {
   SDL_GPUBuffer* crw_ = nullptr;
   uint32_t pbuf_cap_ = 0, cro_cap_ = 0, crw_cap_ = 0;
   SDL_GPUGraphicsPipeline* present_pipeline_ = nullptr;
+  // SetGammaRamp: the ramp as a texture, the pass Show draws through it.
+  bool gamma_on_ = false, gamma_dirty_ = false;
+  uint16_t gamma_lut_[256 * 4] = {};
+  SDL_GPUTexture* gamma_tex_ = nullptr;
+  SDL_GPUTransferBuffer* gamma_tb_ = nullptr;
+  SDL_GPUGraphicsPipeline* gamma_pipeline_ = nullptr;
+  SDL_GPUTextureFormat gamma_format_ = SDL_GPU_TEXTUREFORMAT_INVALID;
   SDL_GPUTexture* dummy_array_ = nullptr;
 
   // The state the current uniforms were built from.

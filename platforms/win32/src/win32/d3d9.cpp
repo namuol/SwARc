@@ -838,18 +838,14 @@ HLE_NAMED("d3d9.dll", "IDirect3DDevice9::GetBackBuffer", D3DDev9_GetBackBuffer, 
 }
 
 // SetGammaRamp(swapchain, flags, D3DGAMMARAMP*) / GetGammaRamp(swapchain,
-// ramp*): kept, and read back; the picture is not corrected by it yet
-// (warned once for a ramp that is not the identity).
+// ramp*): kept, read back, and applied to what is shown (gfx), windowed
+// too (Windows applied it to the display in fullscreen only).
 HLE_NAMED("d3d9.dll", "IDirect3DDevice9::SetGammaRamp", D3DDev9_SetGammaRamp, 4) {
   Device* d = Dev(c);
   std::memcpy(d->gamma.data(), GPtr(Arg(c, 3)), sizeof d->gamma);
-  bool identity = true;
-  for (int i = 0; i < 3 * 256; i++) identity = identity && d->gamma[i] / 257 == i % 256;
-  static bool warned = false;
-  if (!identity && !warned) {
-    warned = true;
-    WarnF("d3d9: SetGammaRamp: a ramp other than the identity is not applied\n");
-  }
+  RECOMP_TRACE("  ramp: red[64] %u [128] %u [192] %u (identity %u, %u, %u)\n", d->gamma[64], d->gamma[128],
+               d->gamma[192], 64 * 257, 128 * 257, 192 * 257);
+  if (d->gfx) d->gfx->SetGammaRamp(d->gamma.data());
   return 0;
 }
 HLE_NAMED("d3d9.dll", "IDirect3DDevice9::GetGammaRamp", D3DDev9_GetGammaRamp, 3) {

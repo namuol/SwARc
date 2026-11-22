@@ -501,6 +501,10 @@ class Device {
   // The land_later dispatches with read-write buffers for the host: how
   // many were queued, and how many have landed after writing back, in
   // order, those the GPU has run (all of them, waiting, with wait).
+  // The display's gamma ramp (Direct3D 9's SetGammaRamp): 256 red, then
+  // green, then blue 16-bit values, applied to what is shown (not to what
+  // is read back), as a display's lookup table does. The identity: none.
+  virtual void SetGammaRamp(const uint16_t ramp[3 * 256]);
   virtual uint64_t WritesQueued();
   virtual uint64_t LandWrites(bool wait);
   // Occlusion queries (Direct3D 9's): the shader draws between

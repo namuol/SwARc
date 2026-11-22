@@ -31,6 +31,7 @@ void Device::ClearDepth(DepthId, float, int, int) {}
 void Device::CopyDepth(DepthId, DepthId, const Rect&) {}
 void Device::DrawProgram(const ProgramDraw&) {}
 void Device::DispatchProgram(const ProgramDispatch&) {}
+void Device::SetGammaRamp(const uint16_t*) {}
 uint64_t Device::WritesQueued() { return 0; }
 uint64_t Device::LandWrites(bool) { return 0; }
 bool Device::SupportsOcclusion() { return false; }

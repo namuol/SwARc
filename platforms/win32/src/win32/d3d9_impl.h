@@ -182,7 +182,7 @@ struct Query final : com::Object {
 struct Device : com::Object {
   uint32_t d3d = 0;  // IDirect3D9 guest pointer
   // The gamma ramp (D3DGAMMARAMP: 256 red, green and blue WORDs), as last
-  // set; identity until then. Not applied to the picture yet.
+  // set; identity until then. The gfx device applies it to what is shown.
   std::array<uint16_t, 3 * 256> gamma = [] {
     std::array<uint16_t, 3 * 256> g{};
     for (int i = 0; i < 3 * 256; i++) g[i] = uint16_t((i % 256) * 257);
