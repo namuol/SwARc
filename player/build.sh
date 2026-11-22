@@ -221,6 +221,8 @@ while [ -z "$game" ]; do
   fi
 done
 game=${game%/}
+# An absolute path: the app starts from Finder with / as its current folder.
+game=$(cd "$game" && pwd) || die "can't open $game."
 build_note=""; [ -n "$STEAM_BUILD" ] && build_note=" (Steam build $STEAM_BUILD)"
 is_supported "$game" ||
   die "the game in $game is not the version of $STEAM_TITLE this build is for$build_note." \
