@@ -34,6 +34,8 @@ add_test(NAME reverb COMMAND reverb_test)
 # portable.
 add_executable(gl_draw_test gl_draw_test.cpp
                ${PROJECT_SOURCE_DIR}/src/runtime/gl/context.cpp
+               ${PROJECT_SOURCE_DIR}/src/runtime/gl/glsl.cpp
+               ${PROJECT_SOURCE_DIR}/src/runtime/gl/program.cpp
                ${PROJECT_SOURCE_DIR}/src/runtime/gfx/format.cpp)
 target_include_directories(gl_draw_test PRIVATE ${PROJECT_SOURCE_DIR}/src)
 target_compile_features(gl_draw_test PRIVATE cxx_std_20)

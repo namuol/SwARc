@@ -23,6 +23,7 @@
 //   GL front face is a device back face.
 
 #include "runtime/gl/context.h"
+#include "runtime/gl/context_impl.h"
 
 #include <algorithm>
 #include <array>
@@ -295,67 +296,49 @@ int MaxLevels(int w, int h) {
   return n;
 }
 
-bool UsesMipmaps(Enum min_filter) {
-  return min_filter != NEAREST && min_filter != LINEAR;
-}
 
 }  // namespace
 
-// ---- texture objects -------------------------------------------------------
+std::shared_ptr<Context::Shared> Context::NewShared(gfx::Device* dev) {
+  return std::make_shared<Shared>(dev);
+}
 
-struct Context::Texture {
-  gfx::TextureId id = 0;
-  int w = 0, h = 0, levels = 0;
-  bool compressed = false;
-  gfx::Format fmt = gfx::Format::Unknown;
-  // GL base-format facts the environment rules depend on (storage always
-  // has four channels).
-  bool has_alpha = true, has_color = true;
-  std::vector<bool> defined;
-  Enum min_filter = NEAREST_MIPMAP_LINEAR, mag_filter = LINEAR;
-  Enum wrap_s = REPEAT, wrap_t = REPEAT;
-  float aniso = 1;
-  bool Complete() const {
-    if (!id || defined.empty() || !defined[0]) return false;
-    if (!UsesMipmaps(min_filter)) return true;
-    return std::all_of(defined.begin(), defined.end(), [](bool b) { return b; });
-  }
-};
+Context::Context(gfx::Device* dev, int fb_w, int fb_h) : Context(NewShared(dev), fb_w, fb_h) {}
 
-struct Context::Unit {
-  uint32_t bound = 0;
-  bool tex2d = false;
-  Enum env_mode = MODULATE;
-  float env_color[4] = {0, 0, 0, 0};
-  Enum combine_rgb = MODULATE, combine_alpha = MODULATE;
-  Enum src_rgb[3] = {TEXTURE, PREVIOUS, CONSTANT};
-  Enum op_rgb[3] = {SRC_COLOR, SRC_COLOR, SRC_ALPHA};
-  Enum src_alpha[3] = {TEXTURE, PREVIOUS, CONSTANT};
-  Enum op_alpha[3] = {SRC_ALPHA, SRC_ALPHA, SRC_ALPHA};
-  float rgb_scale = 1, alpha_scale = 1;
-};
-
-Context::Context(gfx::Device* dev, int fb_w, int fb_h)
-    : dev_(dev), fb_w_(fb_w), fb_h_(fb_h), units_(new Unit[kUnits]) {
+Context::Context(std::shared_ptr<Shared> shared, int fb_w, int fb_h)
+    : shared_(std::move(shared)),
+      dev_(shared_->dev),
+      fb_w_(fb_w),
+      fb_h_(fb_h),
+      textures_(shared_->textures),
+      next_name_(shared_->next_texture),
+      units_(new Unit[kImageUnits]) {
   for (auto& s : stacks_) s.assign(1, Identity());
-  textures_[0] = new Texture;  // the default texture object
+  // The default texture object (name 0). GL has one per context; here the
+  // share group's contexts have one in common.
+  if (!textures_.count(0)) textures_[0] = new Texture;
   vp_[2] = scissor_[2] = fb_w;
   vp_[3] = scissor_[3] = fb_h;
   current_.color = 0xFFFFFFFF;
   current_.pos[3] = 1;
   current_.normal[2] = 1;
   depth_ = dev_->CreateDepth(fb_w, fb_h, gfx::Format::D24S8);
-  dev_->SetRenderTarget(0, depth_);
+  ApplyTarget();
   for (float* c : {lights_[0].diffuse, lights_[0].specular}) std::fill(c, c + 4, 1.0f);
 }
 
+// The share group's objects go with its last context.
 Context::~Context() {
-  for (auto& [n, t] : textures_) {
-    if (t->id) dev_->DestroyTexture(t->id);
-    delete t;
-  }
+  for (auto& [n, f] : framebuffers_) delete f;
+  if (fb_image_) dev_->DestroyTexture(fb_image_);
   if (depth_) dev_->DestroyDepth(depth_);
   delete[] units_;
+}
+
+void Context::MakeCurrent() {
+  Changed();
+  matrices_dirty_ = true;
+  ApplyTarget();
 }
 
 void Context::Resize(int fb_w, int fb_h) {
@@ -366,7 +349,12 @@ void Context::Resize(int fb_w, int fb_h) {
   dev_->ResetSwapChain(fb_w, fb_h, vsync_);
   if (depth_) dev_->DestroyDepth(depth_);
   depth_ = dev_->CreateDepth(fb_w, fb_h, gfx::Format::D24S8);
-  dev_->SetRenderTarget(0, depth_);
+  if (fb_image_) {
+    dev_->DestroyTexture(fb_image_);
+    fb_image_ = 0;
+    UseImageFramebuffer();
+  }
+  ApplyTarget();
   matrices_dirty_ = true;
 }
 
@@ -402,7 +390,19 @@ const char* Context::GetString(Enum name) const {
     case VENDOR: return "SwARc";
     case RENDERER: return "gfx::Device";
     case VERSION: return "1.1.0";
+    case SHADING_LANGUAGE_VERSION: return programmable_ ? "3.30" : nullptr;
     case EXTENSIONS:
+      if (programmable_)
+        return "GL_ARB_multitexture GL_EXT_texture_env_add "
+               "GL_ARB_texture_env_combine GL_EXT_texture_env_combine "
+               "GL_EXT_compiled_vertex_array GL_ARB_texture_compression "
+               "GL_EXT_texture_compression_s3tc GL_EXT_texture_filter_anisotropic "
+               "GL_EXT_bgra GL_EXT_texture_edge_clamp GL_SGIS_texture_edge_clamp "
+               "GL_ARB_vertex_buffer_object GL_ARB_shader_objects GL_ARB_vertex_shader "
+               "GL_ARB_fragment_shader GL_ARB_shading_language_100 "
+               "GL_ARB_texture_non_power_of_two GL_EXT_framebuffer_object "
+               "GL_EXT_packed_depth_stencil GL_EXT_framebuffer_blit GL_EXT_blend_func_separate "
+               "GL_EXT_blend_equation_separate GL_EXT_blend_minmax GL_EXT_blend_subtract";
       return "GL_ARB_multitexture GL_EXT_texture_env_add "
              "GL_ARB_texture_env_combine GL_EXT_texture_env_combine "
              "GL_EXT_compiled_vertex_array GL_ARB_texture_compression "
@@ -416,7 +416,7 @@ bool Context::GetIntegerv(Enum pname, int32_t* out) {
   switch (pname) {
     // Games also check it against the screen size (a 2560-wide mode needs
     // more than 2048); every SDL_GPU and d3d9 target takes 8192.
-    case MAX_TEXTURE_SIZE: *out = 8192; return true;
+    case MAX_TEXTURE_SIZE: *out = kMaxTextureSize; return true;
     case MAX_TEXTURE_UNITS: *out = kUnits; return true;
     case VIEWPORT: std::copy(vp_, vp_ + 4, out); return true;
     case DEPTH_BITS: *out = 24; return true;
@@ -426,6 +426,19 @@ bool Context::GetIntegerv(Enum pname, int32_t* out) {
     case MATRIX_MODE: *out = int32_t(matrix_mode_); return true;
     case MAX_LIGHTS: *out = 8; return true;
     case MAX_CLIP_PLANES: *out = 6; return true;
+    case TEXTURE_BINDING_2D: *out = int32_t(units_[active_unit_].bound); return true;
+    case ACTIVE_TEXTURE: *out = int32_t(TEXTURE0 + Enum(active_unit_)); return true;
+    case CLIENT_ACTIVE_TEXTURE: *out = int32_t(TEXTURE0 + Enum(client_unit_)); return true;
+    case ARRAY_BUFFER_BINDING: *out = int32_t(array_buffer_); return true;
+    case ELEMENT_ARRAY_BUFFER_BINDING: *out = int32_t(element_buffer_); return true;
+    case FRAMEBUFFER_BINDING: *out = int32_t(framebuffer_); return true;
+    case READ_FRAMEBUFFER_BINDING: *out = int32_t(read_framebuffer_); return true;
+    case RENDERBUFFER_BINDING: *out = int32_t(renderbuffer_); return true;
+    case MAX_VERTEX_ATTRIBS: *out = glsl::kMaxAttribs; return true;
+    case MAX_TEXTURE_COORDS: *out = kUnits; return true;
+    case MAX_TEXTURE_IMAGE_UNITS:
+    case MAX_COMBINED_TEXTURE_IMAGE_UNITS: *out = kImageUnits; return true;
+    case MAX_RENDERBUFFER_SIZE: *out = kMaxTextureSize; return true;
     default: {
       float f[16];
       if (pname == MAX_TEXTURE_MAX_ANISOTROPY_EXT && GetFloatv(pname, f)) {
@@ -495,8 +508,8 @@ bool Context::IsEnabled(Enum cap) const {
 
 void Context::BlendFunc(Enum s, Enum d) {
   Changed();
-  blend_src_ = s;
-  blend_dst_ = d;
+  blend_src_ = blend_src_a_ = s;
+  blend_dst_ = blend_dst_a_ = d;
 }
 
 void Context::AlphaFunc(Enum f, float ref) {
@@ -631,13 +644,17 @@ void Context::Clear(uint32_t mask) {
     dev_->BeginScene();
     scene_ = true;
   }
+  ApplyTarget();
+  if (!tgt_depth_) flags &= ~(CLEAR_ZBUFFER | CLEAR_STENCIL);
+  if (!flags) return;
   ApplyState();  // the scissor (GL clears ignore the viewport)
-  gfx::Rect r = ff_.rs[RS_SCISSORTESTENABLE] ? ff_.scissor : gfx::Rect{0, 0, fb_w_, fb_h_};
+  gfx::Rect r = ff_.rs[RS_SCISSORTESTENABLE] ? ff_.scissor : gfx::Rect{0, 0, tgt_w_, tgt_h_};
   if (r.right <= r.left || r.bottom <= r.top) return;
   dev_->Clear(1, &r, flags, Argb(clear_color_), float(clear_depth_), uint32_t(clear_stencil_));
 }
 
 const gfx::FfState& Context::DrawState(int* tex_sets) {
+  ApplyTarget();
   if (!scene_) {
     dev_->BeginScene();
     scene_ = true;
@@ -814,10 +831,12 @@ void Context::ApplyMatrices() {
   if (!matrices_dirty_) return;
   matrices_dirty_ = false;
   std::memcpy(ff_.world[0], stacks_[0].back().data(), 64);
-  // Projection: z from -w..w to 0..w, and the half-pixel shift.
+  // Projection: z from -w..w to 0..w, y negated into a target whose rows
+  // run bottom-up (a framebuffer object's), and the half-pixel shift.
   std::array<float, 16> p = stacks_[1].back();
   float vw = float(std::max(vp_[2], 1)), vh = float(std::max(vp_[3], 1));
   for (int k = 0; k < 4; k++) {
+    if (tgt_flip_) p[k * 4 + 1] = -p[k * 4 + 1];
     float w = p[k * 4 + 3];
     p[k * 4 + 2] = 0.5f * p[k * 4 + 2] + 0.5f * w;
     p[k * 4 + 0] -= w / vw;
@@ -840,10 +859,12 @@ void Context::ApplyMatrices() {
     }
     TSS(u, TSS_TEXTURETRANSFORMFLAGS, 2);  // D3DTTFF_COUNT2
   }
-  // Viewport, flipped to a top-left origin and clipped to the target.
-  int x = std::clamp(vp_[0], 0, fb_w_), y = fb_h_ - (vp_[1] + vp_[3]);
-  int y0 = std::clamp(y, 0, fb_h_), x1 = std::clamp(vp_[0] + vp_[2], 0, fb_w_);
-  int y1 = std::clamp(y + vp_[3], 0, fb_h_);
+  // Viewport, flipped to a top-left origin (but in a target whose rows run
+  // bottom-up) and clipped to the target.
+  const int tw = tgt_w_, th = tgt_h_;
+  int x = std::clamp(vp_[0], 0, tw), y = tgt_flip_ ? vp_[1] : th - (vp_[1] + vp_[3]);
+  int y0 = std::clamp(y, 0, th), x1 = std::clamp(vp_[0] + vp_[2], 0, tw);
+  int y1 = std::clamp(y + vp_[3], 0, th);
   if (x != vp_[0] || y0 != y || x1 != vp_[0] + vp_[2] || y1 != y + vp_[3])
     Unsupported("viewport outside the framebuffer", 0);
   ff_.viewport = {uint32_t(x), uint32_t(y0), uint32_t(std::max(x1 - x, 0)),
@@ -866,6 +887,25 @@ void Context::ApplyState() {
   RS(RS_ALPHABLENDENABLE, enabled_.count(BLEND) ? 1 : 0);
   RS(RS_SRCBLEND, BlendFactor(blend_src_));
   RS(RS_DESTBLEND, BlendFactor(blend_dst_));
+  // Separate alpha factors and the equations: D3D9's render states 206-209
+  // and BLENDOP (171); its ops are ADD 1, SUBTRACT 2, REVSUBTRACT 3, MIN 4,
+  // MAX 5.
+  auto op = [](Enum e) -> uint32_t {
+    switch (e) {
+      case FUNC_SUBTRACT: return 2;
+      case FUNC_REVERSE_SUBTRACT: return 3;
+      case MIN: return 4;
+      case MAX: return 5;
+      default: return 1;
+    }
+  };
+  const bool separate = blend_src_a_ != blend_src_ || blend_dst_a_ != blend_dst_ ||
+                        blend_eq_a_ != blend_eq_;
+  RS(171, op(blend_eq_));
+  RS(206, separate ? 1 : 0);
+  RS(207, BlendFactor(blend_src_a_));
+  RS(208, BlendFactor(blend_dst_a_));
+  RS(209, op(blend_eq_a_));
   RS(RS_ALPHATESTENABLE, enabled_.count(ALPHA_TEST) ? 1 : 0);
   RS(RS_ALPHAFUNC, CmpFunc(alpha_func_));
   RS(RS_ALPHAREF, uint32_t(std::lround(alpha_ref_ * 255)));
@@ -874,6 +914,7 @@ void Context::ApplyState() {
     bool cull_back = cull_face_ == BACK;
     if (cull_face_ == FRONT_AND_BACK) Unsupported("glCullFace", cull_face_);
     if (front_face_ == CW) cull_back = !cull_back;
+    if (tgt_flip_) cull_back = !cull_back;  // the flip mirrors the winding
     cull = cull_back ? 2 : 3;  // CW : CCW (see the file comment)
   }
   RS(RS_CULLMODE, cull);
@@ -888,10 +929,11 @@ void Context::ApplyState() {
   bool scissor = enabled_.count(SCISSOR_TEST);
   RS(RS_SCISSORTESTENABLE, scissor ? 1 : 0);
   if (scissor) {
-    int x0 = std::clamp(scissor_[0], 0, fb_w_);
-    int x1 = std::clamp(scissor_[0] + scissor_[2], 0, fb_w_);
-    int y0 = std::clamp(fb_h_ - (scissor_[1] + scissor_[3]), 0, fb_h_);
-    int y1 = std::clamp(fb_h_ - scissor_[1], 0, fb_h_);
+    const int tw = tgt_w_, th = tgt_h_;
+    int x0 = std::clamp(scissor_[0], 0, tw);
+    int x1 = std::clamp(scissor_[0] + scissor_[2], 0, tw);
+    int y0 = std::clamp(tgt_flip_ ? scissor_[1] : th - (scissor_[1] + scissor_[3]), 0, th);
+    int y1 = std::clamp(tgt_flip_ ? scissor_[1] + scissor_[3] : th - scissor_[1], 0, th);
     ff_.scissor = {x0, y0, x1, y1};
   }
   bool stencil = enabled_.count(STENCIL_TEST);
@@ -1144,7 +1186,7 @@ void Context::DeleteTextures(int n, const uint32_t* names) {
     if (it->second->id) dev_->DestroyTexture(it->second->id);
     delete it->second;
     textures_.erase(it);
-    for (int u = 0; u < kUnits; u++)
+    for (int u = 0; u < kImageUnits; u++)
       if (units_[u].bound == name) units_[u].bound = 0;
   }
 }
@@ -1260,7 +1302,8 @@ void Context::TexImage2D(Enum target, int level, Enum internal, int w, int h, in
     t->levels = MaxLevels(w, h);
     t->compressed = false;
     t->fmt = gfx::Format::A8R8G8B8;
-    t->id = dev_->CreateTexture(w, h, t->levels, t->fmt, false);
+    // Renderable: a framebuffer object may draw into any texture.
+    t->id = dev_->CreateTexture(w, h, t->levels, t->fmt, true);
     t->defined.assign(size_t(t->levels), false);
   }
   if (level == 0) {
@@ -1364,7 +1407,7 @@ void Context::TexEnv(Enum target, Enum pname, const float* v) {
 
 void Context::ActiveTexture(Enum unit) {
   int u = int(unit - TEXTURE0);
-  if (u < 0 || u >= kUnits) return Error(INVALID_ENUM, "glActiveTextureARB");
+  if (u < 0 || u >= kImageUnits) return Error(INVALID_ENUM, "glActiveTextureARB");
   active_unit_ = u;
 }
 
@@ -1380,7 +1423,9 @@ void Context::VertexPointer(int size, Enum type, int stride, const void* p) {
   vertex_.size = size;
   vertex_.type = type;
   vertex_.stride = stride;
-  vertex_.ptr = static_cast<const uint8_t*>(p);
+  vertex_.buffer = array_buffer_;
+  vertex_.offset = reinterpret_cast<uintptr_t>(p);
+  vertex_.ptr = array_buffer_ ? nullptr : static_cast<const uint8_t*>(p);
 }
 
 void Context::LockArrays(int first, int count) {
@@ -1401,7 +1446,9 @@ void Context::ColorPointer(int size, Enum type, int stride, const void* p) {
   color_.size = size;
   color_.type = type;
   color_.stride = stride;
-  color_.ptr = static_cast<const uint8_t*>(p);
+  color_.buffer = array_buffer_;
+  color_.offset = reinterpret_cast<uintptr_t>(p);
+  color_.ptr = array_buffer_ ? nullptr : static_cast<const uint8_t*>(p);
 }
 
 void Context::TexCoordPointer(int size, Enum type, int stride, const void* p) {
@@ -1409,14 +1456,18 @@ void Context::TexCoordPointer(int size, Enum type, int stride, const void* p) {
   a.size = size;
   a.type = type;
   a.stride = stride;
-  a.ptr = static_cast<const uint8_t*>(p);
+  a.buffer = array_buffer_;
+  a.offset = reinterpret_cast<uintptr_t>(p);
+  a.ptr = array_buffer_ ? nullptr : static_cast<const uint8_t*>(p);
 }
 
 void Context::NormalPointer(Enum type, int stride, const void* p) {
   normal_.size = 3;
   normal_.type = type;
   normal_.stride = stride;
-  normal_.ptr = static_cast<const uint8_t*>(p);
+  normal_.buffer = array_buffer_;
+  normal_.offset = reinterpret_cast<uintptr_t>(p);
+  normal_.ptr = array_buffer_ ? nullptr : static_cast<const uint8_t*>(p);
 }
 
 void Context::SetClientState(Enum array, bool on) {
@@ -1467,7 +1518,9 @@ void Context::FetchVertex(int i, Vtx* v) const {
 }
 
 Context::Sources Context::ClientSources() const {
-  return {vertex_, normal_, color_, {texcoord_[0], texcoord_[1], texcoord_[2], texcoord_[3]}};
+  return {Resolved(vertex_), Resolved(normal_), Resolved(color_),
+          {Resolved(texcoord_[0]), Resolved(texcoord_[1]), Resolved(texcoord_[2]),
+           Resolved(texcoord_[3])}};
 }
 
 bool Context::ArrayDraw(Enum mode, uint32_t first, uint32_t last, gfx::FfDraw* d,
@@ -1514,6 +1567,11 @@ bool Context::ArrayDraw(Enum mode, uint32_t first, uint32_t last, gfx::FfDraw* d
 
 void Context::DrawArrays(Enum mode, int first, int count) {
   if (count <= 0) return;
+  if (program_) {
+    std::vector<uint32_t> v(static_cast<size_t>(count));
+    std::iota(v.begin(), v.end(), uint32_t(first));
+    return DrawWithProgram(mode, v);
+  }
   if (count > 65536) return Unsupported("draw with more than 65536 vertices", mode);
   draw_verts_.resize(size_t(count));
   std::iota(draw_verts_.begin(), draw_verts_.end(), uint32_t(first));
@@ -1525,6 +1583,32 @@ void Context::DrawArrays(Enum mode, int first, int count) {
 void Context::DrawElements(Enum mode, int count, Enum type, const void* indices) {
   if (count <= 0) return;
   const uint8_t* p = static_cast<const uint8_t*>(indices);
+  if (element_buffer_) {  // indices: an offset into the bound element buffer
+    Array e;
+    e.buffer = element_buffer_;
+    e.offset = reinterpret_cast<uintptr_t>(indices);
+    p = ArrayPtr(e);
+    if (!p) return Error(INVALID_OPERATION, "glDrawElements: element buffer");
+  }
+  if (program_) {
+    if (type != UNSIGNED_BYTE && type != UNSIGNED_SHORT && type != UNSIGNED_INT)
+      return Unsupported("glDrawElements type", type);
+    std::vector<uint32_t> v(static_cast<size_t>(count));
+    for (int i = 0; i < count; i++) {
+      uint16_t s;
+      uint32_t w;
+      if (type == UNSIGNED_BYTE) {
+        v[size_t(i)] = p[i];
+      } else if (type == UNSIGNED_SHORT) {
+        std::memcpy(&s, p + 2 * i, 2);
+        v[size_t(i)] = s;
+      } else {
+        std::memcpy(&w, p + 4 * i, 4);
+        v[size_t(i)] = w;
+      }
+    }
+    return DrawWithProgram(mode, v);
+  }
   bool ok;
   switch (type) {
     case UNSIGNED_BYTE:
@@ -1755,13 +1839,49 @@ void Context::DrawVertices(Enum mode, const Sources& src) {
 
 // ---- readback ------------------------------------------------------------------------
 
+void Context::GetTexImage(Enum target, int level, Enum format, Enum type, void* out) {
+  if (target != TEXTURE_2D) return Unsupported("glGetTexImage target", target);
+  if (type != UNSIGNED_BYTE) return Unsupported("glGetTexImage type", type);
+  const int comps = format == RGBA || format == BGRA_EXT ? 4
+                    : format == RGB || format == BGR_EXT ? 3
+                    : format == ALPHA ? 1 : 0;
+  if (!comps) return Unsupported("glGetTexImage format", format);
+  Texture* t = Bound(active_unit_);
+  if (!t || !t->id || t->compressed || level < 0 || level >= t->levels ||
+      !t->defined[size_t(level)])
+    return Error(INVALID_OPERATION, "glGetTexImage");
+  const int w = std::max(1, t->w >> level), h = std::max(1, t->h >> level);
+  std::vector<uint8_t> px(size_t(w) * size_t(h) * 4);
+  dev_->ReadImage(t->id, level, 0, {0, 0, w, h}, px.data(), uint32_t(w) * 4);
+  size_t stride = size_t(w) * size_t(comps);
+  stride = (stride + size_t(pack_alignment_) - 1) / size_t(pack_alignment_) *
+           size_t(pack_alignment_);
+  const bool bgr = format == BGRA_EXT || format == BGR_EXT;
+  uint8_t* o = static_cast<uint8_t*>(out);
+  for (int row = 0; row < h; row++) {  // stored as uploaded: row 0 first
+    const uint8_t* s = px.data() + size_t(row) * size_t(w) * 4;  // B G R A
+    uint8_t* d = o + size_t(row) * stride;
+    for (int i = 0; i < w; i++, s += 4, d += comps) {
+      if (comps == 1) {
+        d[0] = s[3];
+        continue;
+      }
+      d[0] = bgr ? s[0] : s[2];
+      d[1] = s[1];
+      d[2] = bgr ? s[2] : s[0];
+      if (comps == 4) d[3] = t->has_alpha ? s[3] : 255;
+    }
+  }
+}
+
 void Context::ReadPixels(int x, int y, int w, int h, Enum format, Enum type, void* out) {
   if (type != UNSIGNED_BYTE) return Unsupported("glReadPixels type", type);
   int comps = format == RGBA || format == BGRA_EXT ? 4 : format == RGB || format == BGR_EXT ? 3 : 0;
   if (!comps) return Unsupported("glReadPixels format", format);
   if (w <= 0 || h <= 0) return;
   std::vector<uint8_t> px(size_t(w) * size_t(h) * 4);
-  int top = fb_h_ - (y + h);
+  ApplyTarget();
+  int top = tgt_flip_ ? y : tgt_h_ - (y + h);
   dev_->ReadBack({x, top, x + w, top + h}, px.data(), uint32_t(w) * 4,
                  gfx::Format::A8R8G8B8);
   size_t stride = size_t(w) * size_t(comps);
@@ -1769,7 +1889,8 @@ void Context::ReadPixels(int x, int y, int w, int h, Enum format, Enum type, voi
            size_t(pack_alignment_);
   uint8_t* o = static_cast<uint8_t*>(out);
   for (int row = 0; row < h; row++) {
-    const uint8_t* s = px.data() + size_t(h - 1 - row) * size_t(w) * 4;  // bottom-up
+    const uint8_t* s =  // bottom-up
+        px.data() + size_t(tgt_flip_ ? row : h - 1 - row) * size_t(w) * 4;
     uint8_t* d = o + size_t(row) * stride;
     for (int i = 0; i < w; i++, s += 4, d += comps) {
       bool bgr = format == BGRA_EXT || format == BGR_EXT;
