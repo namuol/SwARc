@@ -313,4 +313,20 @@ bool PeImage::IsX64File(const std::string& path) {
          Rd<uint16_t>(d, pe + 4) == 0x8664;
 }
 
+std::pair<gaddr, uint64_t> PeImage::CodeRange() const {
+  constexpr uint32_t kExecute = 0x20000000, kCode = 0x20;  // IMAGE_SCN_MEM_EXECUTE, CNT_CODE
+  gaddr lo = 0, hi = 0;
+  for (const auto& s : sections)
+    if (s.name == ".text") lo = s.va, hi = s.va + s.vsize;
+  for (bool grew = hi != 0; grew;) {
+    grew = false;
+    for (const auto& s : sections)
+      if ((s.characteristics & (kExecute | kCode)) && s.va >= hi && s.va - hi < 0x1000) {
+        hi = s.va + s.vsize;
+        grew = true;
+      }
+  }
+  return {lo, hi - lo};
+}
+
 }  // namespace recomp

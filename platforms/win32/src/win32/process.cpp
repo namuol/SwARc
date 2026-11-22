@@ -37,11 +37,7 @@ std::vector<gaddr> g_free_tebs;
 std::set<gaddr> g_live_tebs;
 
 // The image's .text, where its lifted functions are.
-std::pair<gaddr, uint64_t> TextOf(const PeImage& img) {
-  for (const auto& s : img.sections)
-    if (s.name == ".text") return {s.va, s.vsize};
-  return {0, 0};
-}
+std::pair<gaddr, uint64_t> TextOf(const PeImage& img) { return img.CodeRange(); }
 
 // Process::thread_init: the thread's TEB and TLS array, in the layout of
 // the process's mode, found through fs (32-bit) or gs (x64).

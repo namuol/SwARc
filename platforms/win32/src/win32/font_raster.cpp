@@ -3,6 +3,8 @@
 
 #include "win32/font_raster.h"
 
+#include "runtime/log.h"
+
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -135,9 +137,21 @@ bool PrivateFont(const std::string& path, bool add) {
   CFURLRef url = CFURLCreateFromFileSystemRepresentation(
       nullptr, reinterpret_cast<const UInt8*>(path.c_str()), CFIndex(path.size()), false);
   if (!url) return false;
-  bool ok = add ? CTFontManagerRegisterFontsForURL(url, kCTFontManagerScopeProcess, nullptr)
-                : CTFontManagerUnregisterFontsForURL(url, kCTFontManagerScopeProcess, nullptr);
+  CFErrorRef err = nullptr;
+  bool ok = add ? CTFontManagerRegisterFontsForURL(url, kCTFontManagerScopeProcess, &err)
+                : CTFontManagerUnregisterFontsForURL(url, kCTFontManagerScopeProcess, &err);
   CFRelease(url);
+  // Registering a file already registered (the game adds its fonts again
+  // when its UI restarts) is success here, as AddFontResource counts it.
+  if (!ok && err && CFErrorGetCode(err) == kCTFontManagerErrorAlreadyRegistered) ok = true;
+  if (!ok && err) {
+    CFStringRef d = CFErrorCopyDescription(err);
+    char buf[256] = {};
+    CFStringGetCString(d, buf, sizeof buf, kCFStringEncodingUTF8);
+    WarnF("font: %s %s: %s\n", add ? "registering" : "unregistering", path.c_str(), buf);
+    CFRelease(d);
+  }
+  if (err) CFRelease(err);
   if (ok) {
     // Faces looked up before may now resolve differently.
     std::lock_guard<std::mutex> l(g_mu);

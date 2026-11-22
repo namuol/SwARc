@@ -49,13 +49,11 @@ bool Load(Program& p, Module& m, const std::string& path, uint64_t base, std::st
   if (!img.Load(path, p.mem, err, base)) return false;
   m.base = img.image_base;
   m.preferred_base = img.preferred_base;
-  for (const auto& s : img.sections) {
-    if (s.name == ".text") {
-      m.text_lo = s.va;
-      m.text_hi = s.va + s.vsize;
-    }
+  const auto [code_lo, code_size] = img.CodeRange();
+  m.text_lo = code_lo;
+  m.text_hi = code_lo + code_size;
+  for (const auto& s : img.sections)
     if (s.name == ".rdata" || s.name == ".data") m.data.push_back({s.va, s.va + s.vsize});
-  }
   auto in_text = [&](uint64_t va) { return va >= m.text_lo && va < m.text_hi; };
 
   // x64: every .pdata entry that is not a chained fragment starts a
