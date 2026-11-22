@@ -42,13 +42,20 @@ struct StdIoObject : KObject {
   int fd;
 };
 
+void RemoveOnClose(const std::string& guest, bool dir);
+
 struct FileObject : KObject {
   FileObject() : KObject(Type::File) {}
   ~FileObject() override {
     if (fd >= 0) close(fd);
+    if (delete_on_close) RemoveOnClose(guest, dir);
   }
   int fd = -1;
   std::string guest;  // the absolute guest path it was opened by
+  // SetFileInformationByHandle's disposition: deleted when the last handle
+  // to it closes (this object is shared by the handles DuplicateHandle makes).
+  bool delete_on_close = false;
+  bool dir = false;
 };
 
 struct FindObject : KObject {
@@ -286,6 +293,7 @@ uint32_t ErrnoToWin(int e) {
     case EACCES:
     case EPERM: return kErrorAccessDenied;
     case EEXIST: return kErrorFileExists;
+    case ENOTEMPTY: return 145;  // ERROR_DIR_NOT_EMPTY
     default: return kErrorAccessDenied;
   }
 }
@@ -777,13 +785,23 @@ HLE64("kernel32.dll", GetFileAttributesExW, 3) { return GetFileAttributesEx(c, W
 // serial is GetVolumeInformation's; the file index the host inode.
 // GetFileInformationByHandleEx(h, class, buf, size): the classes the C++
 // library's <filesystem> asks for.
+uint32_t RemoveGuest(const std::string& g, bool dir);
+
 // SetFileInformationByHandle(file, class, info, size): the end of file
 // (FileEndOfFileInfo, 6) and allocation size (FileAllocationInfo, 5) set
 // the file's length; times (FileBasicInfo, 0) are accepted and not kept.
-// Other classes (renames, deletion on close) are refused with
+// Deletion: FileDispositionInfo (4, {BOOLEAN DeleteFile}) and
+// FileDispositionInfoEx (21, {ULONG Flags}: DELETE 1, POSIX_SEMANTICS 2,
+// IGNORE_READONLY_ATTRIBUTE 0x10) mark the file or directory to be deleted
+// when its last handle closes, or clear the mark; with POSIX semantics its
+// name goes at once (the open handles keep working). As on Windows, a
+// read-only file is refused unless IGNORE_READONLY is given, and so is a
+// directory that isn't empty. The C++ library's std::filesystem::remove
+// deletes this way. Other classes (renames...) are refused with
 // ERROR_INVALID_PARAMETER.
 HLE64("kernel32.dll", SetFileInformationByHandle, 4) {
-  int fd = FdOf(Arg(c, 0));
+  auto obj = GetHandle(Arg(c, 0));
+  int fd = obj ? FileFd(obj.get()) : -1;
   uint32_t cls = uint32_t(Arg(c, 1)), size = uint32_t(Arg(c, 3));
   gaddr d = Arg(c, 2);
   if (fd < 0) {
@@ -806,6 +824,54 @@ HLE64("kernel32.dll", SetFileInformationByHandle, 4) {
         SetLastError(ErrnoToWin(errno));
         return 0;
       }
+      return 1;
+    }
+    case 4:     // FileDispositionInfo
+    case 21: {  // FileDispositionInfoEx
+      if (size < (cls == 4 ? 1u : 4u) || obj->type != KObject::Type::File) {
+        SetLastError(cls == 4 ? 24 : kErrorInvalidParameter);
+        return 0;
+      }
+      auto* f = static_cast<FileObject*>(obj.get());
+      const uint32_t flags = cls == 4 ? (Rd8(d) ? 1u : 0u) : Rd32(d);
+      if (!(flags & 1)) {
+        f->delete_on_close = false;
+        return 1;
+      }
+      struct stat st;
+      if (fstat(fd, &st) != 0) {
+        SetLastError(ErrnoToWin(errno));
+        return 0;
+      }
+      f->dir = S_ISDIR(st.st_mode);
+      if (!f->dir && !(flags & 0x10) && !(st.st_mode & S_IWUSR)) {
+        SetLastError(kErrorAccessDenied);  // read-only
+        return 0;
+      }
+      if (f->dir) {  // Windows refuses a non-empty directory now, not at close
+        DIR* dd = fdopendir(dup(fd));
+        bool empty = true;
+        if (dd) {
+          while (dirent* e = readdir(dd))
+            if (std::strcmp(e->d_name, ".") && std::strcmp(e->d_name, "..")) {
+              empty = false;
+              break;
+            }
+          closedir(dd);
+        }
+        if (!empty) {
+          SetLastError(145);  // ERROR_DIR_NOT_EMPTY
+          return 0;
+        }
+      }
+      RECOMP_TRACE("  SetFileInformationByHandle(%s): delete%s\n", f->guest.c_str(),
+                   flags & 2 ? " now (POSIX semantics)" : " on close");
+      if (flags & 2) {
+        f->delete_on_close = false;
+        if (!RemoveGuest(f->guest, f->dir)) return 0;
+        return 1;
+      }
+      f->delete_on_close = true;
       return 1;
     }
     default:
@@ -916,6 +982,21 @@ HLE64("kernel32.dll", SetFileAttributesW, 2) { return 1; }
 // or moved away.
 bool InstallOnly(const std::string& gpath) {
   return HostPath(gpath) != HostPath(gpath, PathAccess::kWrite);
+}
+
+// Deletes a guest file or (empty) directory: what DeleteFile and
+// RemoveDirectory do, for deletion through a handle.
+uint32_t RemoveGuest(const std::string& g, bool dir) {
+  if (InstallOnly(g) && Exists(HostPath(g))) {
+    SetLastError(kErrorAccessDenied);
+    return 0;
+  }
+  const std::string path = HostPath(g, PathAccess::kWrite);
+  if ((dir ? rmdir(path.c_str()) : unlink(path.c_str())) != 0) {
+    SetLastError(ErrnoToWin(errno));
+    return 0;
+  }
+  return 1;
 }
 
 uint32_t DeleteFile(const std::string& g) {
@@ -1358,4 +1439,12 @@ HLE64("kernel32.dll", SetFileTime, 4) { return 1; }
 
 }  // namespace
 }  // namespace hle
+
+namespace {
+// A handle's deletion on close (FileObject), when its last handle closes.
+void RemoveOnClose(const std::string& guest, bool dir) {
+  if (!hle::RemoveGuest(guest, dir))
+    RECOMP_TRACE("  delete on close of %s failed\n", guest.c_str());
+}
+}  // namespace
 }  // namespace recomp
