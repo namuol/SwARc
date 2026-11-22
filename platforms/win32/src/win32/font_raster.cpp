@@ -131,7 +131,28 @@ void RasterizeText(const FontDesc& d, const char* s, int n, std::vector<uint8_t>
   for (uint8_t& v : *mask) v = v >= 128 ? 255 : 0;
 }
 
+bool PrivateFont(const std::string& path, bool add) {
+  CFURLRef url = CFURLCreateFromFileSystemRepresentation(
+      nullptr, reinterpret_cast<const UInt8*>(path.c_str()), CFIndex(path.size()), false);
+  if (!url) return false;
+  bool ok = add ? CTFontManagerRegisterFontsForURL(url, kCTFontManagerScopeProcess, nullptr)
+                : CTFontManagerUnregisterFontsForURL(url, kCTFontManagerScopeProcess, nullptr);
+  CFRelease(url);
+  if (ok) {
+    // Faces looked up before may now resolve differently.
+    std::lock_guard<std::mutex> l(g_mu);
+    for (auto& [k, f] : g_fonts) CFRelease(f);
+    g_fonts.clear();
+  }
+  return ok;
+}
+bool AddPrivateFont(const std::string& path) { return PrivateFont(path, true); }
+bool RemovePrivateFont(const std::string& path) { return PrivateFont(path, false); }
+
 #else  // no host font engine: 8x16 cells, nothing drawn
+
+bool AddPrivateFont(const std::string&) { return false; }
+bool RemovePrivateFont(const std::string&) { return false; }
 
 FontMetrics MeasureFont(const FontDesc&) { return {}; }
 int TextWidth(const FontDesc&, const char*, int n) { return 8 * std::max(n, 0); }

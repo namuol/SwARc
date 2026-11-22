@@ -452,6 +452,54 @@ HLE("advapi32.dll", CryptGenRandom, 3) {
 }
 HLE("advapi32.dll", CryptReleaseContext, 2) { return 1; }
 
+// ---- rpcrt4: UUIDs ------------------------------------------------------------
+// UuidCreate(UUID*): a random (version 4) UUID; RPC_S_OK. To and from the
+// "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" form, the string allocated from
+// the process heap and freed with RpcStringFree.
+HLE("rpcrt4.dll", UuidCreate, 1) {
+  gaddr u = Arg(c, 0);
+  RandomBytes(u, 16);
+  Wr8(u + 7, uint8_t((Rd8(u + 7) & 0x0F) | 0x40));  // Data3's high byte: version 4
+  Wr8(u + 8, uint8_t((Rd8(u + 8) & 0x3F) | 0x80));  // the variant
+  return 0;
+}
+HLE("rpcrt4.dll", UuidToStringA, 2) {
+  gaddr u = Arg(c, 0);
+  char buf[40];
+  std::snprintf(buf, sizeof buf, "%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x", Rd32(u),
+                Rd16(u + 4), Rd16(u + 6), Rd8(u + 8), Rd8(u + 9), Rd8(u + 10), Rd8(u + 11),
+                Rd8(u + 12), Rd8(u + 13), Rd8(u + 14), Rd8(u + 15));
+  gaddr s = HeapAllocProcess(37, false);
+  PutStr(s, buf);
+  Wr32(Arg(c, 1), uint32_t(s));
+  return 0;
+}
+HLE("rpcrt4.dll", UuidFromStringA, 2) {
+  constexpr uint32_t kRpcSInvalidStringUuid = 1705;
+  gaddr u = Arg(c, 1);
+  if (!Arg(c, 0)) {
+    std::memset(GPtr(u), 0, 16);
+    return 0;
+  }
+  std::string str = GStr(Arg(c, 0));
+  unsigned d1, d2, d3, b[8];
+  if (str.size() != 36 ||
+      std::sscanf(str.c_str(), "%8x-%4x-%4x-%2x%2x-%2x%2x%2x%2x%2x%2x", &d1, &d2, &d3, &b[0],
+                  &b[1], &b[2], &b[3], &b[4], &b[5], &b[6], &b[7]) != 11)
+    return kRpcSInvalidStringUuid;
+  Wr32(u, d1);
+  Wr16(u + 4, uint16_t(d2));
+  Wr16(u + 6, uint16_t(d3));
+  for (int i = 0; i < 8; i++) Wr8(u + 8 + i, uint8_t(b[i]));
+  return 0;
+}
+HLE("rpcrt4.dll", RpcStringFreeA, 1) {
+  gaddr p = Arg(c, 0);
+  if (Rd32(p)) HeapFreeProcess(Rd32(p));
+  Wr32(p, 0);
+  return 0;
+}
+
 HLE("ole32.dll", CoInitialize, 1) { return 0; }  // S_OK
 HLE("ole32.dll", CoInitializeEx, 2) { return 0; }
 // CoInitializeSecurity(desc, cAuth, auth, reserved, authn level, imp level,

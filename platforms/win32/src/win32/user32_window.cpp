@@ -1704,6 +1704,9 @@ using namespace win32;
 std::string ClassKey(uint32_t name) {
   return name < 0x10000 ? "#" + std::to_string(name) : Lower(GStr(name));
 }
+std::string ClassKeyW(uint32_t name) {
+  return name < 0x10000 ? "#" + std::to_string(name) : Lower(Narrow(GWStr(name)));
+}
 
 // The system control classes every process has (see "built-in control
 // classes" below). Their window procedures are host handlers behind
@@ -1734,12 +1737,13 @@ void EnsureSystemClasses() {
 
 // WNDCLASSA at wc, or the same fields 4 bytes on in WNDCLASSEXA (after
 // cbSize).
-uint32_t RegisterWndClass(uint32_t wc) {
+// WNDCLASSW has the same layout, its names wide.
+uint32_t RegisterWndClass(uint32_t wc, bool wide = false) {
   WndClass k;
   k.style = Rd32(wc + 0);
   k.wndproc = Rd32(wc + 4);
   k.wnd_extra = Rd32(wc + 12);
-  k.name = ClassKey(Rd32(wc + 36));
+  k.name = wide ? ClassKeyW(Rd32(wc + 36)) : ClassKey(Rd32(wc + 36));
   std::lock_guard<std::recursive_mutex> l(g_mu);
   if (g_classes.count(k.name)) {
     SetLastError(kErrorClassAlreadyExists);
@@ -1751,6 +1755,7 @@ uint32_t RegisterWndClass(uint32_t wc) {
 }
 
 HLE("user32.dll", RegisterClassA, 1) { return RegisterWndClass(Arg(c, 0)); }
+HLE("user32.dll", RegisterClassW, 1) { return RegisterWndClass(Arg(c, 0), true); }
 
 HLE("user32.dll", RegisterClassExA, 1) {
   uint32_t wc = Arg(c, 0);
@@ -1794,6 +1799,11 @@ HLE("user32.dll", UnregisterClassA, 2) {
   std::lock_guard<std::recursive_mutex> l(g_mu);
   return g_classes.erase(n) ? 1 : 0;
 }
+HLE("user32.dll", UnregisterClassW, 2) {
+  std::string n = ClassKeyW(Arg(c, 0));
+  std::lock_guard<std::recursive_mutex> l(g_mu);
+  return g_classes.erase(n) ? 1 : 0;
+}
 
 HLE("user32.dll", SetClassLongA, 3) {
   // GCL_HCURSOR (-12), GCL_HICON (-14)... cosmetic; remember nothing.
@@ -1805,13 +1815,24 @@ HLE("user32.dll", SetClassLongA, 3) {
 // Set while the dialog code creates a dialog window: it gets no host window.
 thread_local bool t_creating_dialog = false;
 
+// CreateWindowEx{A,W}: the class key and title from the A or W strings;
+// CREATESTRUCT gets the caller's own string pointers (A or W ones, as a
+// window procedure of that kind reads them).
+uint32_t CreateWindowImpl(Ctx& c, const std::string& cls, const std::string& title);
+
 HLE("user32.dll", CreateWindowExA, 12) {
+  return CreateWindowImpl(c, ClassKey(Arg(c, 1)), Arg(c, 2) ? GStr(Arg(c, 2)) : "");
+}
+HLE("user32.dll", CreateWindowExW, 12) {
+  return CreateWindowImpl(c, ClassKeyW(Arg(c, 1)), Arg(c, 2) ? Narrow(GWStr(Arg(c, 2))) : "");
+}
+
+uint32_t CreateWindowImpl(Ctx& c, const std::string& cls, const std::string& title) {
   uint32_t exstyle = Arg(c, 0), cls_va = Arg(c, 1), title_va = Arg(c, 2),
            style = Arg(c, 3), parent = Arg(c, 8), menu = Arg(c, 9),
            hinst = Arg(c, 10), param = Arg(c, 11);
   int32_t x = int32_t(Arg(c, 4)), y = int32_t(Arg(c, 5)), w = int32_t(Arg(c, 6)),
           h = int32_t(Arg(c, 7));
-  std::string cls = ClassKey(cls_va);
   EnsureSystemClasses();
   Window win;
   {
@@ -1844,7 +1865,7 @@ HLE("user32.dll", CreateWindowExA, 12) {
   win.y = y;
   win.w = w;
   win.h = h;
-  win.title = title_va ? GStr(title_va) : "";
+  win.title = title;
   win.tid = CurrentThread()->tid;
   win.is_dialog = t_creating_dialog;
   // A top-level window gets its host window here, on the main thread.
@@ -1858,7 +1879,7 @@ HLE("user32.dll", CreateWindowExA, 12) {
     g_windows[hwnd] = std::move(win);
   }
   RECOMP_TRACE("  CreateWindowExA(%s, \"%s\", style %08X, %d,%d %dx%d) -> %X\n",
-            cls.c_str(), GStr(title_va).c_str(), style, x, y, w, h, hwnd);
+            cls.c_str(), title.c_str(), style, x, y, w, h, hwnd);
 
   // CREATESTRUCTA in a process-heap block.
   uint32_t cs = HeapAllocProcess(48, true);
@@ -2526,7 +2547,16 @@ HLE("user32.dll", GetWindowTextLengthA, 1) {
   return w ? uint32_t(w->title.size()) : 0;
 }
 
-HLE("user32.dll", GetWindowLongA, 2) {
+// The W forms: windows are the same whichever kind made them (messages
+// carry the same, US-layout characters to both).
+uint32_t GetWindowLong(Ctx& c);
+uint32_t SetWindowLong(Ctx& c);
+HLE("user32.dll", GetWindowLongA, 2) { return GetWindowLong(c); }
+HLE("user32.dll", GetWindowLongW, 2) { return GetWindowLong(c); }
+HLE("user32.dll", SetWindowLongA, 3) { return SetWindowLong(c); }
+HLE("user32.dll", SetWindowLongW, 3) { return SetWindowLong(c); }
+
+uint32_t GetWindowLong(Ctx& c) {
   std::lock_guard<std::recursive_mutex> l(g_mu);
   Window* w = Win(Arg(c, 0));
   int32_t idx = int32_t(Arg(c, 1));
@@ -2548,7 +2578,7 @@ HLE("user32.dll", GetWindowLongA, 2) {
   return 0;
 }
 
-HLE("user32.dll", SetWindowLongA, 3) {
+uint32_t SetWindowLong(Ctx& c) {
   std::lock_guard<std::recursive_mutex> l(g_mu);
   Window* w = Win(Arg(c, 0));
   int32_t idx = int32_t(Arg(c, 1));
@@ -2851,8 +2881,17 @@ HLE("user32.dll", IsDialogMessageA, 2) {
 HLE("user32.dll", CallWindowProcA, 5) {
   return CallGuest(c, Arg(c, 0), {Arg(c, 1), Arg(c, 2), Arg(c, 3), Arg(c, 4)});
 }
+HLE("user32.dll", CallWindowProcW, 5) {
+  return CallGuest(c, Arg(c, 0), {Arg(c, 1), Arg(c, 2), Arg(c, 3), Arg(c, 4)});
+}
 
-HLE("user32.dll", DefWindowProcA, 4) {
+uint32_t DefWindowProc(Ctx& c);
+HLE("user32.dll", DefWindowProcA, 4) { return DefWindowProc(c); }
+// The same for Unicode windows: what the default handling does reads no
+// message text (window text messages are handled the A way, line by line
+// below, for both).
+HLE("user32.dll", DefWindowProcW, 4) { return DefWindowProc(c); }
+uint32_t DefWindowProc(Ctx& c) {
   uint32_t hwnd = Arg(c, 0), msg = Arg(c, 1), wp = Arg(c, 2);
   switch (msg) {
     case WM_NCCREATE: return 1;
@@ -3318,6 +3357,20 @@ HLE("user32.dll", EnumChildWindows, 3) {
   Children(Arg(c, 0), true, &kids);
   for (uint32_t h : kids)
     if (!CallGuest(c, Arg(c, 1), {h, Arg(c, 2)})) break;
+  return 1;
+}
+
+// EnumWindows(proc, lparam): the top-level windows (not WS_CHILD), in
+// creation order, until proc returns FALSE.
+HLE("user32.dll", EnumWindows, 2) {
+  std::vector<uint32_t> top;
+  {
+    std::lock_guard<std::recursive_mutex> l(g_mu);
+    for (auto& [h, w] : g_windows)
+      if (!w.destroyed && !(w.style & WS_CHILD)) top.push_back(h);
+  }
+  for (uint32_t h : top)
+    if (!CallGuest(c, Arg(c, 0), {h, Arg(c, 1)})) break;
   return 1;
 }
 

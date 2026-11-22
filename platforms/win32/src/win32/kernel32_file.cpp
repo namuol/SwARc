@@ -730,12 +730,13 @@ HLE("kernel32.dll", GetShortPathNameA, 3) {
 }
 HLE64("kernel32.dll", GetFileAttributesW, 1) { return GetFileAttributes(WidePath(Arg(c, 0))); }
 
-// GetFileAttributesExW(path, GetFileExInfoStandard, WIN32_FILE_ATTRIBUTE_DATA*).
-HLE64("kernel32.dll", GetFileAttributesExW, 3) {
-  if (Arg(c, 1) != 0) FatalF("GetFileAttributesExW: info level %llu", (unsigned long long)Arg(c, 1));
+// GetFileAttributesEx{A,W}(path, GetFileExInfoStandard,
+// WIN32_FILE_ATTRIBUTE_DATA*).
+uint32_t GetFileAttributesEx(Ctx& c, const std::string& path) {
+  if (Arg(c, 1) != 0) FatalF("GetFileAttributesEx: info level %llu", (unsigned long long)Arg(c, 1));
   struct stat st;
   uint32_t a;
-  if (!StatGuest(WidePath(Arg(c, 0)), &st, &a)) return 0;
+  if (!StatGuest(path, &st, &a)) return 0;
   gaddr d = Arg(c, 2);
   Wr32(d + 0, a);
   PutFileTime(d + 4, platform::StatModifyTime(st));   // creation
@@ -745,6 +746,8 @@ HLE64("kernel32.dll", GetFileAttributesExW, 3) {
   Wr32(d + 32, uint32_t(st.st_size));
   return 1;
 }
+HLE64("kernel32.dll", GetFileAttributesExA, 3) { return GetFileAttributesEx(c, GStr(Arg(c, 0))); }
+HLE64("kernel32.dll", GetFileAttributesExW, 3) { return GetFileAttributesEx(c, WidePath(Arg(c, 0))); }
 
 // GetFileInformationByHandle(h, BY_HANDLE_FILE_INFORMATION*). The volume
 // serial is GetVolumeInformation's; the file index the host inode.

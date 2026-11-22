@@ -179,9 +179,12 @@ HLE_NAMED("wsock32.dll", "#52", gethostbyname, 1) {
   return hostent;
 }
 
-HLE_NAMED("wsock32.dll", "#14", htonl, 1) { return __builtin_bswap32(Arg(c, 0)); }  // htonl
+// wsock32's ordinals are Winsock 1.1's (8 htonl, 9 htons, 10 inet_addr,
+// 11 inet_ntoa, 12 ioctlsocket, 14 ntohl, 15 ntohs, ...): ws2_32's own
+// numbering differs from 10 on. The socket calls are in win9x_misc.cpp.
+HLE_NAMED("wsock32.dll", "#14", ntohl, 1) { return __builtin_bswap32(Arg(c, 0)); }  // ntohl
 
-HLE_NAMED("wsock32.dll", "#10", ioctlsocket, 3) {  // ioctlsocket: no sockets exist
+HLE_NAMED("wsock32.dll", "#12", ioctlsocket, 3) {  // ioctlsocket: no sockets exist
   return 0xFFFFFFFF;
 }
 

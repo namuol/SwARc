@@ -285,13 +285,45 @@ HLE_NAMED("wsock32.dll", "#8", wsock_htonl, 1) { return __builtin_bswap32(Arg(c,
 HLE_NAMED("wsock32.dll", "#9", wsock_htons, 1) { return __builtin_bswap16(uint16_t(Arg(c, 0))); }
 HLE_NAMED("wsock32.dll", "#15", wsock_ntohs, 1) { return __builtin_bswap16(uint16_t(Arg(c, 0))); }
 // inet_addr("a.b.c.d"), network byte order; INADDR_NONE otherwise.
-HLE_NAMED("wsock32.dll", "#11", wsock_inet_addr, 1) {
+HLE_NAMED("wsock32.dll", "#10", wsock_inet_addr, 1) {
   unsigned a, b, cc, d;
   char tail;
   if (std::sscanf(GStr(Arg(c, 0)).c_str(), "%u.%u.%u.%u%c", &a, &b, &cc, &d, &tail) != 4 ||
       a > 255 || b > 255 || cc > 255 || d > 255)
     return 0xFFFFFFFF;
   return a | b << 8 | cc << 16 | d << 24;
+}
+// inet_ntoa(struct in_addr, by value): "a.b.c.d" in a buffer per thread.
+HLE_NAMED("wsock32.dll", "#11", wsock_inet_ntoa, 1) {
+  static thread_local gaddr buf = 0;
+  if (!buf) buf = HeapAllocProcess(16, false);
+  uint32_t a = Arg(c, 0);
+  char s[16];
+  std::snprintf(s, sizeof s, "%u.%u.%u.%u", a & 0xFF, (a >> 8) & 0xFF, (a >> 16) & 0xFF, a >> 24);
+  PutStr(buf, s);
+  return buf;
+}
+// With no socket to be had, the calls that take one fail (WSAENETDOWN as
+// the rest), and select finds nothing ready.
+HLE_NAMED("wsock32.dll", "#1", wsock_accept, 3) { return SockFail(); }
+HLE_NAMED("wsock32.dll", "#4", wsock_connect, 3) { return SockFail(); }
+HLE_NAMED("wsock32.dll", "#6", wsock_getsockname, 3) { return SockFail(); }
+HLE_NAMED("wsock32.dll", "#13", wsock_listen, 2) { return SockFail(); }
+HLE_NAMED("wsock32.dll", "#16", wsock_recv, 4) { return SockFail(); }
+HLE_NAMED("wsock32.dll", "#18", wsock_select, 5) { return SockFail(); }
+HLE_NAMED("wsock32.dll", "#19", wsock_send, 4) { return SockFail(); }
+HLE_NAMED("wsock32.dll", "#22", wsock_shutdown, 2) { return SockFail(); }
+HLE_NAMED("wsock32.dll", "#112", wsock_WSASetLastError, 1) {
+  g_wsa_error = Arg(c, 0);
+  return 0;
+}
+// __WSAFDIsSet(socket, fd_set* {u_int count; SOCKET array[]}).
+HLE_NAMED("wsock32.dll", "#151", wsock___WSAFDIsSet, 2) {
+  gaddr set = Arg(c, 1);
+  uint32_t n = Rd32(set);
+  for (uint32_t i = 0; i < n && i < 64; i++)
+    if (Rd32(set + 4 + 4 * i) == Arg(c, 0)) return 1;
+  return 0;
 }
 
 }  // namespace

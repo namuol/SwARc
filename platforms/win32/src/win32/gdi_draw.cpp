@@ -23,6 +23,8 @@
 // - Stretching between bitmaps is nearest-neighbour whatever
 //   SetStretchBltMode asked for.
 
+#include <sys/stat.h>
+
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -1073,6 +1075,26 @@ HLE("gdi32.dll", CreateFontIndirectA, 1) {
 // (height, width, escapement, orientation, weight, italic, underline,
 // strikeout, charset, out precision, clip precision, quality, pitch and
 // family, face)
+// AddFontResource{,Ex}A(path[, flags, reserved]): the fonts in the file,
+// for this process (FR_PRIVATE or not: there are no other processes to see
+// them). The number of fonts added: 1 for a font file, 0 for anything else.
+uint32_t AddFontResource(const std::string& guest_path) {
+  struct stat st;
+  std::string host = HostPath(guest_path);
+  if (stat(host.c_str(), &st) != 0) return 0;
+  if (!AddPrivateFont(host)) {
+    WarnF("gdi32: AddFontResource(%s): not a font the host can use\n", guest_path.c_str());
+    return 0;
+  }
+  return 1;
+}
+HLE("gdi32.dll", AddFontResourceA, 1) { return AddFontResource(GStr(Arg(c, 0))); }
+HLE("gdi32.dll", AddFontResourceExA, 3) { return AddFontResource(GStr(Arg(c, 0))); }
+HLE("gdi32.dll", RemoveFontResourceA, 1) { return RemovePrivateFont(HostPath(GStr(Arg(c, 0)))) ? 1 : 0; }
+HLE("gdi32.dll", RemoveFontResourceExA, 3) {
+  return RemovePrivateFont(HostPath(GStr(Arg(c, 0)))) ? 1 : 0;
+}
+
 HLE("gdi32.dll", CreateFontA, 14) {
   std::lock_guard<std::recursive_mutex> l(g_mu);
   FontDesc f;

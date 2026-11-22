@@ -107,11 +107,14 @@ struct Surface final : com::Object {
 struct Texture final : com::Object {
   uint32_t device = 0;
   bool cube = false;  // IDirect3DCubeTexture9: six faces of levels each
-  uint32_t width = 0, height = 0, levels = 0, usage = 0, format = 0, pool = 0;
+  bool volume = false;  // IDirect3DVolumeTexture9: depth slices per level
+  uint32_t width = 0, height = 0, depth = 1, levels = 0, usage = 0, format = 0, pool = 0;
   gfx::Format fmt = gfx::Format::Unknown;
   gfx::TextureId tex = 0;  // none for SYSTEMMEM/SCRATCH
   struct Level {
     uint32_t w = 0, h = 0, pitch = 0, size = 0;
+    uint32_t d = 1, slice = 0;  // volume levels: depth and slice pitch (size = slice * d)
+    uint32_t locked_front = 0, locked_back = 0;  // volume levels: the locked box's depth
     uint32_t mem = 0;  // lock shadow, allocated on first lock
     bool locked = false;
     gfx::Rect locked_rect{};
@@ -173,6 +176,13 @@ struct Query final : com::Object {
 
 struct Device : com::Object {
   uint32_t d3d = 0;  // IDirect3D9 guest pointer
+  // The gamma ramp (D3DGAMMARAMP: 256 red, green and blue WORDs), as last
+  // set; identity until then. Not applied to the picture yet.
+  std::array<uint16_t, 3 * 256> gamma = [] {
+    std::array<uint16_t, 3 * 256> g{};
+    for (int i = 0; i < 3 * 256; i++) g[i] = uint16_t((i % 256) * 257);
+    return g;
+  }();
   guest::D3DDEVICE_CREATION_PARAMETERS creation{};
   guest::D3DPRESENT_PARAMETERS pp{};
   uint32_t hwnd = 0;

@@ -1526,10 +1526,16 @@ void r_color0(inout vec4 c) {
                               : want == hlsl::ParamType::Sampler3D ? dummy_3d_
                                                                    : dummy_2d_;
       sc.tex[r] = dummy;
+      // A texture of the kind the sampler declares (2D, cube or 3D); any
+      // other reads as the dummy, as an unbound one.
       auto it = textures_.find(d.textures[r]);
-      if (it != textures_.end() && it->second.cube == (want == hlsl::ParamType::SamplerCube) &&
-          want != hlsl::ParamType::Sampler3D)
-        sc.tex[r] = it->second.tex;
+      if (it != textures_.end()) {
+        const TextureKind k = it->second.cube ? TextureKind::Cube : it->second.kind;
+        const TextureKind w = want == hlsl::ParamType::SamplerCube ? TextureKind::Cube
+                              : want == hlsl::ParamType::Sampler3D ? TextureKind::Tex3D
+                                                                   : TextureKind::Tex2D;
+        if (k == w) sc.tex[r] = it->second.tex;
+      }
       SamplerKey sk = D3D9Sampler(d.sampler_states ? d.sampler_states[r] : nullptr);
 #if defined(__APPLE__)
       sk.lod_bias = 0;  // in the shader (R_BIAS)

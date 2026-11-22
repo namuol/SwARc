@@ -324,8 +324,8 @@ HLE("kernel32.dll", CreateMutexA, 3) {
 
 // OpenMutexA/OpenFileMappingA(access, inherit, name): a new handle to an
 // existing named object of that type.
-uint32_t OpenNamed(gaddr name_va, KObject::Type type) {
-  std::string name = NameOf(name_va);
+uint32_t OpenNamed(gaddr name_va, KObject::Type type, bool wide = false) {
+  std::string name = NameOf(name_va, wide);
   std::lock_guard<std::mutex> l(g_wait_mu);
   auto it = g_named.find(name);
   if (it == g_named.end() || it->second->type != type) {
@@ -337,6 +337,8 @@ uint32_t OpenNamed(gaddr name_va, KObject::Type type) {
 
 HLE("kernel32.dll", OpenMutexA, 3) { return OpenNamed(Arg(c, 2), KObject::Type::Mutex); }
 HLE("kernel32.dll", OpenEventA, 3) { return OpenNamed(Arg(c, 2), KObject::Type::Event); }
+HLE("kernel32.dll", OpenMutexW, 3) { return OpenNamed(Arg(c, 2), KObject::Type::Mutex, true); }
+HLE("kernel32.dll", OpenEventW, 3) { return OpenNamed(Arg(c, 2), KObject::Type::Event, true); }
 
 HLE("kernel32.dll", ReleaseMutex, 1) {
   GuestSyncPoint sync;
@@ -792,6 +794,14 @@ HLE("kernel32.dll", ExitThread, 1) {
 HLE("kernel32.dll", GetThreadPriority, 1) { return 0; }
 HLE("kernel32.dll", SetThreadPriority, 2) { return 1; }
 HLE("kernel32.dll", GetPriorityClass, 1) { return 0x20; }  // NORMAL
+// Priority boosts (a waiting thread's temporary raise) are the host
+// scheduler's business: reported as enabled, changes accepted.
+HLE("kernel32.dll", SetThreadPriorityBoost, 2) { return 1; }
+HLE("kernel32.dll", GetThreadPriorityBoost, 2) {
+  Wr32(Arg(c, 1), 0);
+  return 1;
+}
+HLE("kernel32.dll", SetProcessPriorityBoost, 2) { return 1; }
 HLE("kernel32.dll", SetPriorityClass, 2) { return 1; }
 
 // Affinity is bookkeeping only: guest threads are never pinned on the host
@@ -900,7 +910,10 @@ struct MappingObject : KObject {
 std::mutex g_views_mu;
 std::set<uint32_t> g_views;  // guest bases of file views
 
-HLE("kernel32.dll", CreateFileMappingA, 6) {
+uint32_t CreateFileMapping(Ctx& c, bool wide);
+HLE("kernel32.dll", CreateFileMappingA, 6) { return CreateFileMapping(c, false); }
+HLE("kernel32.dll", CreateFileMappingW, 6) { return CreateFileMapping(c, true); }
+uint32_t CreateFileMapping(Ctx& c, bool wide) {
   uint32_t file = Arg(c, 0), prot = Arg(c, 2), size_hi = Arg(c, 3),
            size_lo = Arg(c, 4), name = Arg(c, 5);
   auto m = std::make_shared<MappingObject>();
@@ -928,11 +941,14 @@ HLE("kernel32.dll", CreateFileMappingA, 6) {
     g_proc->vm.Commit(base, uint32_t(m->size), Prot::RW);
     m->anon_base = base;
   }
-  return CreateNamed(NameOf(name), [&] { return m; });
+  return CreateNamed(NameOf(name, wide), [&] { return m; });
 }
 
 HLE("kernel32.dll", OpenFileMappingA, 3) {
   return OpenNamed(Arg(c, 2), KObject::Type::Mapping);
+}
+HLE("kernel32.dll", OpenFileMappingW, 3) {
+  return OpenNamed(Arg(c, 2), KObject::Type::Mapping, true);
 }
 
 uint32_t MapView(uint32_t h, uint32_t access, uint32_t off_hi, uint32_t off_lo,

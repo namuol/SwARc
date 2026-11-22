@@ -454,7 +454,8 @@ HLE64("kernel32.dll", ExitProcess, 1) {
 HLE64("kernel32.dll", TerminateProcess, 2) {
   auto p = GetHandle(uint32_t(Arg(c, 0)));
   if (p && p->type == KObject::Type::Process) {
-    std::fprintf(stderr, "TerminateProcess(self, %u)\n", uint32_t(Arg(c, 1)));
+    std::fprintf(stderr, "TerminateProcess(self, %u) (return address %08X, guest thread %04X)\n",
+                 uint32_t(Arg(c, 1)), uint32_t(Rd32(c.esp)), CurrentThread()->tid);
     std::_Exit(int(Arg(c, 1)));
   }
   return 0;
@@ -1203,6 +1204,34 @@ HLE64("kernel32.dll", GetSystemTimeAsFileTime, 1) {
   Wr64(Arg(c, 0), uint64_t(ns / 100) + kFileTimeUnixEpoch);
   return 0;
 }
+
+// GetThreadTimes(thread, creation, exit, kernel, user) and
+// GetProcessTimes(process, ...): FILETIMEs. The CPU time is the host's:
+// the calling thread's own for the current thread (profilers time their
+// own work), the process's for the process and for any other thread
+// (host threads are not tracked by guest handle). Creation is the
+// process's start, exit 0 (still running); all CPU time counts as user.
+uint64_t CpuTime100ns(clockid_t clock) {
+  timespec ts;
+  clock_gettime(clock, &ts);
+  return uint64_t(ts.tv_sec) * 10000000 + uint64_t(ts.tv_nsec) / 100;
+}
+uint32_t PutTimes(Ctx& c, uint64_t cpu) {
+  using namespace std::chrono;
+  static const uint64_t start =
+      uint64_t(duration_cast<nanoseconds>(system_clock::now().time_since_epoch()).count() / 100) +
+      kFileTimeUnixEpoch;
+  if (Arg(c, 1)) Wr64(Arg(c, 1), start);
+  if (Arg(c, 2)) Wr64(Arg(c, 2), 0);
+  if (Arg(c, 3)) Wr64(Arg(c, 3), 0);
+  if (Arg(c, 4)) Wr64(Arg(c, 4), cpu);
+  return 1;
+}
+HLE("kernel32.dll", GetThreadTimes, 5) {
+  return PutTimes(c, CpuTime100ns(uint32_t(Arg(c, 0)) == 0xFFFFFFFE ? CLOCK_THREAD_CPUTIME_ID
+                                                                       : CLOCK_PROCESS_CPUTIME_ID));
+}
+HLE("kernel32.dll", GetProcessTimes, 5) { return PutTimes(c, CpuTime100ns(CLOCK_PROCESS_CPUTIME_ID)); }
 
 HLE("kernel32.dll", GetSystemTime, 1) {
   using namespace std::chrono;

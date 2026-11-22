@@ -466,6 +466,12 @@ HLE("d3d9.dll", D3DPERF_EndEvent, 0) {
   return uint32_t(g_perf_level);
 }
 
+// D3DPERF_SetOptions(1) asks PIX not to profile the program: there is no
+// PIX. D3DPERF_GetStatus: not being profiled.
+HLE("d3d9.dll", D3DPERF_SetOptions, 1) { return 0; }
+HLE("d3d9.dll", D3DPERF_GetStatus, 0) { return 0; }
+HLE("d3d9.dll", D3DPERF_SetMarker, 2) { return 0; }
+
 // ---- IDirect3D9 ------------------------------------------------------------------
 
 HLE_NAMED("d3d9.dll", "IDirect3D9::QueryInterface", D3D9_QueryInterface, 3) {
@@ -820,6 +826,26 @@ HLE_NAMED("d3d9.dll", "IDirect3DDevice9::GetBackBuffer", D3DDev9_GetBackBuffer, 
   com::AddRef(d->backbuffer->guest);
   Wr32(Arg(c, 4), d->backbuffer->guest);
   return D3D_OK;
+}
+
+// SetGammaRamp(swapchain, flags, D3DGAMMARAMP*) / GetGammaRamp(swapchain,
+// ramp*): kept, and read back; the picture is not corrected by it yet
+// (warned once for a ramp that is not the identity).
+HLE_NAMED("d3d9.dll", "IDirect3DDevice9::SetGammaRamp", D3DDev9_SetGammaRamp, 4) {
+  Device* d = Dev(c);
+  std::memcpy(d->gamma.data(), GPtr(Arg(c, 3)), sizeof d->gamma);
+  bool identity = true;
+  for (int i = 0; i < 3 * 256; i++) identity = identity && d->gamma[i] / 257 == i % 256;
+  static bool warned = false;
+  if (!identity && !warned) {
+    warned = true;
+    WarnF("d3d9: SetGammaRamp: a ramp other than the identity is not applied\n");
+  }
+  return 0;
+}
+HLE_NAMED("d3d9.dll", "IDirect3DDevice9::GetGammaRamp", D3DDev9_GetGammaRamp, 3) {
+  std::memcpy(GPtr(Arg(c, 2)), Dev(c)->gamma.data(), sizeof Dev(c)->gamma);
+  return 0;
 }
 
 HLE_NAMED("d3d9.dll", "IDirect3DDevice9::GetRasterStatus", D3DDev9_GetRasterStatus, 3) {

@@ -29,6 +29,11 @@ struct FontMetrics {
 
 FontMetrics MeasureFont(const FontDesc& f);
 
+// Makes the font file at host path `path` usable by face name for the
+// process (AddFontResource); false if it is not a font.
+bool AddPrivateFont(const std::string& path);
+bool RemovePrivateFont(const std::string& path);
+
 // Advance width of `n` bytes of text, in pixels.
 int TextWidth(const FontDesc& f, const char* s, int n);
 
