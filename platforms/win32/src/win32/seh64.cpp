@@ -234,10 +234,32 @@ void UnwindTo(Ctx& c, gaddr record, gaddr target_frame, gaddr target_ip, uint64_
 
 // ---- the Rtl* unwind functions ------------------------------------------------
 
+// RtlUnwindEx(target frame, target ip, record, return value, context,
+// history): the second pass of the exception being dispatched, to the
+// target frame. An unwind without one (a longjmp-style unwind) is not
+// supported yet.
+HLE64("kernel32.dll", RtlUnwindEx, 6) {
+  const gaddr frame = Arg(c, 0), ip = Arg(c, 1), record = Arg(c, 2);
+  if (!record || !Current())
+    FatalF("RtlUnwindEx(frame %08llX, ip %08llX) outside an exception dispatch: not supported",
+           (unsigned long long)frame, (unsigned long long)ip);
+  UnwindTo(c, record, frame, ip, Arg(c, 3));
+  return 0;
+}
+
 // RtlCaptureContext(ctx): the caller's state at the call.
 HLE64("kernel32.dll", RtlCaptureContext, 1) {
   WriteContext(Arg(c, 0), AtReturn(c), c);
   return 0;
+}
+
+// RtlPcToFileHeader(pc, &base): the base of the image holding pc (the EXE
+// or a lifted DLL), also the result; null for any other address.
+HLE64("kernel32.dll", RtlPcToFileHeader, 2) {
+  const PeImage* img = ImageAt(Arg(c, 0));
+  const gaddr base = img ? img->image_base : 0;
+  Wr64(Arg(c, 1), base);
+  return base;
 }
 
 // RtlLookupFunctionEntry(pc, &image_base, history)

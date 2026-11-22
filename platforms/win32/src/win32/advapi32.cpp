@@ -500,13 +500,29 @@ HLE("rpcrt4.dll", RpcStringFreeA, 1) {
   return 0;
 }
 
-HLE("ole32.dll", CoInitialize, 1) { return 0; }  // S_OK
-HLE("ole32.dll", CoInitializeEx, 2) { return 0; }
+HLE64("ole32.dll", CoInitialize, 1) { return 0; }  // S_OK
+HLE64("ole32.dll", CoInitializeEx, 2) { return 0; }
 // CoInitializeSecurity(desc, cAuth, auth, reserved, authn level, imp level,
 // auth list, caps, reserved): process-wide COM security for remote calls,
 // which never happen here.
 HLE("ole32.dll", CoInitializeSecurity, 9) { return 0; }  // S_OK
-HLE("ole32.dll", CoUninitialize, 0) { return 0; }
+HLE64("ole32.dll", CoUninitialize, 0) { return 0; }
+
+// PropVariantClear(PROPVARIANT*): frees what the variant owns (strings
+// are CoTaskMemAlloc'd, which is the process heap here) and empties it
+// (VT_EMPTY). 16 bytes, or 24 on x64.
+HLE64("ole32.dll", PropVariantClear, 1) {
+  const gaddr v = Arg(c, 0);
+  if (!v) return 0;
+  const uint16_t vt = Rd16(v);
+  if (vt == 30 || vt == 31) {  // VT_LPSTR, VT_LPWSTR
+    if (gaddr s = RdPtr(v + 8)) HeapFreeProcess(s);
+  } else if (vt > 21 && vt != 64) {  // beyond the plain scalars and FILETIME
+    WarnF("PropVariantClear: type %u left as it is\n", vt);
+  }
+  std::memset(GPtr(v), 0, g_proc->x64 ? 24 : 16);
+  return 0;
+}
 
 // The COM task allocator: the process heap (a NULL free is a no-op).
 HLE64("ole32.dll", CoTaskMemAlloc, 1) { return HeapAllocProcess(Arg(c, 0), false); }
@@ -618,7 +634,14 @@ bool InprocServer(Ctx& c, uint32_t clsid, uint32_t iid, uint32_t out, uint32_t* 
   return true;
 }
 
-HLE("ole32.dll", CoCreateInstance, 5) {
+// x64 guests get no COM classes yet (the class table and in-process servers
+// are 32-bit): every class is unregistered for them.
+HLE64("ole32.dll", CoCreateInstance, 5) {
+  if (g_proc->x64) {
+    WarnF("CoCreateInstance({%08X-...}): no COM classes for x64 guests yet\n", Rd32(Arg(c, 0)));
+    if (Arg(c, 4)) Wr64(Arg(c, 4), 0);
+    return 0x80040154;  // REGDB_E_CLASSNOTREG
+  }
   uint32_t clsid = Arg(c, 0), out = Arg(c, 4), hr_inproc = 0;
   if (com::CreateFn create = com::FindCoClass(clsid)) {
     uint32_t obj = 0;

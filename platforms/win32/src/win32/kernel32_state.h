@@ -43,7 +43,7 @@ std::vector<std::string> EnvironmentVars();
 void SetEnvironmentBlock(const std::vector<std::string>& vars);
 
 // SYSTEMTIME at guest address st from a broken-down time and milliseconds.
-void WriteSystemTime(uint32_t st, const std::tm& t, int ms);
+void WriteSystemTime(gaddr st, const std::tm& t, int ms);
 
 gaddr HeapAllocProcess(uint64_t size, bool zero);
 void HeapFreeProcess(gaddr p);

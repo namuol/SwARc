@@ -293,7 +293,7 @@ HLE("kernel32.dll", EnumResourceLanguagesA, 5) {
 // ---- time --------------------------------------------------------------------------
 
 // SYSTEMTIME at st as a broken-down time (milliseconds dropped).
-std::tm ReadSystemTime(uint32_t st) {
+std::tm ReadSystemTime(gaddr st) {
   std::tm t{};
   t.tm_year = Rd16(st) - 1900;
   t.tm_mon = Rd16(st + 2) - 1;
@@ -344,8 +344,8 @@ HLE("kernel32.dll", FileTimeToSystemTime, 2) {
   return 1;
 }
 
-HLE("kernel32.dll", SystemTimeToFileTime, 2) {
-  uint32_t st = Arg(c, 0);
+HLE64("kernel32.dll", SystemTimeToFileTime, 2) {
+  gaddr st = Arg(c, 0);
   std::tm t = ReadSystemTime(st);
   time_t secs = timegm(&t);
   Wr64(Arg(c, 1),
@@ -374,7 +374,7 @@ HLE("kernel32.dll", SystemTimeToTzSpecificLocalTime, 3) {
 }
 
 // The SYSTEMTIME a Get*Format call formats; null means now (local).
-std::tm TmFromSystemTime(uint32_t st) {
+std::tm TmFromSystemTime(gaddr st) {
   if (st) return ReadSystemTime(st);
   std::tm t{};
   time_t now = time(nullptr);
@@ -443,17 +443,18 @@ HLE("kernel32.dll", VerLanguageNameA, 3) {
   return uint32_t(n.size());
 }
 
-HLE("kernel32.dll", FormatMessageA, 7) {
-  uint32_t flags = Arg(c, 0), id = Arg(c, 2), buf = Arg(c, 4), cap = Arg(c, 5);
+HLE64("kernel32.dll", FormatMessageA, 7) {
+  uint32_t flags = uint32_t(Arg(c, 0)), id = uint32_t(Arg(c, 2)), cap = uint32_t(Arg(c, 5));
+  gaddr buf = Arg(c, 4);
   if (!(flags & 0x1000)) {  // only FORMAT_MESSAGE_FROM_SYSTEM
     WarnF("FormatMessageA(flags %X): only FROM_SYSTEM is supported\n", flags);
     return 0;
   }
   std::string s = "Error " + std::to_string(id) + ".\r\n";
   if (flags & 0x100) {  // FORMAT_MESSAGE_ALLOCATE_BUFFER
-    uint32_t p = HeapAllocProcess(uint32_t(s.size() + 1), false);
+    gaddr p = HeapAllocProcess(s.size() + 1, false);
     PutStr(p, s);
-    Wr32(buf, p);
+    WrPtr(buf, p);
     return uint32_t(s.size());
   }
   if (s.size() + 1 > cap) return 0;
@@ -462,17 +463,18 @@ HLE("kernel32.dll", FormatMessageA, 7) {
 }
 
 // The same in WCHARs; `cap` counts WCHARs.
-HLE("kernel32.dll", FormatMessageW, 7) {
-  uint32_t flags = Arg(c, 0), id = Arg(c, 2), buf = Arg(c, 4), cap = Arg(c, 5);
+HLE64("kernel32.dll", FormatMessageW, 7) {
+  uint32_t flags = uint32_t(Arg(c, 0)), id = uint32_t(Arg(c, 2)), cap = uint32_t(Arg(c, 5));
+  gaddr buf = Arg(c, 4);
   if (!(flags & 0x1000)) {  // only FORMAT_MESSAGE_FROM_SYSTEM
     WarnF("FormatMessageW(flags %X): only FROM_SYSTEM is supported\n", flags);
     return 0;
   }
   std::string s = "Error " + std::to_string(id) + ".\r\n";
   if (flags & 0x100) {  // FORMAT_MESSAGE_ALLOCATE_BUFFER
-    uint32_t p = HeapAllocProcess(uint32_t(2 * (s.size() + 1)), false);
+    gaddr p = HeapAllocProcess(2 * (s.size() + 1), false);
     PutWStr(p, s);
-    Wr32(buf, p);
+    WrPtr(buf, p);
     return uint32_t(s.size());
   }
   if (s.size() + 1 > cap) return 0;
@@ -701,9 +703,68 @@ HLE("version.dll", VerQueryValueW, 4) {
 // ---- odds and ends ---------------------------------------------------------------
 
 // File APIs take ANSI (code page) strings, not OEM ones.
-HLE("kernel32.dll", AreFileApisANSI, 0) { return 1; }
+HLE64("kernel32.dll", AreFileApisANSI, 0) { return 1; }
 
-HLE("kernel32.dll", OutputDebugStringW, 1) {
+// GetLogicalProcessorInformationEx(relationship, buffer, &length): the
+// processors the guest sees (GuestProcessorCount) as one package and NUMA
+// node in one group, each its own core with one logical processor. Records
+// are SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX {DWORD Relationship, Size;
+// ...}: a core or package (PROCESSOR_RELATIONSHIP, 48 bytes with its one
+// GROUP_AFFINITY {KAFFINITY Mask; WORD Group;}), a NUMA node (48), the group
+// (GROUP_RELATIONSHIP, 80). No cache records. RelationAll (0xFFFF) gives
+// every kind. Too small a buffer: FALSE, ERROR_INSUFFICIENT_BUFFER and the
+// size needed.
+HLE64("kernel32.dll", GetLogicalProcessorInformationEx, 3) {
+  const uint32_t rel = uint32_t(Arg(c, 0));
+  const gaddr buf = Arg(c, 1), len = Arg(c, 2);
+  const uint32_t n = std::min<uint32_t>(GuestProcessorCount(), 64);
+  const uint64_t all = n == 64 ? ~0ull : (1ull << n) - 1;
+  std::vector<uint8_t> out;
+  auto record = [&](uint32_t type, uint32_t size) {
+    size_t at = out.size();
+    out.resize(at + size, 0);
+    std::memcpy(&out[at], &type, 4);
+    std::memcpy(&out[at + 4], &size, 4);
+    return at + 8;
+  };
+  auto put16 = [&](size_t at, uint16_t v) { std::memcpy(&out[at], &v, 2); };
+  auto put64 = [&](size_t at, uint64_t v) { std::memcpy(&out[at], &v, 8); };
+  const bool every = rel == 0xFFFF;
+  if (every || rel == 0)  // RelationProcessorCore
+    for (uint32_t i = 0; i < n; i++) {
+      size_t r = record(0, 48);
+      put16(r + 22, 1);       // GroupCount
+      put64(r + 24, 1ull << i);  // GroupMask[0].Mask
+    }
+  if (every || rel == 1) {  // RelationNumaNode
+    size_t r = record(1, 48);
+    put16(r + 22, 1);
+    put64(r + 24, all);
+  }
+  if (every || rel == 3) {  // RelationProcessorPackage
+    size_t r = record(3, 48);
+    put16(r + 22, 1);
+    put64(r + 24, all);
+  }
+  if (every || rel == 4) {  // RelationGroup
+    size_t r = record(4, 80);
+    put16(r + 0, 1);  // MaximumGroupCount
+    put16(r + 2, 1);  // ActiveGroupCount
+    out[r + 24] = uint8_t(n);  // MaximumProcessorCount
+    out[r + 25] = uint8_t(n);  // ActiveProcessorCount
+    put64(r + 64, all);        // ActiveProcessorMask
+  }
+  const uint32_t have = len ? Rd32(len) : 0;
+  if (len) Wr32(len, uint32_t(out.size()));
+  if (!buf || have < out.size()) {
+    SetLastError(kErrorInsufficientBuffer);
+    return 0;
+  }
+  std::memcpy(GPtr(buf), out.data(), out.size());
+  return 1;
+}
+
+HLE64("kernel32.dll", OutputDebugStringW, 1) {
   std::fprintf(stderr, "[guest] %s", Narrow(GWStr(Arg(c, 0))).c_str());
   return 0;
 }

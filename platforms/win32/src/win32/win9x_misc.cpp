@@ -46,12 +46,14 @@ HLE("kernel32.dll", lstrlenW, 1) {
 // GetDiskFreeSpaceA(root, &sectors_per_cluster, &bytes_per_sector,
 // &free_clusters, &total_clusters): a 2 GB disk with 1 GB free, the most a
 // FAT32-era API reports without overflowing callers' arithmetic.
-HLE("kernel32.dll", GetDiskFreeSpaceA, 5) {
+uint64_t GetDiskFreeSpace(Ctx& c) {
   const uint32_t v[4] = {8, 512, (1u << 30) / 4096, (2u << 30) / 4096 - 1};
   for (int i = 0; i < 4; i++)
     if (Arg(c, i + 1)) Wr32(Arg(c, i + 1), v[i]);
   return 1;
 }
+HLE64("kernel32.dll", GetDiskFreeSpaceA, 5) { return GetDiskFreeSpace(c); }
+HLE64("kernel32.dll", GetDiskFreeSpaceW, 5) { return GetDiskFreeSpace(c); }
 
 // DosDateTimeToFileTime(date, time, FILETIME*): local time, as FAT stores it.
 HLE("kernel32.dll", DosDateTimeToFileTime, 3) {
@@ -74,7 +76,7 @@ HLE("kernel32.dll", FatalAppExitA, 2) {
   FatalF("FatalAppExit: %s", GStr(Arg(c, 1)).c_str());
 }
 
-HLE("kernel32.dll", HeapValidate, 3) { return 1; }
+HLE64("kernel32.dll", HeapValidate, 3) { return 1; }
 
 // Consoles: none is attached; output goes to stderr.
 HLE("kernel32.dll", AllocConsole, 0) { return 1; }
@@ -197,7 +199,7 @@ HLE("shell32.dll", FindExecutableA, 3) {
 }
 
 // timeGetDevCaps(TIMECAPS*, size): 1 ms to 1,000,000 ms.
-HLE("winmm.dll", timeGetDevCaps, 2) {
+HLE64("winmm.dll", timeGetDevCaps, 2) {
   Wr32(Arg(c, 0), 1);
   Wr32(Arg(c, 0) + 4, 1000000);
   return 0;
@@ -224,15 +226,15 @@ HLE("ole32.dll", CoFileTimeNow, 1) {
 }
 
 // StringFromCLSID(clsid, LPOLESTR*): "{XXXXXXXX-XXXX-...}" in task memory.
-HLE("ole32.dll", StringFromCLSID, 2) {
-  uint32_t g = Arg(c, 0);
+HLE64("ole32.dll", StringFromCLSID, 2) {
+  gaddr g = Arg(c, 0);
   char s[40];
   std::snprintf(s, sizeof s, "{%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}", Rd32(g),
                 Rd16(g + 4), Rd16(g + 6), Rd8(g + 8), Rd8(g + 9), Rd8(g + 10), Rd8(g + 11),
                 Rd8(g + 12), Rd8(g + 13), Rd8(g + 14), Rd8(g + 15));
-  uint32_t out = HeapAllocProcess(2 * 39, false);
+  gaddr out = HeapAllocProcess(2 * 39, false);
   for (int i = 0; i < 39; i++) Wr16(out + 2 * uint32_t(i), uint8_t(s[i]));
-  Wr32(Arg(c, 1), out);
+  WrPtr(Arg(c, 1), out);
   return 0;
 }
 
