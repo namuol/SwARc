@@ -82,6 +82,13 @@ using Event = std::array<uint8_t, 56>;  // SDL2's SDL_Event
 std::mutex g_ev_mu;
 std::deque<Event> g_events;
 
+// SDL_AddEventWatch's filters (guest SDL_EventFilter, userdata), and the
+// events they have yet to see. SDL2 calls a watch as each event is added;
+// here they are called from the next SDL_PumpEvents or SDL_PollEvent, on
+// the guest thread that pumps (where SDL2 adds most of its events too).
+std::vector<std::pair<gaddr, gaddr>> g_watches;
+std::deque<Event> g_watch_pending;
+
 // SDL2 event types.
 enum : uint32_t {
   kQuit = 0x100, kDisplayEvent = 0x150, kWindowEvent = 0x200, kKeyDown = 0x300,
@@ -139,6 +146,7 @@ struct Builder {
   void Push() {
     std::lock_guard<std::mutex> l(g_ev_mu);
     g_events.push_back(e);
+    if (!g_watches.empty()) g_watch_pending.push_back(e);
   }
 };
 
@@ -575,8 +583,44 @@ HLE64(kDll, SDL_GetWindowWMInfo, kCdecl) {
 
 // ---- events ---------------------------------------------------------------------------
 
+// Shows the events added since the last call to each event watch.
+void RunWatches(Ctx& c) {
+  for (;;) {
+    std::vector<std::pair<gaddr, gaddr>> watches;
+    Event e;
+    {
+      std::lock_guard<std::mutex> l(g_ev_mu);
+      if (g_watch_pending.empty()) return;
+      e = g_watch_pending.front();
+      g_watch_pending.pop_front();
+      watches = g_watches;
+    }
+    static thread_local gaddr buf = 0;
+    if (!buf) buf = HeapAllocProcess(56, false);
+    for (auto [filter, userdata] : watches) {
+      std::memcpy(GPtr(buf), e.data(), 56);
+      CallGuest(c, filter, {userdata, buf});
+    }
+  }
+}
+
+HLE64(kDll, SDL_AddEventWatch, kCdecl) {
+  std::lock_guard<std::mutex> l(g_ev_mu);
+  g_watches.push_back({Arg(c, 0), Arg(c, 1)});
+  return 0;
+}
+
+HLE64(kDll, SDL_DelEventWatch, kCdecl) {
+  std::lock_guard<std::mutex> l(g_ev_mu);
+  auto it = std::find(g_watches.begin(), g_watches.end(), std::pair{Arg(c, 0), Arg(c, 1)});
+  if (it != g_watches.end()) g_watches.erase(it);
+  if (g_watches.empty()) g_watch_pending.clear();
+  return 0;
+}
+
 HLE64(kDll, SDL_PumpEvents, kCdecl) {
   PumpHostEvents();
+  RunWatches(c);
   return 0;
 }
 
@@ -584,6 +628,7 @@ HLE64(kDll, SDL_PumpEvents, kCdecl) {
 // event, only tells whether there is one).
 HLE64(kDll, SDL_PollEvent, kCdecl) {
   PumpHostEvents();
+  RunWatches(c);
   std::lock_guard<std::mutex> l(g_ev_mu);
   if (g_events.empty()) return 0;
   if (gaddr out = Arg(c, 0)) {
@@ -700,6 +745,96 @@ HLE64(kDll, SDL_JoystickInstanceID, kCdecl) {
   SDL_JoystickID id = SDL_GetJoystickID(JoyOf(Arg(c, 0), "SDL_JoystickInstanceID"));
   return id ? id : uint32_t(-1);
 }
+
+// SDL_JoystickOpen(index): a joystick block as SDL_GameControllerGetJoystick's.
+HLE64(kDll, SDL_JoystickOpen, kCdecl) {
+  SDL_JoystickID id = DeviceAt(int(int32_t(Arg(c, 0))));
+  SDL_Joystick* joy = id ? SDL_OpenJoystick(id) : nullptr;
+  if (!joy) return 0;
+  std::lock_guard<std::mutex> l(g_pad_mu);
+  for (auto& [j, h] : g_joys)
+    if (h == joy) return j;
+  gaddr j = HeapAllocProcess(16, true);
+  g_joys[j] = joy;
+  return j;
+}
+
+HLE64(kDll, SDL_JoystickClose, kCdecl) {
+  gaddr j = Arg(c, 0);
+  if (!j) return 0;
+  SDL_Joystick* joy = JoyOf(j, "SDL_JoystickClose");
+  std::lock_guard<std::mutex> l(g_pad_mu);
+  // A controller's own joystick block stays with the controller.
+  for (auto& [gc, p] : g_pads)
+    if (p.joystick == j) return 0;
+  SDL_CloseJoystick(joy);
+  g_joys.erase(j);
+  HeapFreeProcess(j);
+  return 0;
+}
+
+// SDL_JoystickNameForIndex(index): a guest copy, kept per device index.
+HLE64(kDll, SDL_JoystickNameForIndex, kCdecl) {
+  int i = int(int32_t(Arg(c, 0)));
+  SDL_JoystickID id = DeviceAt(i);
+  if (!id) return 0;
+  const char* name = SDL_GetJoystickNameForID(id);
+  static std::mutex mu;
+  static std::map<int, gaddr> names;
+  std::lock_guard<std::mutex> l(mu);
+  gaddr& g = names[i];
+  if (g) HeapFreeProcess(g);
+  std::string n = name ? name : "";
+  g = HeapAllocProcess(n.size() + 1, false);
+  PutStr(g, n);
+  return g;
+}
+
+// SDL_JoystickGUID SDL_JoystickGetDeviceGUID(index): 16 bytes, returned
+// through a hidden pointer (the first argument) on both 32-bit and x64.
+HLE64(kDll, SDL_JoystickGetDeviceGUID, kCdecl) {
+  gaddr out = Arg(c, 0);
+  SDL_GUID g{};
+  if (SDL_JoystickID id = DeviceAt(int(int32_t(Arg(c, 1))))) g = SDL_GetJoystickGUIDForID(id);
+  std::memcpy(GPtr(out), g.data, 16);
+  return out;
+}
+
+// SDL_JoystickGetGUIDString(SDL_JoystickGUID, char* buf, int size): the
+// GUID by value, on the stack in four dwords for 32-bit guests, by
+// reference for x64 ones.
+HLE64(kDll, SDL_JoystickGetGUIDString, kCdecl) {
+  SDL_GUID g;
+  int next;
+  if (g_proc->x64) {
+    std::memcpy(g.data, GPtr(Arg(c, 0)), 16);
+    next = 1;
+  } else {
+    for (int i = 0; i < 4; i++) {
+      uint32_t v = uint32_t(Arg(c, i));
+      std::memcpy(g.data + 4 * i, &v, 4);
+    }
+    next = 4;
+  }
+  gaddr buf = Arg(c, next);
+  int size = int(int32_t(Arg(c, next + 1)));
+  if (!buf || size <= 0) return 0;
+  char s[33];
+  SDL_GUIDToString(g, s, sizeof s);
+  std::string str(s);
+  PutStr(buf, str.substr(0, size_t(size - 1)));
+  return 0;
+}
+
+// Haptics: none (SDL2's rumble for controllers is SDL_GameControllerRumble).
+HLE64(kDll, SDL_HapticOpenFromJoystick, kCdecl) {
+  SDL_SetError("Haptic: joystick isn't a haptic device");
+  return 0;
+}
+HLE64(kDll, SDL_HapticClose, kCdecl) { return 0; }
+HLE64(kDll, SDL_HapticRumbleInit, kCdecl) { return uint32_t(-1); }
+HLE64(kDll, SDL_HapticRumblePlay, kCdecl) { return uint32_t(-1); }
+HLE64(kDll, SDL_HapticRumbleStop, kCdecl) { return uint32_t(-1); }
 
 HLE64(kDll, SDL_GameControllerName, kCdecl) {
   PadOf(Arg(c, 0), "SDL_GameControllerName");

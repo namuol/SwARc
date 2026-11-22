@@ -38,8 +38,9 @@ bool JoinThread(uint32_t h, uint32_t* exit_code);
 // is 10 MHz) since the process started.
 uint64_t PerfCounter();
 
-// The process environment, as NAME=value strings.
+// The process environment, as NAME=value strings, and its replacement.
 std::vector<std::string> EnvironmentVars();
+void SetEnvironmentBlock(const std::vector<std::string>& vars);
 
 // SYSTEMTIME at guest address st from a broken-down time and milliseconds.
 void WriteSystemTime(uint32_t st, const std::tm& t, int ms);
