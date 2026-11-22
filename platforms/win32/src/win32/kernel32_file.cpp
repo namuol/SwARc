@@ -84,8 +84,16 @@ std::vector<std::string> Components(const std::string& p) {
 // Absolute, normalised guest path: "C:\x\y".
 std::string AbsGuest(std::string p) {
   std::replace(p.begin(), p.end(), '/', '\\');
-  if (p.size() >= 2 && p[1] == ':') {
-    if (p.size() == 2) p += '\\';
+  if (p.size() >= 2 && p[1] == ':' && (p.size() == 2 || p[2] != '\\')) {
+    // Drive-relative ("C:", "C:.\x", "C:x"): against the current directory
+    // when it is on that drive, else the drive's root (C: is the only one).
+    std::string cwd = GuestCurrentDir();
+    std::string rest = p.substr(2);
+    if (std::toupper(uint8_t(p[0])) == std::toupper(uint8_t(cwd[0])))
+      p = cwd + (rest.empty() ? "" : "\\" + rest);
+    else
+      p = p.substr(0, 2) + "\\" + rest;
+  } else if (p.size() >= 2 && p[1] == ':') {
   } else if (!p.empty() && p[0] == '\\') {
     p = "C:" + p;
   } else {
@@ -1112,6 +1120,7 @@ uint32_t FindFirst(const std::string& guest_pattern, uint32_t fd, bool wide) {
     }
     closedir(d);
   }
+  RECOMP_TRACE("  FindFirst %s: %zu found\n", pattern.c_str(), f->entries.size());
   if (f->entries.empty()) {
     SetLastError(kErrorFileNotFound);
     return kInvalidHandle;
