@@ -567,6 +567,20 @@ class GpuDevice final : public Device {
 
   // ---- swap chain
 
+  bool SetWindow(SDL_Window* w) override {
+    std::lock_guard<std::recursive_mutex> l(mu_);
+    if (w == window_) return true;
+    Flush();
+    if (window_) SDL_ReleaseWindowFromGPUDevice(dev_, window_);
+    window_ = w;
+    if (window_ && !SDL_ClaimWindowForGPUDevice(dev_, window_)) {
+      WarnF("gfx: SDL_ClaimWindowForGPUDevice: %s\n", SDL_GetError());
+      window_ = nullptr;
+      return false;
+    }
+    return true;
+  }
+
   void ResetSwapChain(int w, int h, bool vsync) override {
     std::lock_guard<std::recursive_mutex> l(mu_);
     Flush();
@@ -932,6 +946,14 @@ class GpuDevice final : public Device {
 
   void StretchRect(ColorTarget src, const Rect& sr, ColorTarget dst, const Rect& dr,
                    bool linear) override {
+    Stretch(src, sr, dst, dr, linear, false);
+  }
+  void StretchRectFlipped(ColorTarget src, const Rect& sr, ColorTarget dst, const Rect& dr,
+                          bool linear) override {
+    Stretch(src, sr, dst, dr, linear, true);
+  }
+  void Stretch(ColorTarget src, const Rect& sr, ColorTarget dst, const Rect& dr, bool linear,
+               bool flip) {
     std::lock_guard<std::recursive_mutex> l(mu_);
     auto target = [&](ColorTarget t, int* w, int* h) -> SDL_GPUTexture* {
       if (!t.tex) {
@@ -970,6 +992,7 @@ class GpuDevice final : public Device {
     bi.destination.h = Uint32(b.bottom - b.top);
     bi.load_op = SDL_GPU_LOADOP_LOAD;
     bi.filter = linear ? SDL_GPU_FILTER_LINEAR : SDL_GPU_FILTER_NEAREST;
+    if (flip) bi.flip_mode = SDL_FLIP_VERTICAL;
     SDL_BlitGPUTexture(cmd, &bi);
     Submit(cmd);
   }
@@ -5025,10 +5048,20 @@ void r_color0(inout vec4 c) {
       if (!GlslToSpirv(i ? kFs : kVs, i ? ShaderStage::Fragment : ShaderStage::Vertex, &spirv, &log))
         FatalF("gfx: the present shader: %s", log.c_str());
       SDL_GPUShaderCreateInfo si{};
+#if defined(__APPLE__)
+      // Metal takes MSL (binding numbers kept: texture 0, uniform buffer 0).
+      std::string msl;
+      if (!SpirvToMsl(spirv, &msl, &log)) FatalF("gfx: the present shader: %s", log.c_str());
+      si.code = reinterpret_cast<const Uint8*>(msl.c_str());
+      si.code_size = msl.size();
+      si.entrypoint = "main0";
+      si.format = SDL_GPU_SHADERFORMAT_MSL;
+#else
       si.code = reinterpret_cast<const Uint8*>(spirv.data());
       si.code_size = spirv.size() * 4;
       si.entrypoint = "main";
       si.format = SDL_GPU_SHADERFORMAT_SPIRV;
+#endif
       si.stage = i ? SDL_GPU_SHADERSTAGE_FRAGMENT : SDL_GPU_SHADERSTAGE_VERTEX;
       si.num_samplers = i ? 1 : 0;
       si.num_uniform_buffers = i ? 1 : 0;

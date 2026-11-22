@@ -408,6 +408,12 @@ class Device {
   // or nearest filtering (Direct3D 9's StretchRect).
   virtual void StretchRect(ColorTarget src, const Rect& sr, ColorTarget dst, const Rect& dr,
                            bool linear) = 0;
+  // StretchRect upside down: the source's first row becomes the
+  // destination's last (between targets whose rows run in opposite
+  // directions, as a GL front end's window and framebuffer objects do).
+  // Backends without it copy unflipped and warn once.
+  virtual void StretchRectFlipped(ColorTarget src, const Rect& sr, ColorTarget dst, const Rect& dr,
+                                  bool linear);
 
   // ---- 2D (DirectDraw Blt onto the back buffer / render target)
   // Copies `src_rect` of a linear image into `dst_rect` of the current
@@ -506,6 +512,11 @@ class Device {
   // green, then blue 16-bit values, applied to what is shown (not to what
   // is read back), as a display's lookup table does. The identity: none.
   virtual void SetGammaRamp(const uint16_t ramp[3 * 256]);
+  // Presents to `window` from now on instead of the window the device was
+  // made for (a GL share group's device follows the window being drawn;
+  // ResetSwapChain then sizes its back buffer). Backends that cannot move
+  // their swap chain report false.
+  virtual bool SetWindow(SDL_Window* window);
   virtual uint64_t WritesQueued();
   virtual uint64_t LandWrites(bool wait);
   // Occlusion queries (Direct3D 9's): the shader draws between
