@@ -353,7 +353,7 @@ struct BytesHash {
 
 struct SamplerKey {
   uint8_t min, mag, mip, u, v, aniso;
-  uint8_t w, pad;
+  uint8_t w, pad;  // pad: 1 for a shadow map's comparison sampler
   float lod_bias, min_lod;
   bool operator<(const SamplerKey& o) const { return std::memcmp(this, &o, sizeof *this) < 0; }
 };
@@ -1207,10 +1207,13 @@ class GpuDevice final : public Device {
     int32_t occl[4];  // the occlusion query's counter (r_oq), in a counting variant
   };
 
-  // occl: a pixel shader's occlusion-counting variant (Occlusion below):
-  // early depth and stencil tests, and R_OCCL_COUNT, which the translated
-  // shader calls last, adds 1 to the query's counter.
-  static std::string Prelude(hlsl::Stage stage, uint32_t samplers, bool occl = false) {
+  // A pixel shader's variant (Variant below): occl, occlusion counting
+  // (early depth and stencil tests, and R_OCCL_COUNT, which the translated
+  // shader calls last, adds 1 to the query's counter); shadow, a bit per
+  // sampler register with a depth texture bound (R_SHADOW_n: a shadow map
+  // comparison sampler).
+  static std::string Prelude(hlsl::Stage stage, uint32_t samplers, bool occl = false,
+                             uint32_t shadow = 0) {
 #if defined(__APPLE__)
     const bool metal = true;
 #else
@@ -1290,6 +1293,8 @@ vec4 r_position(vec4 p) {
       p += "layout(std140, " + binding(3, 2) +
            ") uniform r_ps_state { ivec4 r_alpha; vec4 r_bias[4]; vec4 r_fogc; vec4 r_fogp;"
            " ivec4 r_fogm; ivec4 r_srgb; ivec4 r_occl; };\n";
+      for (uint32_t r = 0; r < 16; r++)
+        if (shadow & (1u << r)) p += "#define R_SHADOW_" + std::to_string(r) + "\n";
       if (occl) {
         p += "layout(early_fragment_tests) in;\n";
         p += "layout(std430, " + binding(2, metal ? 3 : int(samplers)) +
@@ -1376,16 +1381,16 @@ void r_color0(inout vec4 c) {
     }
     bool vertex = prog.stage == hlsl::Stage::Vertex;
     if (!vertex) sh.glsl = prog.glsl;  // for its occlusion-counting variant
-    sh.sh = CompileShader(prog.stage, sh.samplers, prog.glsl, false);
+    sh.sh = CompileShader(prog.stage, sh.samplers, prog.glsl, false, 0);
     ShaderId id = next_id_++;
     shaders_[id] = std::move(sh);
     return id;
   }
 
   SDL_GPUShader* CompileShader(hlsl::Stage stage, uint32_t samplers, const std::string& body,
-                               bool occl) {
+                               bool occl, uint32_t shadow) {
     bool vertex = stage == hlsl::Stage::Vertex;
-    std::string glsl = "#version 450\n" + Prelude(stage, samplers, occl) + body;
+    std::string glsl = "#version 450\n" + Prelude(stage, samplers, occl, shadow) + body;
     // Dev aid: <ID>_SHADER_DUMP=DIR writes each translated shader's GLSL
     // there, as vs_NNNNN.glsl / ps_NNNNN.glsl in creation order.
     if (const char* dir = Env("SHADER_DUMP")) {
@@ -1426,15 +1431,20 @@ void r_color0(inout vec4 c) {
     return sh;
   }
 
-  // A pixel shader's occlusion-counting variant, made on first use.
-  ShaderId OcclVariant(ShaderId ps) {
+  // A pixel shader's variant (Prelude's occl and shadow), made on first
+  // use; the shader itself for neither.
+  ShaderId Variant(ShaderId ps, bool occl, uint32_t shadow) {
+    if (!occl && !shadow) return ps;
     Shader& sh = shaders_.at(ps);
-    if (sh.occl) return sh.occl;
+    const uint32_t key = shadow << 1 | (occl ? 1 : 0);
+    auto it = sh.variants.find(key);
+    if (it != sh.variants.end()) return it->second;
     Shader v = sh;
     v.glsl.clear();
-    v.sh = CompileShader(sh.stage, sh.samplers, sh.glsl, true);
+    v.variants.clear();
+    v.sh = CompileShader(sh.stage, sh.samplers, sh.glsl, occl, shadow);
     ShaderId id = next_id_++;
-    sh.occl = id;
+    sh.variants[key] = id;
     shaders_[id] = std::move(v);
     return id;
   }
@@ -1453,10 +1463,11 @@ void r_color0(inout vec4 c) {
         ++p;
       }
     }
-    const ShaderId variant = it->second.occl;
+    std::vector<ShaderId> variants;
+    for (const auto& [k, v] : it->second.variants) variants.push_back(v);
     SDL_ReleaseGPUShader(dev_, it->second.sh);
     shaders_.erase(it);
-    if (variant) DestroyShader(variant);
+    for (ShaderId v : variants) DestroyShader(v);
   }
 
   void DrawShader(const ShaderDraw& d) override {
@@ -1495,9 +1506,8 @@ void r_color0(inout vec4 c) {
     k.front = SDL_GPU_FRONTFACE_CLOCKWISE;
     for (int i = 1; i < 4; i++) k.mask[i - 1] = i < pass_targets_ ? uint8_t(state.rs[189 + i] & 0xF) : 0;
     sc.key.vs = d.vs;
-    sc.key.ps = d.ps;
+    sc.key.ps = d.ps;  // or its variant (below, after the samplers)
     if (occl_open_) {
-      sc.key.ps = OcclVariant(d.ps);
       sc.occl = true;
       occl_draws_ = true;
     }
@@ -1604,6 +1614,7 @@ void r_color0(inout vec4 c) {
     PushUniform(sc, 5, &pst, sizeof pst);
 
     // Samplers: pixel 0-15 at 0-15, vertex 0-3 at 16-19.
+    uint32_t shadow = 0;  // pixel sampler registers reading a depth buffer
     sc.nps = ps.samplers;
     sc.nvs = vs.samplers;
     for (uint32_t r = 0; r < 20; r++) {
@@ -1617,8 +1628,24 @@ void r_color0(inout vec4 c) {
                                                                    : dummy_2d_;
       sc.tex[r] = dummy;
       // A texture of the kind the sampler declares (2D, cube or 3D); any
-      // other reads as the dummy, as an unbound one.
+      // other reads as the dummy, as an unbound one. A depth buffer in a
+      // pixel shader's 2D sampler: a shadow map (Variant's shadow).
       auto it = textures_.find(d.textures[r]);
+      auto dit = it == textures_.end() && !vertex && want == hlsl::ParamType::Sampler2D
+                     ? depths_.find(d.textures[r])
+                     : depths_.end();
+      if (dit != depths_.end()) {
+        sc.tex[r] = dit->second.tex;
+        shadow |= 1u << reg;
+        SamplerKey sk = D3D9Sampler(d.sampler_states ? d.sampler_states[r] : nullptr);
+        sk.pad = 1;  // comparing
+        sk.mip = 0xFF;
+#if defined(__APPLE__)
+        sk.lod_bias = 0;
+#endif
+        sc.smp[r] = Sampler(sk);
+        continue;
+      }
       if (it != textures_.end()) {
         const TextureKind k = it->second.cube ? TextureKind::Cube : it->second.kind;
         const TextureKind w = want == hlsl::ParamType::SamplerCube ? TextureKind::Cube
@@ -1632,6 +1659,7 @@ void r_color0(inout vec4 c) {
 #endif
       sc.smp[r] = Sampler(sk);
     }
+    sc.key.ps = Variant(d.ps, sc.occl, shadow);
     ShaderPipeline(sc.key);
     c.shader = int(shader_cmds_.size());
     shader_cmds_.push_back(sc);
@@ -2384,8 +2412,8 @@ void r_color0(inout vec4 c) {
     std::array<hlsl::ParamType, 16> sampler_type{};  // per register; Void if unused
     uint32_t samplers = 0;  // highest register used + 1
     uint32_t float_regs = 0;
-    std::string glsl;    // a pixel shader's translation (for its variant)
-    ShaderId occl = 0;   // its occlusion-counting variant, once made
+    std::string glsl;    // a pixel shader's translation (for its variants)
+    std::map<uint32_t, ShaderId> variants;  // Variant's, by shadow << 1 | occl
   };
   struct BlitTex {
     SDL_GPUTexture* tex;
@@ -3800,6 +3828,11 @@ void r_color0(inout vec4 c) {
     if (k.mip == 0xFF) si.mipmap_mode = SDL_GPU_SAMPLERMIPMAPMODE_NEAREST;
     si.enable_anisotropy = k.aniso > 1;
     si.max_anisotropy = float(k.aniso);
+    if (k.pad & 1) {  // a shadow map's: lit where the coordinate's depth is not nearer
+      si.enable_compare = true;
+      si.compare_op = SDL_GPU_COMPAREOP_LESS_OR_EQUAL;
+      si.enable_anisotropy = false;
+    }
     SDL_GPUSampler* s = SDL_CreateGPUSampler(dev_, &si);
     if (!s) FatalF("gfx: SDL_CreateGPUSampler: %s", SDL_GetError());
     samplers_[k] = s;

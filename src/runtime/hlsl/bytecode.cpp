@@ -537,8 +537,15 @@ class Translator {
         // texel decoded from sRGB to linear.
         const std::string n = std::to_string(s[1].num);
         auto srgb = [&](const std::string& e) { return "R_SRGB(" + n + ", " + e + ")"; };
+        // 2D: through r_texN (in the declarations), which a depth texture's
+        // variant makes a shadow map comparison.
+        if (ty == ParamType::Sampler2D) {
+          const std::string f = "r_tex" + n + "(" + c + ", ";
+          if (in.ctl == 1) return srgb(f + "true, " + b + ")");                       // texldp
+          if (in.ctl == 2) return srgb(f + "false, (" + c + ").w + " + b + ")");  // texldb
+          return srgb(f + "false, " + b + ")");
+        }
         if (in.ctl == 1) {  // texldp
-          if (ty == ParamType::Sampler2D) return srgb("textureProj(" + smp + ", " + c + ", " + b + ")");
           return srgb("texture(" + smp + ", (" + c + ").xyz / (" + c + ").w, " + b + ")");
         }
         if (in.ctl == 2)  // texldb
@@ -910,8 +917,23 @@ class Translator {
       const char* ty = t == ParamType::SamplerCube ? "samplerCube"
                        : t == ParamType::Sampler3D ? "sampler3D"
                                                    : "sampler2D";
-      h += "layout(R_SAMPLER_BINDING(" + std::to_string(n) + ")) uniform " + ty + " r_s" +
-           std::to_string(n) + ";\n";
+      const std::string ns = std::to_string(n);
+      const std::string decl = "layout(R_SAMPLER_BINDING(" + ns + ")) uniform ";
+      if (pixel_ && t == ParamType::Sampler2D) {
+        // A depth texture bound here (a backend's variant defines
+        // R_SHADOW_n): Direct3D 9's hardware shadow maps, the texel's
+        // depth compared with the coordinate's z (z / w projected), 1
+        // where it is not nearer, filtered as the sampler's filter says.
+        h += "#ifdef R_SHADOW_" + ns + "\n" + decl + "sampler2DShadow r_s" + ns + ";\n" +
+             "vec4 r_tex" + ns + "(vec4 c, bool proj, float bias) {\n" +
+             "  return vec4(texture(r_s" + ns + ", proj ? c.xyz / c.w : c.xyz));\n}\n" +
+             "#else\n" + decl + "sampler2D r_s" + ns + ";\n" +
+             "vec4 r_tex" + ns + "(vec4 c, bool proj, float bias) {\n" +
+             "  return proj ? textureProj(r_s" + ns + ", c, bias) : texture(r_s" + ns + ", c.xy, bias);\n}\n" +
+             "#endif\n";
+      } else {
+        h += decl + ty + " r_s" + ns + ";\n";
+      }
       out_->samplers.push_back(Sampler{n, t});
     }
 

@@ -112,6 +112,10 @@ struct Texture final : com::Object {
   uint32_t width = 0, height = 0, depth = 1, levels = 0, usage = 0, format = 0, pool = 0;
   gfx::Format fmt = gfx::Format::Unknown;
   gfx::TextureId tex = 0;  // none for SYSTEMMEM/SCRATCH
+  // A depth texture (DEPTHSTENCIL usage, a depth format): `tex` is a gfx
+  // depth buffer, its surface a depth-stencil target, and a pixel shader's
+  // 2D sampler reads it as a shadow map (gfx's depth comparison).
+  bool depth_target = false;
   struct Level {
     uint32_t w = 0, h = 0, pitch = 0, size = 0;
     uint32_t d = 1, slice = 0;  // volume levels: depth and slice pitch (size = slice * d)

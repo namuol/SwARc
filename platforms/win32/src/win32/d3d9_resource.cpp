@@ -158,7 +158,7 @@ bool LockRectValid(const gfx::Rect& r, uint32_t w, uint32_t h, gfx::Format f) {
 // Locks a level of texture memory: rect (null = all), pitch and pointer.
 uint32_t LockLevel(Texture& t, uint32_t face, uint32_t level, uint32_t out, uint32_t rect,
                    uint32_t flags) {
-  if (level >= t.levels || face >= t.Faces()) return D3DERR_INVALIDCALL;
+  if (level >= t.levels || face >= t.Faces() || t.depth_target) return D3DERR_INVALIDCALL;
   Texture::Level& l = t.At(face, level);
   if (l.locked) return D3DERR_INVALIDCALL;
   if ((t.usage & D3DUSAGE_RENDERTARGET) && t.pool == D3DPOOL_DEFAULT)
@@ -198,6 +198,7 @@ Surface& LevelSurface(Texture& t, uint32_t face, uint32_t level) {
     s->desc = {t.format, D3DRTYPE_SURFACE, t.usage, t.pool, 0, 0, l.w, l.h};
     s->texture = &t;
     s->container = t.guest;
+    if (t.depth_target) s->depth = t.tex;  // bound as a depth-stencil surface
     s->face = int(face);
     s->level = int(level);
     l.surface = s;
@@ -295,7 +296,10 @@ Shader::~Shader() {
 Texture::~Texture() {
   RefundVram(device, vram);
   Device* d = com::As<Device>(device);
-  if (d && tex) d->gfx->DestroyTexture(tex);
+  if (d && tex) {
+    if (depth_target) d->gfx->DestroyDepth(tex);
+    else d->gfx->DestroyTexture(tex);
+  }
   for (Level& l : lv) {
     if (l.mem) HeapFreeProcess(l.mem);
     if (l.surface) com::Release(l.surface->guest);
@@ -311,7 +315,11 @@ uint32_t NewTexture(Device& d, uint32_t device, bool cube, uint32_t w, uint32_t 
                     uint32_t* out) {
   *out = 0;
   gfx::Format f = FormatFromD3D(fmt);
-  if (!w || !h || f == gfx::Format::Unknown || IsDepthFormat(f) ||
+  // A depth texture: one level, in the default pool, a 2D depth format.
+  // (A depth format's texture is a depth texture whatever its usage says.)
+  const bool depth = IsDepthFormat(f) && pool == D3DPOOL_DEFAULT && !cube &&
+                     (f == gfx::Format::D16 || f == gfx::Format::D24S8 || f == gfx::Format::D24X8);
+  if (!w || !h || f == gfx::Format::Unknown || (IsDepthFormat(f) && !depth) ||
       ((usage & D3DUSAGE_RENDERTARGET) && (pool != D3DPOOL_DEFAULT || cube))) {
     WarnF("d3d9: Create%sTexture %ux%u fmt %X usage %X pool %u: not supported\n",
           cube ? "Cube" : "", w, h, fmt, usage, pool);
@@ -321,6 +329,7 @@ uint32_t NewTexture(Device& d, uint32_t device, bool cube, uint32_t w, uint32_t 
   for (uint32_t s = std::max(w, h); s > 1; s >>= 1) full++;
   if (!levels || levels > full) levels = full;
   if (usage & D3DUSAGE_AUTOGENMIPMAP) levels = 1;  // the app sees one level
+  if (depth) levels = 1;
   auto t = std::make_shared<Texture>();
   t->device = device;
   t->cube = cube;
@@ -331,6 +340,7 @@ uint32_t NewTexture(Device& d, uint32_t device, bool cube, uint32_t w, uint32_t 
   t->format = fmt;
   t->pool = pool;
   t->fmt = f;
+  t->depth_target = depth;
   for (uint32_t face = 0; face < t->Faces(); face++)
     for (uint32_t i = 0; i < levels; i++) {
       Texture::Level l;
@@ -346,7 +356,10 @@ uint32_t NewTexture(Device& d, uint32_t device, bool cube, uint32_t w, uint32_t 
     if (!ChargeVram(d, bytes)) return 0x8876017C;  // D3DERR_OUTOFVIDEOMEMORY
     t->vram = bytes;
   }
-  if (pool != D3DPOOL_SYSTEMMEM && pool != D3DPOOL_SCRATCH) {
+  if (depth) {
+    t->tex = d.gfx->CreateDepth(int(w), int(h), f);
+    if (!t->tex) return 0x8876017C;  // D3DERR_OUTOFVIDEOMEMORY
+  } else if (pool != D3DPOOL_SYSTEMMEM && pool != D3DPOOL_SCRATCH) {
     t->tex = cube ? d.gfx->CreateCubeTexture(int(w), int(levels), f)
                   : d.gfx->CreateTexture(int(w), int(h), int(levels), f,
                                          (usage & D3DUSAGE_RENDERTARGET) != 0);
