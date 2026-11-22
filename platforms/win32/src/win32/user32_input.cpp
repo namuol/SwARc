@@ -167,11 +167,11 @@ using namespace win32;
 
 uint32_t MapVirtualKey(uint32_t code, uint32_t type);
 
-HLE("user32.dll", MapVirtualKeyA, 2) { return MapVirtualKey(Arg(c, 0), Arg(c, 1)); }
-HLE("user32.dll", MapVirtualKeyW, 2) { return MapVirtualKey(Arg(c, 0), Arg(c, 1)); }
+HLE64("user32.dll", MapVirtualKeyA, 2) { return MapVirtualKey(Arg(c, 0), Arg(c, 1)); }
+HLE64("user32.dll", MapVirtualKeyW, 2) { return MapVirtualKey(Arg(c, 0), Arg(c, 1)); }
 // The Ex forms take a keyboard layout: there is only the US one.
-HLE("user32.dll", MapVirtualKeyExA, 3) { return MapVirtualKey(Arg(c, 0), Arg(c, 1)); }
-HLE("user32.dll", MapVirtualKeyExW, 3) { return MapVirtualKey(Arg(c, 0), Arg(c, 1)); }
+HLE64("user32.dll", MapVirtualKeyExA, 3) { return MapVirtualKey(Arg(c, 0), Arg(c, 1)); }
+HLE64("user32.dll", MapVirtualKeyExW, 3) { return MapVirtualKey(Arg(c, 0), Arg(c, 1)); }
 
 uint32_t MapVirtualKey(uint32_t code, uint32_t type) {
   switch (type) {
@@ -292,7 +292,7 @@ HLE("user32.dll", IsCharAlphaNumericA, 1) {
 
 // Key state: bit 15 = down; GetKeyState bit 0 = toggled. GetAsyncKeyState
 // bit 0 = "pressed since last call" (still honoured by Windows XP).
-HLE("user32.dll", GetKeyState, 1) {
+HLE64("user32.dll", GetKeyState, 1) {
   uint8_t vk = uint8_t(Arg(c, 0));
   uint32_t r = (g_key_down[vk] ? 0xFF80u : 0) | (g_key_toggled[vk] ? 1u : 0);
   return r;
@@ -307,7 +307,7 @@ HLE("user32.dll", GetKeyboardState, 1) {
   return 1;
 }
 
-HLE("user32.dll", GetAsyncKeyState, 1) {
+HLE64("user32.dll", GetAsyncKeyState, 1) {
   uint8_t vk = uint8_t(Arg(c, 0));
   uint32_t r = (g_key_down[vk] ? 0x8000u : 0) |
                (g_key_pressed_since[vk].exchange(0) ? 1u : 0);
@@ -316,7 +316,7 @@ HLE("user32.dll", GetAsyncKeyState, 1) {
 
 // ---- system metrics and parameters -------------------------------------------
 
-HLE("user32.dll", GetSystemMetrics, 1) {
+HLE64("user32.dll", GetSystemMetrics, 1) {
   switch (Arg(c, 0)) {
     case 0: return uint32_t(g_display_w);   // SM_CXSCREEN
     case 1: return uint32_t(g_display_h);   // SM_CYSCREEN
@@ -511,8 +511,24 @@ HLE("kernel32.dll", GlobalGetAtomNameA, 3) {
 }
 
 // Cursors and icons: opaque handles; the visible cursor is SDL's.
-HLE("user32.dll", LoadCursorA, 2) { return 0x00010000u | (Arg(c, 1) & 0xFFFF); }
-HLE("user32.dll", LoadIconA, 2) { return 0x00020000u | (Arg(c, 1) & 0xFFFF); }
+HLE64("user32.dll", LoadCursorA, 2) { return 0x00010000u | (Arg(c, 1) & 0xFFFF); }
+HLE64("user32.dll", LoadIconA, 2) { return 0x00020000u | (Arg(c, 1) & 0xFFFF); }
+// The W forms: the system cursors and icons (IDC_*, IDI_*) are ordinals,
+// which both forms take alike.
+HLE64("user32.dll", LoadCursorW, 2) { return 0x00010000u | (Arg(c, 1) & 0xFFFF); }
+HLE64("user32.dll", LoadIconW, 2) { return 0x00020000u | (Arg(c, 1) & 0xFFFF); }
+
+// Icons and cursors a game makes itself (from pixels: CreateIcon,
+// CreateIconIndirect; or copies) are opaque handles: the host window keeps
+// its own icon, and SetCursor shows the host's arrow for any cursor.
+uint32_t NewIconHandle() {
+  static std::atomic<uint32_t> next{0x00050000};
+  return next += 0x10;
+}
+HLE64("user32.dll", CreateIcon, 7) { return NewIconHandle(); }
+HLE64("user32.dll", CreateIconIndirect, 1) { return NewIconHandle(); }
+HLE64("user32.dll", CopyIcon, 1) { return Arg(c, 0) ? NewIconHandle() : 0; }
+HLE64("user32.dll", DestroyIcon, 1) { return 1; }
 
 // Images are opaque handles too: nothing is drawn through GDI. A file
 // (LR_LOADFROMFILE) must exist, as the game may check for the splash
@@ -550,9 +566,9 @@ HLE("user32.dll", LoadCursorFromFileA, 1) {
   }
   return next += 0x10;
 }
-HLE("user32.dll", DestroyCursor, 1) { return 1; }
+HLE64("user32.dll", DestroyCursor, 1) { return 1; }
 
-HLE("user32.dll", SetCursor, 1) {
+HLE64("user32.dll", SetCursor, 1) {
   static uint32_t cur = 0;
   uint32_t old = cur;
   cur = Arg(c, 0);

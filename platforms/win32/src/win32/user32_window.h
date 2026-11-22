@@ -17,6 +17,10 @@ inline constexpr uint32_t kPrimaryMonitor = 0x00010001;
 // The SDL window behind a top-level HWND, or nullptr.
 SDL_Window* SdlWindowFor(uint32_t hwnd);
 
+// Whether the game has shown hwnd (IsWindowVisible), whether or not a
+// background run shows the host window.
+bool WindowShown(uint32_t hwnd);
+
 // HDCs: GetDC(hwnd) returns DcForWindow(hwnd); WindowForDc maps it back
 // (0 for the screen DC or anything else).
 uint32_t DcForWindow(uint32_t hwnd);

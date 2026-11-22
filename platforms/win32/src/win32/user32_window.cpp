@@ -92,17 +92,20 @@ constexpr int32_t GWL_WNDPROC = -4, GWL_HINSTANCE = -6, GWL_HWNDPARENT = -8,
                   GWL_STYLE = -16, GWL_EXSTYLE = -20, GWL_USERDATA = -21,
                   GWL_ID = -12;
 
+// Guest addresses (window procedures, GWLP_USERDATA, instance handles) are
+// gaddr: x64 guests' are above 4 GiB. Window handles stay 32-bit values.
 struct WndClass {
   std::string name;  // lower case
-  uint32_t style = 0, wndproc = 0, wnd_extra = 0;
+  uint32_t style = 0, wnd_extra = 0;
+  gaddr wndproc = 0;
   uint16_t atom = 0;
 };
 
 struct Window {
   uint32_t hwnd = 0;
   std::string cls;
-  uint32_t wndproc = 0, style = 0, exstyle = 0, parent = 0, id = 0;
-  uint32_t hinst = 0, userdata = 0, class_style = 0;
+  uint32_t style = 0, exstyle = 0, parent = 0, id = 0, class_style = 0;
+  gaddr wndproc = 0, hinst = 0, userdata = 0;
   int x = 0, y = 0, w = 0, h = 0;  // window rect (screen)
   std::string title;
   std::vector<uint8_t> extra;      // cbWndExtra bytes (GetWindowLong >= 0)
@@ -141,8 +144,11 @@ struct Window {
   bool dropped = false;
 };
 
+// WPARAM and LPARAM are pointer-sized: 64-bit for x64 guests.
 struct Msg {
-  uint32_t hwnd, msg, wparam, lparam, time;
+  uint32_t hwnd, msg;
+  uint64_t wparam, lparam;
+  uint32_t time;
   int32_t ptx, pty;
 };
 
@@ -155,7 +161,9 @@ struct Queue {
 // SetTimer: WM_TIMER is not queued but synthesised when the owning
 // thread's queue has nothing else for the caller, as on Windows.
 struct Timer {
-  uint32_t hwnd, id, elapse, proc, tid;
+  uint32_t hwnd, id, elapse;
+  gaddr proc;
+  uint32_t tid;
   int64_t due;  // TickCount() of the next WM_TIMER
 };
 
@@ -191,13 +199,15 @@ uint32_t g_focus = 0, g_active = 0;
 constexpr int32_t kWhKeyboard = 2, kWhCbt = 5;
 struct Hook {
   int32_t type;
-  uint32_t handle, proc, tid;  // tid 0: every thread
+  uint32_t handle;
+  gaddr proc;
+  uint32_t tid;  // tid 0: every thread
 };
 std::vector<Hook> g_hooks;
 
 // The procedure of the calling thread's first `type` hook after the hook
 // `after` (0: the first one); 0 if there is none.
-uint32_t NextHook(int32_t type, uint32_t after) {
+gaddr NextHook(int32_t type, uint32_t after) {
   std::lock_guard<std::recursive_mutex> l(g_mu);
   uint32_t tid = CurrentThread()->tid;
   bool past = after == 0;
@@ -210,7 +220,7 @@ uint32_t NextHook(int32_t type, uint32_t after) {
   }
   return 0;
 }
-uint32_t NextCbtHook(uint32_t after) { return NextHook(kWhCbt, after); }
+gaddr NextCbtHook(uint32_t after) { return NextHook(kWhCbt, after); }
 int g_cursor_count = 0;  // ShowCursor display counter
 int32_t g_mouse_x = 0, g_mouse_y = 0;  // screen coordinates
 // The host pointer over the game window, in client (mode) coordinates;
@@ -252,7 +262,7 @@ void PostTo(uint32_t tid, const Msg& m) {
   g_queue_cv.notify_all();
 }
 
-void Post(uint32_t hwnd, uint32_t msg, uint32_t wp, uint32_t lp) {
+void Post(uint32_t hwnd, uint32_t msg, uint64_t wp, uint64_t lp) {
   uint32_t tid;
   {
     std::lock_guard<std::recursive_mutex> l(g_mu);
@@ -262,9 +272,10 @@ void Post(uint32_t hwnd, uint32_t msg, uint32_t wp, uint32_t lp) {
   PostTo(tid, Msg{hwnd, msg, wp, lp, TickCount(), g_mouse_x, g_mouse_y});
 }
 
-// Synchronous delivery to the guest WndProc (SendMessage semantics).
-uint32_t Send(uint32_t hwnd, uint32_t msg, uint32_t wp, uint32_t lp) {
-  uint32_t proc;
+// Synchronous delivery to the guest WndProc (SendMessage semantics). The
+// result is an LRESULT: pointer-sized.
+uint64_t Send(uint32_t hwnd, uint32_t msg, uint64_t wp, uint64_t lp) {
+  gaddr proc;
   {
     std::lock_guard<std::recursive_mutex> l(g_mu);
     Window* w = Win(hwnd);
@@ -885,15 +896,32 @@ void HandleSdlEvent(const SDL_Event& e) {
   }
 }
 
-// Writes a guest MSG.
-void PutMsg(uint32_t va, const Msg& m) {
-  Wr32(va + 0, m.hwnd);
-  Wr32(va + 4, m.msg);
-  Wr32(va + 8, m.wparam);
-  Wr32(va + 12, m.lparam);
-  Wr32(va + 16, m.time);
-  Wr32(va + 20, uint32_t(m.ptx));
-  Wr32(va + 24, uint32_t(m.pty));
+// A guest MSG: {HWND, UINT message, WPARAM, LPARAM, DWORD time, POINT pt}
+// (28 bytes), or on x64 HWND, WPARAM and LPARAM 8 bytes each and aligned
+// (48 bytes, with lPrivate after pt).
+struct MsgLayout {
+  uint32_t msg, wparam, lparam, time, pt;
+};
+MsgLayout MsgFields() {
+  return g_proc->x64 ? MsgLayout{8, 16, 24, 32, 36} : MsgLayout{4, 8, 12, 16, 20};
+}
+
+void PutMsg(gaddr va, const Msg& m) {
+  const MsgLayout f = MsgFields();
+  WrPtr(va, hle::HandleRet(m.hwnd));
+  Wr32(va + f.msg, m.msg);
+  WrPtr(va + f.wparam, m.wparam);
+  WrPtr(va + f.lparam, m.lparam);
+  Wr32(va + f.time, m.time);
+  Wr32(va + f.pt, uint32_t(m.ptx));
+  Wr32(va + f.pt + 4, uint32_t(m.pty));
+}
+
+// Reads a guest MSG.
+Msg GetMsg(gaddr va) {
+  const MsgLayout f = MsgFields();
+  return Msg{uint32_t(RdPtr(va)), Rd32(va + f.msg), RdPtr(va + f.wparam), RdPtr(va + f.lparam),
+             Rd32(va + f.time), int32_t(Rd32(va + f.pt)), int32_t(Rd32(va + f.pt + 4))};
 }
 
 bool Matches(const Msg& m, uint32_t hwnd, uint32_t lo, uint32_t hi) {
@@ -949,9 +977,9 @@ bool KeyboardHookDiscards(Ctx& c, const Msg& m, bool removed) {
   if (m.msg != WM_KEYDOWN && m.msg != WM_KEYUP && m.msg != WM_SYSKEYDOWN &&
       m.msg != WM_SYSKEYUP)
     return false;
-  uint32_t proc = NextHook(kWhKeyboard, 0);
+  gaddr proc = NextHook(kWhKeyboard, 0);
   if (!proc) return false;
-  uint32_t r = CallGuest(c, proc, {removed ? 0u : 3u, m.wparam, m.lparam});
+  uint64_t r = CallGuest(c, proc, {removed ? 0u : 3u, m.wparam, m.lparam});
   return removed && r != 0;
 }
 
@@ -1297,6 +1325,20 @@ struct TestEvent {
   SDL_Event e;
 };
 
+// The window scripted input goes to: the last host window the game has
+// shown, else the last one it made (games keep hidden helper windows, such
+// as an OpenGL library's windows for its extra contexts).
+SDL_WindowID TestInputWindow() {
+  std::lock_guard<std::recursive_mutex> l(g_mu);
+  SDL_WindowID any = 0, shown = 0;
+  for (auto& [h, w] : g_windows) {
+    if (!w.sdl || w.destroyed) continue;
+    any = SDL_GetWindowID(w.sdl);
+    if (w.visible) shown = any;
+  }
+  return shown ? shown : any;
+}
+
 void InjectTestInput() {
   static std::vector<TestEvent> q;
   static size_t next = 0;
@@ -1484,12 +1526,7 @@ void InjectTestInput() {
   static SDL_Event press_up{};
   const double now = (SDL_GetTicks() - t0) / 1000.0;
   auto send_key = [&](SDL_Event e) {
-    SDL_WindowID wid = 0;
-    {
-      std::lock_guard<std::recursive_mutex> l(g_mu);
-      for (auto& [h, w] : g_windows)
-        if (w.sdl && !w.destroyed) wid = SDL_GetWindowID(w.sdl);
-    }
+    const SDL_WindowID wid = TestInputWindow();
     // With no host window (only a dialog without an owner, say), windowID
     // 0: the key goes to the focus window.
     e.key.windowID = wid;
@@ -1504,12 +1541,7 @@ void InjectTestInput() {
   static double paused = 0;
   static double wait_since = -1, last_press = -1e9;
   double t = now - paused;
-  SDL_WindowID id = 0;
-  {
-    std::lock_guard<std::recursive_mutex> l(g_mu);
-    for (auto& [h, w] : g_windows)
-      if (w.sdl && !w.destroyed) id = SDL_GetWindowID(w.sdl);
-  }
+  const SDL_WindowID id = TestInputWindow();
   if (!id) return;
   // At most one motion per pump, so each lands in its own game frame.
   bool moved = false;
@@ -1805,6 +1837,12 @@ std::vector<ModeSize> DisplayModeSizes() {
   return v;
 }
 
+bool WindowShown(uint32_t hwnd) {
+  std::lock_guard<std::recursive_mutex> l(g_mu);
+  Window* w = Win(hwnd);
+  return w && w->visible;
+}
+
 void ClientAreaSize(uint32_t hwnd, int* w, int* h) {
   std::lock_guard<std::recursive_mutex> l(g_mu);
   *w = *h = 0;
@@ -1819,10 +1857,10 @@ using namespace win32;
 // ---- classes ---------------------------------------------------------------
 
 // g_classes key of a class name argument: an atom (MAKEINTATOM) or a name.
-std::string ClassKey(uint32_t name) {
+std::string ClassKey(gaddr name) {
   return name < 0x10000 ? "#" + std::to_string(name) : Lower(GStr(name));
 }
-std::string ClassKeyW(uint32_t name) {
+std::string ClassKeyW(gaddr name) {
   return name < 0x10000 ? "#" + std::to_string(name) : Lower(Narrow(GWStr(name)));
 }
 
@@ -1853,15 +1891,26 @@ void EnsureSystemClasses() {
   }
 }
 
-// WNDCLASSA at wc, or the same fields 4 bytes on in WNDCLASSEXA (after
-// cbSize).
-// WNDCLASSW has the same layout, its names wide.
-uint32_t RegisterWndClass(uint32_t wc, bool wide = false) {
+// WNDCLASS{A,W}: {UINT style; WNDPROC; int cbClsExtra, cbWndExtra;
+// HINSTANCE; HICON; HCURSOR; HBRUSH; LPCSTR menu, class}: 40 bytes, or on
+// x64 72, pointers and handles 8 bytes and aligned. WNDCLASSEX has cbSize
+// first and hIconSm last.
+struct WndClassLayout {
+  uint32_t wndproc, wnd_extra, hinst, menu, cls, size;
+};
+WndClassLayout WndClassFields() {
+  return g_proc->x64 ? WndClassLayout{8, 20, 24, 56, 64, 72}
+                     : WndClassLayout{4, 12, 16, 32, 36, 40};
+}
+
+// WNDCLASS{A,W} at wc (the fields after cbSize in WNDCLASSEX).
+uint64_t RegisterWndClass(gaddr wc, bool wide = false) {
+  const WndClassLayout f = WndClassFields();
   WndClass k;
   k.style = Rd32(wc + 0);
-  k.wndproc = Rd32(wc + 4);
-  k.wnd_extra = Rd32(wc + 12);
-  k.name = wide ? ClassKeyW(Rd32(wc + 36)) : ClassKey(Rd32(wc + 36));
+  k.wndproc = RdPtr(wc + f.wndproc);
+  k.wnd_extra = Rd32(wc + f.wnd_extra);
+  k.name = wide ? ClassKeyW(RdPtr(wc + f.cls)) : ClassKey(RdPtr(wc + f.cls));
   std::lock_guard<std::recursive_mutex> l(g_mu);
   if (g_classes.count(k.name)) {
     SetLastError(kErrorClassAlreadyExists);
@@ -1872,24 +1921,28 @@ uint32_t RegisterWndClass(uint32_t wc, bool wide = false) {
   return k.atom;
 }
 
-HLE("user32.dll", RegisterClassA, 1) { return RegisterWndClass(Arg(c, 0)); }
-HLE("user32.dll", RegisterClassW, 1) { return RegisterWndClass(Arg(c, 0), true); }
+HLE64("user32.dll", RegisterClassA, 1) { return RegisterWndClass(Arg(c, 0)); }
+HLE64("user32.dll", RegisterClassW, 1) { return RegisterWndClass(Arg(c, 0), true); }
 
-HLE("user32.dll", RegisterClassExA, 1) {
-  uint32_t wc = Arg(c, 0);
-  if (Rd32(wc) != 48) {  // cbSize: sizeof(WNDCLASSEXA)
-    SetLastError(87);    // ERROR_INVALID_PARAMETER
+// WNDCLASSEX: cbSize (48, or 80 on x64), then WNDCLASS's fields (the x64
+// ones from offset 8, the next aligned one), then hIconSm.
+uint64_t RegisterWndClassEx(gaddr wc, bool wide) {
+  const bool x64 = g_proc->x64;
+  if (Rd32(wc) != (x64 ? 80u : 48u)) {
+    SetLastError(87);  // ERROR_INVALID_PARAMETER
     return 0;
   }
-  return RegisterWndClass(wc + 4);
+  return RegisterWndClass(wc + (x64 ? 8 : 4), wide);
 }
+HLE64("user32.dll", RegisterClassExA, 1) { return RegisterWndClassEx(Arg(c, 0), false); }
+HLE64("user32.dll", RegisterClassExW, 1) { return RegisterWndClassEx(Arg(c, 0), true); }
 
 // GetClassInfoA(hinstance, name, WNDCLASSA*): what was registered (icons,
 // cursor, brush and menu are not kept, so they read back as 0). Returns
 // the class atom, or 0 and ERROR_CLASS_DOES_NOT_EXIST.
-HLE("user32.dll", GetClassInfoA, 3) {
+HLE64("user32.dll", GetClassInfoA, 3) {
   EnsureSystemClasses();
-  uint32_t name = Arg(c, 1), wc = Arg(c, 2);
+  gaddr name = Arg(c, 1), wc = Arg(c, 2);
   std::lock_guard<std::recursive_mutex> l(g_mu);
   const WndClass* k = nullptr;
   if (name < 0x10000) {
@@ -1903,21 +1956,22 @@ HLE("user32.dll", GetClassInfoA, 3) {
     SetLastError(1411);  // ERROR_CLASS_DOES_NOT_EXIST
     return 0;
   }
-  std::memset(GPtr(wc), 0, 40);
+  const WndClassLayout f = WndClassFields();
+  std::memset(GPtr(wc), 0, f.size);
   Wr32(wc + 0, k->style);
-  Wr32(wc + 4, k->wndproc);
-  Wr32(wc + 12, k->wnd_extra);
-  Wr32(wc + 16, Arg(c, 0));
-  Wr32(wc + 36, name);
+  WrPtr(wc + f.wndproc, k->wndproc);
+  Wr32(wc + f.wnd_extra, k->wnd_extra);
+  WrPtr(wc + f.hinst, Arg(c, 0));
+  WrPtr(wc + f.cls, name);
   return k->atom;
 }
 
-HLE("user32.dll", UnregisterClassA, 2) {
+HLE64("user32.dll", UnregisterClassA, 2) {
   std::string n = ClassKey(Arg(c, 0));
   std::lock_guard<std::recursive_mutex> l(g_mu);
   return g_classes.erase(n) ? 1 : 0;
 }
-HLE("user32.dll", UnregisterClassW, 2) {
+HLE64("user32.dll", UnregisterClassW, 2) {
   std::string n = ClassKeyW(Arg(c, 0));
   std::lock_guard<std::recursive_mutex> l(g_mu);
   return g_classes.erase(n) ? 1 : 0;
@@ -1936,19 +1990,21 @@ thread_local bool t_creating_dialog = false;
 // CreateWindowEx{A,W}: the class key and title from the A or W strings;
 // CREATESTRUCT gets the caller's own string pointers (A or W ones, as a
 // window procedure of that kind reads them).
-uint32_t CreateWindowImpl(Ctx& c, const std::string& cls, const std::string& title);
+uint64_t CreateWindowImpl(Ctx& c, const std::string& cls, const std::string& title);
 
-HLE("user32.dll", CreateWindowExA, 12) {
+HLE64("user32.dll", CreateWindowExA, 12) {
   return CreateWindowImpl(c, ClassKey(Arg(c, 1)), Arg(c, 2) ? GStr(Arg(c, 2)) : "");
 }
-HLE("user32.dll", CreateWindowExW, 12) {
+HLE64("user32.dll", CreateWindowExW, 12) {
   return CreateWindowImpl(c, ClassKeyW(Arg(c, 1)), Arg(c, 2) ? Narrow(GWStr(Arg(c, 2))) : "");
 }
 
-uint32_t CreateWindowImpl(Ctx& c, const std::string& cls, const std::string& title) {
-  uint32_t exstyle = Arg(c, 0), cls_va = Arg(c, 1), title_va = Arg(c, 2),
-           style = Arg(c, 3), parent = Arg(c, 8), menu = Arg(c, 9),
-           hinst = Arg(c, 10), param = Arg(c, 11);
+uint64_t CreateWindowImpl(Ctx& c, const std::string& cls, const std::string& title) {
+  uint32_t exstyle = uint32_t(Arg(c, 0)), style = uint32_t(Arg(c, 3)),
+           parent = uint32_t(Arg(c, 8));
+  // hMenu is a child's id; on x64 an id is the handle's low 32 bits too.
+  uint32_t menu = uint32_t(Arg(c, 9));
+  gaddr cls_va = Arg(c, 1), title_va = Arg(c, 2), hinst = Arg(c, 10), param = Arg(c, 11);
   int32_t x = int32_t(Arg(c, 4)), y = int32_t(Arg(c, 5)), w = int32_t(Arg(c, 6)),
           h = int32_t(Arg(c, 7));
   EnsureSystemClasses();
@@ -1999,31 +2055,36 @@ uint32_t CreateWindowImpl(Ctx& c, const std::string& cls, const std::string& tit
   RECOMP_TRACE("  CreateWindowExA(%s, \"%s\", style %08X, %d,%d %dx%d) -> %X\n",
             cls.c_str(), title.c_str(), style, x, y, w, h, hwnd);
 
-  // CREATESTRUCTA in a process-heap block.
-  uint32_t cs = HeapAllocProcess(48, true);
-  Wr32(cs + 0, param);
-  Wr32(cs + 4, hinst);
-  Wr32(cs + 8, menu);
-  Wr32(cs + 12, parent);
-  Wr32(cs + 16, uint32_t(h));
-  Wr32(cs + 20, uint32_t(w));
-  Wr32(cs + 24, uint32_t(y));
-  Wr32(cs + 28, uint32_t(x));
-  Wr32(cs + 32, style);
-  Wr32(cs + 36, title_va);
-  Wr32(cs + 40, cls_va);
-  Wr32(cs + 44, exstyle);
-  // HCBT_CREATEWND (3) to the WH_CBT hooks, with a CBT_CREATEWNDA
+  // CREATESTRUCT{A,W} in a process-heap block: {lpCreateParams, hInstance,
+  // hMenu, hwndParent, int cy, cx, y, x, LONG style, lpszName, lpszClass,
+  // DWORD dwExStyle}, 48 bytes, or 80 on x64 (pointers and handles 8 bytes
+  // and aligned).
+  const bool x64 = g_proc->x64;
+  const uint32_t ps = x64 ? 8 : 4, ints = 4 * ps, name_off = x64 ? 48 : 36;
+  gaddr cs = HeapAllocProcess(x64 ? 80 : 48, true);
+  WrPtr(cs + 0, param);
+  WrPtr(cs + ps, hinst);
+  WrPtr(cs + 2 * ps, menu);
+  WrPtr(cs + 3 * ps, HandleRet(parent));
+  Wr32(cs + ints + 0, uint32_t(h));
+  Wr32(cs + ints + 4, uint32_t(w));
+  Wr32(cs + ints + 8, uint32_t(y));
+  Wr32(cs + ints + 12, uint32_t(x));
+  Wr32(cs + ints + 16, style);
+  WrPtr(cs + name_off, title_va);
+  WrPtr(cs + name_off + ps, cls_va);
+  Wr32(cs + name_off + 2 * ps, exstyle);
+  // HCBT_CREATEWND (3) to the WH_CBT hooks, with a CBT_CREATEWND
   // {lpcs, hwndInsertAfter}: nonzero fails the creation.
   bool ok = true;
-  if (uint32_t proc = NextCbtHook(0)) {
-    uint32_t cbt = HeapAllocProcess(8, true);
-    Wr32(cbt, cs);
+  if (gaddr proc = NextCbtHook(0)) {
+    gaddr cbt = HeapAllocProcess(2 * ps, true);
+    WrPtr(cbt, cs);
     ok = CallGuest(c, proc, {3, hwnd, cbt}) == 0;
     HeapFreeProcess(cbt);
   }
   if (ok) ok = Send(hwnd, WM_NCCREATE, 0, cs) != 0;
-  if (ok) ok = int32_t(Send(hwnd, WM_CREATE, 0, cs)) != -1;
+  if (ok) ok = int32_t(Send(hwnd, WM_CREATE, 0, cs)) != -1;  // LRESULT -1 fails
   HeapFreeProcess(cs);
   if (!ok) {
     std::lock_guard<std::recursive_mutex> l(g_mu);
@@ -2044,11 +2105,11 @@ uint32_t CreateWindowImpl(Ctx& c, const std::string& cls, const std::string& tit
     }
     UpdateFullscreen(hwnd);
   }
-  return hwnd;
+  return HandleRet(hwnd);
 }
 
-HLE("user32.dll", DestroyWindow, 1) {
-  uint32_t hwnd = Arg(c, 0);
+HLE64("user32.dll", DestroyWindow, 1) {
+  uint32_t hwnd = uint32_t(Arg(c, 0));
   uint32_t exposed = 0;  // the parent a visible child uncovers
   {
     std::lock_guard<std::recursive_mutex> l(g_mu);
@@ -2078,7 +2139,7 @@ HLE("user32.dll", DestroyWindow, 1) {
   return 1;
 }
 
-HLE("user32.dll", IsWindow, 1) {
+HLE64("user32.dll", IsWindow, 1) {
   std::lock_guard<std::recursive_mutex> l(g_mu);
   return Win(Arg(c, 0)) ? 1 : 0;
 }
@@ -2119,7 +2180,7 @@ void SetMaximized(uint32_t hwnd, bool on) {
   ApplyRect(hwnd, x, y, w, h, true, true);
 }
 
-HLE("user32.dll", ShowWindow, 2) {
+HLE64("user32.dll", ShowWindow, 2) {
   uint32_t hwnd = Arg(c, 0), cmd = Arg(c, 1);
   bool was, show = cmd != 0;  // SW_HIDE = 0
   // SW_SHOWMINIMIZED, SW_MINIMIZE, SW_SHOWMINNOACTIVE
@@ -2197,7 +2258,7 @@ HLE("user32.dll", CloseWindow, 1) {
 }
 
 // UpdateWindow: paints now (WM_PAINT sent) if the window needs it.
-HLE("user32.dll", UpdateWindow, 1) {
+HLE64("user32.dll", UpdateWindow, 1) {
   bool dirty;
   {
     std::lock_guard<std::recursive_mutex> l(g_mu);
@@ -2255,19 +2316,19 @@ HLE("user32.dll", RedrawWindow, 4) {
   return 1;
 }
 
-HLE("user32.dll", IsWindowVisible, 1) {
+HLE64("user32.dll", IsWindowVisible, 1) {
   std::lock_guard<std::recursive_mutex> l(g_mu);
   Window* w = Win(Arg(c, 0));
   return w && w->visible ? 1 : 0;
 }
 
-HLE("user32.dll", IsWindowEnabled, 1) {
+HLE64("user32.dll", IsWindowEnabled, 1) {
   std::lock_guard<std::recursive_mutex> l(g_mu);
   Window* w = Win(Arg(c, 0));
   return w && w->enabled ? 1 : 0;
 }
 
-HLE("user32.dll", EnableWindow, 2) {
+HLE64("user32.dll", EnableWindow, 2) {
   std::lock_guard<std::recursive_mutex> l(g_mu);
   Window* w = Win(Arg(c, 0));
   if (!w) return 0;
@@ -2276,7 +2337,7 @@ HLE("user32.dll", EnableWindow, 2) {
   return was_disabled ? 1 : 0;
 }
 
-HLE("user32.dll", IsIconic, 1) {
+HLE64("user32.dll", IsIconic, 1) {
   SDL_Window* s;
   {
     std::lock_guard<std::recursive_mutex> l(g_mu);
@@ -2336,7 +2397,7 @@ void ApplyRect(uint32_t hwnd, int x, int y, int w, int h, bool move, bool size) 
   if (moved) Send(hwnd, WM_MOVE, 0, MkLparam(x, y));
 }
 
-HLE("user32.dll", SetWindowPos, 7) {
+HLE64("user32.dll", SetWindowPos, 7) {
   uint32_t hwnd = Arg(c, 0), flags = Arg(c, 6);
   bool nomove = flags & 0x2, nosize = flags & 0x1;
   ApplyRect(hwnd, int32_t(Arg(c, 2)), int32_t(Arg(c, 3)), int32_t(Arg(c, 4)),
@@ -2375,8 +2436,8 @@ HLE("user32.dll", MoveWindow, 6) {
   return 1;
 }
 
-HLE("user32.dll", AdjustWindowRect, 3) {
-  uint32_t rc = Arg(c, 0);
+HLE64("user32.dll", AdjustWindowRect, 3) {
+  gaddr rc = Arg(c, 0);
   int border, caption;
   FrameSize(Arg(c, 1), &border, &caption);
   Wr32(rc + 0, Rd32(rc + 0) - border);
@@ -2487,16 +2548,16 @@ HLE("user32.dll", UnionRect, 3) {
   return 1;
 }
 
-HLE("user32.dll", IsZoomed, 1) {
+HLE64("user32.dll", IsZoomed, 1) {
   std::lock_guard<std::recursive_mutex> l(g_mu);
   Window* w = Win(Arg(c, 0));
   return w && w->maximized ? 1 : 0;
 }
 
-HLE("user32.dll", GetClientRect, 2) {
+HLE64("user32.dll", GetClientRect, 2) {
   std::lock_guard<std::recursive_mutex> l(g_mu);
-  Window* w = Win(Arg(c, 0));
-  uint32_t rc = Arg(c, 1);
+  Window* w = Win(uint32_t(Arg(c, 0)));
+  gaddr rc = Arg(c, 1);
   if (!w) return 0;
   int cw, ch;
   ClientSize(*w, &cw, &ch);
@@ -2528,8 +2589,9 @@ HLE("user32.dll", GetWindowPlacement, 2) {
   return 1;
 }
 
-HLE("user32.dll", GetWindowRect, 2) {
-  uint32_t hwnd = Arg(c, 0), rc = Arg(c, 1);
+HLE64("user32.dll", GetWindowRect, 2) {
+  uint32_t hwnd = uint32_t(Arg(c, 0));
+  gaddr rc = Arg(c, 1);
   if (hwnd == 0x00010000) {  // desktop
     Wr32(rc, 0);
     Wr32(rc + 4, 0);
@@ -2549,29 +2611,30 @@ HLE("user32.dll", GetWindowRect, 2) {
   return 1;
 }
 
-HLE("user32.dll", ClientToScreen, 2) {
+HLE64("user32.dll", ClientToScreen, 2) {
   int ox, oy;
-  WindowOrigin(Arg(c, 0), &ox, &oy);
-  uint32_t pt = Arg(c, 1);
+  WindowOrigin(uint32_t(Arg(c, 0)), &ox, &oy);
+  gaddr pt = Arg(c, 1);
   Wr32(pt, Rd32(pt) + uint32_t(ox));
   Wr32(pt + 4, Rd32(pt + 4) + uint32_t(oy));
   return 1;
 }
 
-HLE("user32.dll", ScreenToClient, 2) {
+HLE64("user32.dll", ScreenToClient, 2) {
   int ox, oy;
-  WindowOrigin(Arg(c, 0), &ox, &oy);
-  uint32_t pt = Arg(c, 1);
+  WindowOrigin(uint32_t(Arg(c, 0)), &ox, &oy);
+  gaddr pt = Arg(c, 1);
   Wr32(pt, Rd32(pt) - uint32_t(ox));
   Wr32(pt + 4, Rd32(pt + 4) - uint32_t(oy));
   return 1;
 }
 
-HLE("user32.dll", MapWindowPoints, 4) {
+HLE64("user32.dll", MapWindowPoints, 4) {
   int fx, fy, tx, ty;
-  WindowOrigin(Arg(c, 0), &fx, &fy);
-  WindowOrigin(Arg(c, 1), &tx, &ty);
-  uint32_t pts = Arg(c, 2), n = Arg(c, 3);
+  WindowOrigin(uint32_t(Arg(c, 0)), &fx, &fy);
+  WindowOrigin(uint32_t(Arg(c, 1)), &tx, &ty);
+  gaddr pts = Arg(c, 2);
+  uint32_t n = uint32_t(Arg(c, 3));
   int dx = fx - tx, dy = fy - ty;
   for (uint32_t i = 0; i < n * 2; i += 2) {
     Wr32(pts + 4 * i, Rd32(pts + 4 * i) + uint32_t(dx));
@@ -2580,9 +2643,9 @@ HLE("user32.dll", MapWindowPoints, 4) {
   return MkLparam(dx, dy);
 }
 
-HLE("user32.dll", GetDesktopWindow, 0) { return 0x00010000; }
+HLE64("user32.dll", GetDesktopWindow, 0) { return 0x00010000; }
 
-HLE("user32.dll", GetParent, 1) {
+HLE64("user32.dll", GetParent, 1) {
   std::lock_guard<std::recursive_mutex> l(g_mu);
   Window* w = Win(Arg(c, 0));
   return w ? w->parent : 0;
@@ -2650,7 +2713,7 @@ HLE("user32.dll", SetWindowTextA, 2) {
 
 // SetWindowTextW: the title is kept in the ANSI code page for the A
 // functions; the host window gets the full Unicode text.
-HLE("user32.dll", SetWindowTextW, 2) {
+HLE64("user32.dll", SetWindowTextW, 2) {
   std::u16string wt = Arg(c, 1) ? GWStr(Arg(c, 1)) : std::u16string();
   SDL_Window* s = nullptr;
   {
@@ -2682,17 +2745,25 @@ HLE("user32.dll", GetWindowTextLengthA, 1) {
 }
 
 // The W forms: windows are the same whichever kind made them (messages
-// carry the same, US-layout characters to both).
-uint32_t GetWindowLong(Ctx& c);
-uint32_t SetWindowLong(Ctx& c);
-HLE("user32.dll", GetWindowLongA, 2) { return GetWindowLong(c); }
-HLE("user32.dll", GetWindowLongW, 2) { return GetWindowLong(c); }
-HLE("user32.dll", SetWindowLongA, 3) { return SetWindowLong(c); }
-HLE("user32.dll", SetWindowLongW, 3) { return SetWindowLong(c); }
+// carry the same, US-layout characters to both). x64 user32 also exports
+// the Ptr forms (32-bit Windows has them as macros for the Long ones):
+// pointer-sized values, and 8 bytes of the window's extra bytes, where the
+// Long forms read and write 4 (an address set through them is truncated,
+// as on Windows).
+uint64_t GetWindowLong(Ctx& c, bool ptr);
+uint64_t SetWindowLong(Ctx& c, bool ptr);
+HLE64("user32.dll", GetWindowLongA, 2) { return uint32_t(GetWindowLong(c, false)); }
+HLE64("user32.dll", GetWindowLongW, 2) { return uint32_t(GetWindowLong(c, false)); }
+HLE64("user32.dll", SetWindowLongA, 3) { return uint32_t(SetWindowLong(c, false)); }
+HLE64("user32.dll", SetWindowLongW, 3) { return uint32_t(SetWindowLong(c, false)); }
+HLE64("user32.dll", GetWindowLongPtrA, 2) { return GetWindowLong(c, true); }
+HLE64("user32.dll", GetWindowLongPtrW, 2) { return GetWindowLong(c, true); }
+HLE64("user32.dll", SetWindowLongPtrA, 3) { return SetWindowLong(c, true); }
+HLE64("user32.dll", SetWindowLongPtrW, 3) { return SetWindowLong(c, true); }
 
-uint32_t GetWindowLong(Ctx& c) {
+uint64_t GetWindowLong(Ctx& c, bool ptr) {
   std::lock_guard<std::recursive_mutex> l(g_mu);
-  Window* w = Win(Arg(c, 0));
+  Window* w = Win(uint32_t(Arg(c, 0)));
   int32_t idx = int32_t(Arg(c, 1));
   if (!w) return 0;
   switch (idx) {
@@ -2704,58 +2775,60 @@ uint32_t GetWindowLong(Ctx& c) {
     case GWL_USERDATA: return w->userdata;
     case GWL_ID: return w->id;
   }
-  if (idx >= 0 && uint32_t(idx) + 4 <= w->extra.size()) {
-    uint32_t v;
-    std::memcpy(&v, w->extra.data() + idx, 4);
+  const uint32_t n = ptr && g_proc->x64 ? 8 : 4;
+  if (idx >= 0 && uint32_t(idx) + n <= w->extra.size()) {
+    uint64_t v = 0;
+    std::memcpy(&v, w->extra.data() + idx, n);
     return v;
   }
   return 0;
 }
 
-uint32_t SetWindowLong(Ctx& c) {
+uint64_t SetWindowLong(Ctx& c, bool ptr) {
   std::lock_guard<std::recursive_mutex> l(g_mu);
-  Window* w = Win(Arg(c, 0));
+  Window* w = Win(uint32_t(Arg(c, 0)));
   int32_t idx = int32_t(Arg(c, 1));
-  uint32_t v = Arg(c, 2), old = 0;
+  const uint32_t n = ptr && g_proc->x64 ? 8 : 4;
+  uint64_t v = n == 8 ? Arg(c, 2) : uint32_t(Arg(c, 2)), old = 0;
   if (!w) return 0;
   switch (idx) {
     case GWL_WNDPROC: old = w->wndproc; w->wndproc = v; return old;
-    case GWL_HWNDPARENT: old = w->parent; w->parent = v; return old;
-    case GWL_STYLE: old = w->style; w->style = v; return old;
-    case GWL_EXSTYLE: old = w->exstyle; w->exstyle = v; return old;
+    case GWL_HWNDPARENT: old = w->parent; w->parent = uint32_t(v); return old;
+    case GWL_STYLE: old = w->style; w->style = uint32_t(v); return old;
+    case GWL_EXSTYLE: old = w->exstyle; w->exstyle = uint32_t(v); return old;
     case GWL_USERDATA: old = w->userdata; w->userdata = v; return old;
-    case GWL_ID: old = w->id; w->id = v; return old;
+    case GWL_ID: old = w->id; w->id = uint32_t(v); return old;
   }
-  if (idx >= 0 && uint32_t(idx) + 4 <= w->extra.size()) {
-    std::memcpy(&old, w->extra.data() + idx, 4);
-    std::memcpy(w->extra.data() + idx, &v, 4);
+  if (idx >= 0 && uint32_t(idx) + n <= w->extra.size()) {
+    std::memcpy(&old, w->extra.data() + idx, n);
+    std::memcpy(w->extra.data() + idx, &v, n);
   }
   return old;
 }
 
 // ---- focus and activation ---------------------------------------------------------
 
-HLE("user32.dll", GetFocus, 0) {
+HLE64("user32.dll", GetFocus, 0) {
   std::lock_guard<std::recursive_mutex> l(g_mu);
   return g_focus;
 }
-HLE("user32.dll", SetFocus, 1) {
+HLE64("user32.dll", SetFocus, 1) {
   std::lock_guard<std::recursive_mutex> l(g_mu);
   uint32_t old = g_focus;
   g_focus = Arg(c, 0);
   return old;
 }
-HLE("user32.dll", GetActiveWindow, 0) {
+HLE64("user32.dll", GetActiveWindow, 0) {
   std::lock_guard<std::recursive_mutex> l(g_mu);
   return g_active;
 }
-HLE("user32.dll", SetActiveWindow, 1) {
+HLE64("user32.dll", SetActiveWindow, 1) {
   std::lock_guard<std::recursive_mutex> l(g_mu);
   uint32_t old = g_active;
   g_active = Arg(c, 0);
   return old;
 }
-HLE("user32.dll", GetForegroundWindow, 0) {
+HLE64("user32.dll", GetForegroundWindow, 0) {
   std::lock_guard<std::recursive_mutex> l(g_mu);
   return g_active;
 }
@@ -2763,7 +2836,7 @@ HLE("user32.dll", GetForegroundWindow, 0) {
 // the active one, it gets WM_ACTIVATEAPP, WM_ACTIVATE and WM_SETFOCUS, as
 // from ShowWindow. Games that create a visible window and only call
 // SetForegroundWindow learn they are active this way.
-HLE("user32.dll", SetForegroundWindow, 1) {
+HLE64("user32.dll", SetForegroundWindow, 1) {
   uint32_t hwnd = Arg(c, 0);
   // A child window cannot be the foreground window: its top-level
   // ancestor is activated (a game's child dialogs leave it active).
@@ -2792,25 +2865,31 @@ HLE("user32.dll", SetForegroundWindow, 1) {
   }
   return 1;
 }
-HLE("user32.dll", BringWindowToTop, 1) {
+HLE64("user32.dll", BringWindowToTop, 1) {
   if (SDL_Window* s = SdlWindowFor(Arg(c, 0)); s && !Background()) SDL_RaiseWindow(s);
   return 1;
 }
 
 // ---- messages ----------------------------------------------------------------------
 
-HLE("user32.dll", PeekMessageA, 5) {
-  uint32_t msg_va = Arg(c, 0), hwnd = Arg(c, 1), lo = Arg(c, 2), hi = Arg(c, 3),
-           flags = Arg(c, 4);
+// The W forms of the message functions are the A ones: messages carry the
+// same (US-layout, ASCII) characters to both kinds of window.
+uint64_t PeekMessageImpl(Ctx& c) {
+  gaddr msg_va = Arg(c, 0);
+  uint32_t hwnd = uint32_t(Arg(c, 1)), lo = uint32_t(Arg(c, 2)), hi = uint32_t(Arg(c, 3)),
+           flags = uint32_t(Arg(c, 4));
   PumpHostEvents();
   Msg m;
   if (!TakeHookedMessage(c, hwnd, lo, hi, flags & 1 /* PM_REMOVE */, &m)) return 0;
   PutMsg(msg_va, m);
   return 1;
 }
+HLE64("user32.dll", PeekMessageA, 5) { return PeekMessageImpl(c); }
+HLE64("user32.dll", PeekMessageW, 5) { return PeekMessageImpl(c); }
 
-HLE("user32.dll", GetMessageA, 4) {
-  uint32_t msg_va = Arg(c, 0), hwnd = Arg(c, 1), lo = Arg(c, 2), hi = Arg(c, 3);
+uint64_t GetMessageImpl(Ctx& c) {
+  gaddr msg_va = Arg(c, 0);
+  uint32_t hwnd = uint32_t(Arg(c, 1)), lo = uint32_t(Arg(c, 2)), hi = uint32_t(Arg(c, 3));
   Msg m;
   for (;;) {
     PumpHostEvents();
@@ -2825,56 +2904,64 @@ HLE("user32.dll", GetMessageA, 4) {
   PutMsg(msg_va, m);
   return m.msg == WM_QUIT ? 0 : 1;
 }
+HLE64("user32.dll", GetMessageA, 4) { return GetMessageImpl(c); }
+HLE64("user32.dll", GetMessageW, 4) { return GetMessageImpl(c); }
 
 // PostThreadMessageA(tid, msg, wparam, lparam): a message with no window
 // in that thread's queue.
-HLE("user32.dll", PostThreadMessageA, 4) {
+uint64_t PostThreadMessageImpl(Ctx& c) {
   PostTo(uint32_t(Arg(c, 0)),
-         Msg{0, uint32_t(Arg(c, 1)), uint32_t(Arg(c, 2)), uint32_t(Arg(c, 3)), TickCount(),
-             g_mouse_x, g_mouse_y});
+         Msg{0, uint32_t(Arg(c, 1)), Arg(c, 2), Arg(c, 3), TickCount(), g_mouse_x, g_mouse_y});
   return 1;
 }
+HLE64("user32.dll", PostThreadMessageA, 4) { return PostThreadMessageImpl(c); }
+HLE64("user32.dll", PostThreadMessageW, 4) { return PostThreadMessageImpl(c); }
 
-HLE("user32.dll", PostMessageA, 4) {
-  uint32_t hwnd = Arg(c, 0);
+uint64_t PostMessageImpl(Ctx& c) {
+  uint32_t hwnd = uint32_t(Arg(c, 0));
   if (!hwnd) {
     PostTo(CurrentThread()->tid,
-           Msg{0, uint32_t(Arg(c, 1)), uint32_t(Arg(c, 2)), uint32_t(Arg(c, 3)), TickCount(),
-               g_mouse_x, g_mouse_y});
+           Msg{0, uint32_t(Arg(c, 1)), Arg(c, 2), Arg(c, 3), TickCount(), g_mouse_x, g_mouse_y});
     return 1;
   }
   {
     std::lock_guard<std::recursive_mutex> l(g_mu);
     if (!Win(hwnd)) return 0;
   }
-  Post(hwnd, Arg(c, 1), Arg(c, 2), Arg(c, 3));
+  Post(hwnd, uint32_t(Arg(c, 1)), Arg(c, 2), Arg(c, 3));
   return 1;
 }
+HLE64("user32.dll", PostMessageA, 4) { return PostMessageImpl(c); }
+HLE64("user32.dll", PostMessageW, 4) { return PostMessageImpl(c); }
 
-HLE("user32.dll", PostQuitMessage, 1) {
+HLE64("user32.dll", PostQuitMessage, 1) {
   {
     std::lock_guard<std::recursive_mutex> l(g_mu);
     Queue& q = g_queues[CurrentThread()->tid];
     q.quit = true;
-    q.quit_code = Arg(c, 0);
+    q.quit_code = uint32_t(Arg(c, 0));
   }
   g_queue_cv.notify_all();
   return 0;
 }
 
-HLE("user32.dll", SendMessageA, 4) {
-  return Send(Arg(c, 0), Arg(c, 1), Arg(c, 2), Arg(c, 3));
+HLE64("user32.dll", SendMessageA, 4) {
+  return Send(uint32_t(Arg(c, 0)), uint32_t(Arg(c, 1)), Arg(c, 2), Arg(c, 3));
+}
+HLE64("user32.dll", SendMessageW, 4) {
+  return Send(uint32_t(Arg(c, 0)), uint32_t(Arg(c, 1)), Arg(c, 2), Arg(c, 3));
 }
 
-HLE("user32.dll", DispatchMessageA, 1) {
-  uint32_t m = Arg(c, 0);
-  uint32_t hwnd = Rd32(m), msg = Rd32(m + 4);
-  // WM_TIMER from a timer with a TIMERPROC goes to the procedure.
-  if (msg == WM_TIMER && Rd32(m + 12))
-    return CallGuest(c, Rd32(m + 12), {hwnd, msg, Rd32(m + 8), Rd32(m + 16)});
-  if (!hwnd) return 0;
-  return Send(hwnd, msg, Rd32(m + 8), Rd32(m + 12));
+uint64_t DispatchMessageImpl(Ctx& c) {
+  const Msg m = GetMsg(Arg(c, 0));
+  // WM_TIMER from a timer with a TIMERPROC (in lParam) goes to the procedure.
+  if (m.msg == WM_TIMER && m.lparam)
+    return CallGuest(c, m.lparam, {m.hwnd, m.msg, m.wparam, m.time});
+  if (!m.hwnd) return 0;
+  return Send(m.hwnd, m.msg, m.wparam, m.lparam);
 }
+HLE64("user32.dll", DispatchMessageA, 1) { return DispatchMessageImpl(c); }
+HLE64("user32.dll", DispatchMessageW, 1) { return DispatchMessageImpl(c); }
 
 // ---- hot keys ------------------------------------------------------------------------
 
@@ -2944,10 +3031,10 @@ HLE("user32.dll", KillTimer, 2) {
   return 1;
 }
 
-HLE("user32.dll", TranslateMessage, 1) {
+HLE64("user32.dll", TranslateMessage, 1) {
   // Generate WM_CHAR from WM_KEYDOWN using the US layout and shift/caps.
-  uint32_t m = Arg(c, 0);
-  uint32_t msg = Rd32(m + 4), vk = Rd32(m + 8);
+  const Msg m = GetMsg(Arg(c, 0));
+  uint32_t msg = m.msg, vk = uint32_t(m.wparam);
   if (msg != WM_KEYDOWN && msg != WM_SYSKEYDOWN) return 0;
   bool shift = g_key_down[0x10], caps = g_key_toggled[0x14];
   bool ctrl = g_key_down[0x11];
@@ -2972,7 +3059,7 @@ HLE("user32.dll", TranslateMessage, 1) {
       if (e.vk == vk) ch = uint8_t(shift ? e.s : e.n);
   }
   if (!ch) return 0;
-  Post(Rd32(m), msg == WM_SYSKEYDOWN ? WM_SYSCHAR : WM_CHAR, ch, Rd32(m + 12));
+  Post(m.hwnd, msg == WM_SYSKEYDOWN ? WM_SYSCHAR : WM_CHAR, ch, m.lparam);
   return 1;
 }
 
@@ -2986,8 +3073,10 @@ uint32_t UserProc(const char* name);
 // and dispatched. TRUE when it was the dialog's. (No Tab/arrow navigation
 // or mnemonics.)
 HLE("user32.dll", IsDialogMessageA, 2) {
-  uint32_t dlg = Arg(c, 0), m = Arg(c, 1);
-  uint32_t hwnd = Rd32(m), msg = Rd32(m + 4), wp = Rd32(m + 8);
+  uint32_t dlg = uint32_t(Arg(c, 0));
+  gaddr m = Arg(c, 1);
+  const Msg mm = GetMsg(m);
+  uint32_t hwnd = mm.hwnd, msg = mm.msg, wp = uint32_t(mm.wparam);
   {
     std::lock_guard<std::recursive_mutex> l(g_mu);
     uint32_t w = hwnd;
@@ -3012,25 +3101,26 @@ HLE("user32.dll", IsDialogMessageA, 2) {
   return 1;
 }
 
-HLE("user32.dll", CallWindowProcA, 5) {
+HLE64("user32.dll", CallWindowProcA, 5) {
   return CallGuest(c, Arg(c, 0), {Arg(c, 1), Arg(c, 2), Arg(c, 3), Arg(c, 4)});
 }
-HLE("user32.dll", CallWindowProcW, 5) {
+HLE64("user32.dll", CallWindowProcW, 5) {
   return CallGuest(c, Arg(c, 0), {Arg(c, 1), Arg(c, 2), Arg(c, 3), Arg(c, 4)});
 }
 
-uint32_t DefWindowProc(Ctx& c);
-HLE("user32.dll", DefWindowProcA, 4) { return DefWindowProc(c); }
+uint64_t DefWindowProc(Ctx& c);
+HLE64("user32.dll", DefWindowProcA, 4) { return DefWindowProc(c); }
 // The same for Unicode windows: what the default handling does reads no
 // message text (window text messages are handled the A way, line by line
 // below, for both).
-HLE("user32.dll", DefWindowProcW, 4) { return DefWindowProc(c); }
-uint32_t DefWindowProc(Ctx& c) {
-  uint32_t hwnd = Arg(c, 0), msg = Arg(c, 1), wp = Arg(c, 2);
+HLE64("user32.dll", DefWindowProcW, 4) { return DefWindowProc(c); }
+uint64_t DefWindowProc(Ctx& c) {
+  uint32_t hwnd = uint32_t(Arg(c, 0)), msg = uint32_t(Arg(c, 1));
+  uint64_t wp = Arg(c, 2);
   switch (msg) {
     case WM_NCCREATE: return 1;
     case WM_CLOSE: {
-      uint32_t destroy = ProcAddress(ModuleHandle("user32.dll"), "DestroyWindow");
+      gaddr destroy = ProcAddress(ModuleHandle("user32.dll"), "DestroyWindow");
       CallGuest(c, destroy, {hwnd});
       return 0;
     }
@@ -3053,7 +3143,7 @@ uint32_t DefWindowProc(Ctx& c) {
   }
 }
 
-uint32_t CallDefWindowProc(Ctx& c, uint32_t hwnd, uint32_t msg, uint32_t wp, uint32_t lp);
+uint64_t CallDefWindowProc(Ctx& c, uint32_t hwnd, uint32_t msg, uint64_t wp, uint64_t lp);
 
 // ---- dialog boxes ------------------------------------------------------------------
 //
@@ -3583,13 +3673,14 @@ constexpr uint32_t BM_GETCHECK = 0x00F0, BM_SETCHECK = 0x00F1, BM_GETSTATE = 0x0
 constexpr uint32_t STM_SETICON = 0x0170, STM_GETICON = 0x0171, STM_SETIMAGE = 0x0172,
                    STM_GETIMAGE = 0x0173;
 
-uint32_t CallDefWindowProc(Ctx& c, uint32_t hwnd, uint32_t msg, uint32_t wp, uint32_t lp) {
-  uint32_t def = ProcAddress(ModuleHandle("user32.dll"), "DefWindowProcA");
+uint64_t CallDefWindowProc(Ctx& c, uint32_t hwnd, uint32_t msg, uint64_t wp, uint64_t lp) {
+  gaddr def = ProcAddress(ModuleHandle("user32.dll"), "DefWindowProcA");
   return CallGuest(c, def, {hwnd, msg, wp, lp});
 }
 
 // Messages every control handles the same way; false if `msg` is not one.
-bool CommonControlMsg(Window& w, uint32_t msg, uint32_t wp, uint32_t lp, uint32_t* r) {
+// wp and lp are the message's WPARAM and LPARAM (64-bit on x64).
+bool CommonControlMsg(Window& w, uint32_t msg, uint64_t wp, uint64_t lp, uint32_t* r) {
   switch (msg) {
     case WM_NCCREATE: *r = 1; return true;
     case WM_CREATE: *r = 0; return true;
@@ -3602,7 +3693,7 @@ bool CommonControlMsg(Window& w, uint32_t msg, uint32_t wp, uint32_t lp, uint32_
       return true;
     }
     case WM_GETTEXTLENGTH: *r = uint32_t(w.title.size()); return true;
-    case WM_SETFONT: w.font = wp; *r = 0; return true;
+    case WM_SETFONT: w.font = uint32_t(wp); *r = 0; return true;
     case WM_GETFONT: *r = w.font; return true;
     default: return false;
   }
@@ -3630,15 +3721,16 @@ void UnhandledControlMsg(const char* cls, uint32_t msg) {
     WarnF("%s control: message %04X not modelled, returning 0\n", cls, msg);
 }
 
-HLE_NAMED("user32.dll", "<static>", StaticWndProc, 4) {
-  uint32_t hwnd = Arg(c, 0), msg = Arg(c, 1), wp = Arg(c, 2), lp = Arg(c, 3), r = 0;
+HLE_NAMED_X("user32.dll", "<static>", StaticWndProc, 4, true) {
+  uint32_t hwnd = uint32_t(Arg(c, 0)), msg = uint32_t(Arg(c, 1)), r = 0;
+  uint64_t wp = Arg(c, 2), lp = Arg(c, 3);
   {
     std::lock_guard<std::recursive_mutex> l(g_mu);
     Window* w = Win(hwnd);
     if (!w) return 0;
     if (CommonControlMsg(*w, msg, wp, lp, &r)) return r;
     switch (msg) {
-      case STM_SETIMAGE: case STM_SETICON: r = w->image; w->image = msg == STM_SETICON ? wp : lp; return r;
+      case STM_SETIMAGE: case STM_SETICON: r = w->image; w->image = uint32_t(msg == STM_SETICON ? wp : lp); return r;
       case STM_GETIMAGE: case STM_GETICON: return w->image;
     }
     if (msg >= 0x0170 && msg <= 0x017F) {
@@ -4253,7 +4345,7 @@ HLE64("user32.dll", CallNextHookEx, 4) {
 
 // ---- cursor ------------------------------------------------------------------------
 
-HLE("user32.dll", ShowCursor, 1) {
+HLE64("user32.dll", ShowCursor, 1) {
   g_cursor_count += Arg(c, 0) ? 1 : -1;
   ApplyHostCursor();
   if (!CursorHidden()) EndMouseLook();
@@ -4288,7 +4380,7 @@ bool SyncedCursorPos(int32_t* sx, int32_t* sy) {
   return true;
 }
 
-HLE("user32.dll", GetCursorPos, 1) {
+HLE64("user32.dll", GetCursorPos, 1) {
   int32_t x = g_mouse_x, y = g_mouse_y;
   SyncedCursorPos(&x, &y);
   Wr32(Arg(c, 0), uint32_t(x));
@@ -4394,7 +4486,7 @@ HLE("user32.dll", GetRawInputData, 5) {
   return need;
 }
 
-HLE("user32.dll", SetCursorPos, 2) {
+HLE64("user32.dll", SetCursorPos, 2) {
   g_mouse_x = g_recentre_x = int32_t(Arg(c, 0));
   g_mouse_y = g_recentre_y = int32_t(Arg(c, 1));
   g_last_recentre_ms = TickCount();
@@ -4404,8 +4496,8 @@ HLE("user32.dll", SetCursorPos, 2) {
 
 // ClipCursor(RECT const*): NULL frees the cursor. A rectangle inside one
 // of our windows makes its cursor virtual and grabs the host pointer.
-HLE("user32.dll", ClipCursor, 1) {
-  uint32_t rc = Arg(c, 0);
+HLE64("user32.dll", ClipCursor, 1) {
+  gaddr rc = Arg(c, 0);
   SDL_Window* release = nullptr;
   SDL_Window* grab = nullptr;
   {
@@ -4430,21 +4522,49 @@ HLE("user32.dll", ClipCursor, 1) {
   return 1;
 }
 
+// GetWindowThreadProcessId(hwnd, DWORD* pid): the thread that created the
+// window (0 for no window), and the one process.
+HLE64("user32.dll", GetWindowThreadProcessId, 2) {
+  uint32_t tid = 0;
+  {
+    std::lock_guard<std::recursive_mutex> l(g_mu);
+    if (Window* w = Win(uint32_t(Arg(c, 0)))) tid = w->tid;
+  }
+  if (!tid) return 0;
+  if (gaddr pid = Arg(c, 1)) Wr32(pid, kGuestPid);
+  return tid;
+}
+
+// FlashWindowEx(FLASHWINFO*): taskbar flashing is not shown; the result
+// says the window was not active-looking before (FALSE).
+HLE64("user32.dll", FlashWindowEx, 1) { return 0; }
+
+// TrackMouseEvent(TRACKMOUSEEVENT*): a request for WM_MOUSELEAVE or
+// WM_MOUSEHOVER. Accepted; neither message is generated yet, so a window
+// that waits for WM_MOUSELEAVE keeps thinking the pointer is over it.
+HLE64("user32.dll", TrackMouseEvent, 1) { return 1; }
+
+// RegisterDeviceNotificationW(recipient, filter, flags): device arrival
+// and removal (WM_DEVICECHANGE) are never reported, so the registration is
+// a handle that nothing uses.
+HLE64("user32.dll", RegisterDeviceNotificationW, 3) { return HandleRet(0x00DE0010); }
+HLE64("user32.dll", UnregisterDeviceNotification, 1) { return 1; }
+
 // Mouse capture: there is one game window, so mouse messages go to it
 // either way; the capture window is only remembered.
-HLE("user32.dll", SetCapture, 1) {
+HLE64("user32.dll", SetCapture, 1) {
   std::lock_guard<std::recursive_mutex> l(g_mu);
   uint32_t old = g_capture;
   g_capture = Arg(c, 0);
   return old;
 }
 
-HLE("user32.dll", GetCapture, 0) {
+HLE64("user32.dll", GetCapture, 0) {
   std::lock_guard<std::recursive_mutex> l(g_mu);
   return g_capture;
 }
 
-HLE("user32.dll", ReleaseCapture, 0) {
+HLE64("user32.dll", ReleaseCapture, 0) {
   std::lock_guard<std::recursive_mutex> l(g_mu);
   g_capture = 0;
   return 1;
@@ -4464,30 +4584,51 @@ std::vector<Mode> Modes() {
   return m;
 }
 
-void PutDevMode(uint32_t dm, const Mode& m) {
-  std::memset(GPtr(dm), 0, 156);
-  PutStr(dm, win32::Upper(Game().id) + " Display");
-  Wr16(dm + 32, 0x0401);  // dmSpecVersion
-  Wr16(dm + 36, 156);     // dmSize
-  Wr32(dm + 40, 0x001C0000 | 0x00400000);  // BITSPERPEL|PELSWIDTH|PELSHEIGHT|DISPLAYFREQUENCY
-  Wr32(dm + 104, uint32_t(m.bpp));
-  Wr32(dm + 108, uint32_t(m.w));
-  Wr32(dm + 112, uint32_t(m.h));
-  Wr32(dm + 120, uint32_t(m.hz));
+// DEVMODEA (156 bytes) or DEVMODEW (220): the W form's two names
+// (dmDeviceName, dmFormName) are 32 WCHARs instead of 32 chars, so its
+// fields after the first sit 32 bytes on, after the second 64. No
+// pointers: the same on x64.
+struct DevModeLayout {
+  uint32_t size, spec, fields, bpp, w, h, hz;
+};
+DevModeLayout DevModeFields(bool wide) {
+  return wide ? DevModeLayout{220, 64, 72, 168, 172, 176, 184}
+              : DevModeLayout{156, 32, 40, 104, 108, 112, 120};
 }
 
-HLE("user32.dll", EnumDisplaySettingsA, 3) {
+void PutDevMode(gaddr dm, const Mode& m, bool wide) {
+  const DevModeLayout f = DevModeFields(wide);
+  std::memset(GPtr(dm), 0, f.size);
+  const std::string name = win32::Upper(Game().id) + " Display";
+  if (wide) {
+    for (size_t i = 0; i < name.size(); i++) Wr16(dm + 2 * i, uint8_t(name[i]));
+  } else {
+    PutStr(dm, name);
+  }
+  Wr16(dm + f.spec, 0x0401);                       // dmSpecVersion
+  Wr16(dm + f.spec + 4, uint16_t(f.size));         // dmSize
+  Wr32(dm + f.fields, 0x001C0000 | 0x00400000);  // BITSPERPEL|PELSWIDTH|PELSHEIGHT|DISPLAYFREQUENCY
+  Wr32(dm + f.bpp, uint32_t(m.bpp));
+  Wr32(dm + f.w, uint32_t(m.w));
+  Wr32(dm + f.h, uint32_t(m.h));
+  Wr32(dm + f.hz, uint32_t(m.hz));
+}
+
+uint64_t EnumDisplaySettings(Ctx& c, bool wide) {
   EnsureSdlVideo();
-  uint32_t idx = Arg(c, 1), dm = Arg(c, 2);
+  uint32_t idx = uint32_t(Arg(c, 1));
+  gaddr dm = Arg(c, 2);
   if (idx == 0xFFFFFFFF || idx == 0xFFFFFFFE) {  // ENUM_CURRENT/REGISTRY_SETTINGS
-    PutDevMode(dm, {g_display_w, g_display_h, 32, DesktopRefreshRate()});
+    PutDevMode(dm, {g_display_w, g_display_h, 32, DesktopRefreshRate()}, wide);
     return 1;
   }
   auto modes = Modes();
   if (idx >= modes.size()) return 0;
-  PutDevMode(dm, modes[idx]);
+  PutDevMode(dm, modes[idx], wide);
   return 1;
 }
+HLE64("user32.dll", EnumDisplaySettingsA, 3) { return EnumDisplaySettings(c, false); }
+HLE64("user32.dll", EnumDisplaySettingsW, 3) { return EnumDisplaySettings(c, true); }
 
 // ---- monitors -----------------------------------------------------------------
 // One monitor, the primary, covering the screen the game sees (the
@@ -4498,11 +4639,11 @@ HLE("user32.dll", EnumDisplaySettingsA, 3) {
 // MonitorFromWindow(hwnd, flags), MonitorFromPoint(POINT by value, flags),
 // MonitorFromRect(rect, flags): the one monitor, whatever the flags ask
 // for a window or point off every monitor (nearest or primary are it).
-HLE("user32.dll", MonitorFromWindow, 2) { return kPrimaryMonitor; }
-HLE("user32.dll", MonitorFromPoint, 3) { return kPrimaryMonitor; }
-HLE("user32.dll", MonitorFromRect, 2) { return kPrimaryMonitor; }
+HLE64("user32.dll", MonitorFromWindow, 2) { return kPrimaryMonitor; }
+HLE64("user32.dll", MonitorFromPoint, 3) { return kPrimaryMonitor; }
+HLE64("user32.dll", MonitorFromRect, 2) { return kPrimaryMonitor; }
 
-HLE("user32.dll", SetProcessDPIAware, 0) { return 1; }
+HLE64("user32.dll", SetProcessDPIAware, 0) { return 1; }
 
 // EnumDisplayMonitors(hdc, clip, proc, data): proc(hmonitor, hdc, &rect,
 // data) for the one monitor; stops early if it returns FALSE.
@@ -4568,36 +4709,40 @@ HLE("dwmapi.dll", DwmSetWindowAttribute, 4) { return 0; }  // S_OK
 // the game switches to becomes the screen it sees (GetSystemMetrics,
 // EnumDisplaySettings), as after a real switch; a window covering it goes
 // host fullscreen (UpdateFullscreen). NULL restores the desktop size.
-HLE("user32.dll", ChangeDisplaySettingsA, 2) {
+uint64_t ChangeDisplaySettings(Ctx& c, bool wide) {
   EnsureSdlVideo();
-  uint32_t dm = Arg(c, 0), flags = Arg(c, 1);
+  gaddr dm = Arg(c, 0);
+  uint32_t flags = uint32_t(Arg(c, 1));
+  const DevModeLayout f = DevModeFields(wide);
   if (!dm) {
     g_display_w = g_desktop_w;
     g_display_h = g_desktop_h;
     UpdateFullscreenAll();
     return 0;  // DISP_CHANGE_SUCCESSFUL
   }
-  uint32_t fields = Rd32(dm + 40);
-  int w = (fields & 0x00080000) ? int(Rd32(dm + 108)) : g_display_w;  // DM_PELSWIDTH
-  int h = (fields & 0x00100000) ? int(Rd32(dm + 112)) : g_display_h;  // DM_PELSHEIGHT
-  int bpp = (fields & 0x00040000) ? int(Rd32(dm + 104)) : 32;         // DM_BITSPERPEL
+  uint32_t fields = Rd32(dm + f.fields);
+  int w = (fields & 0x00080000) ? int(Rd32(dm + f.w)) : g_display_w;  // DM_PELSWIDTH
+  int h = (fields & 0x00100000) ? int(Rd32(dm + f.h)) : g_display_h;  // DM_PELSHEIGHT
+  int bpp = (fields & 0x00040000) ? int(Rd32(dm + f.bpp)) : 32;       // DM_BITSPERPEL
   bool known = false;
   for (const Mode& m : Modes()) known |= m.w == w && m.h == h && m.bpp == bpp;
-  if (!known) return uint32_t(-2);  // DISP_CHANGE_BADMODE
+  if (!known) return uint32_t(-2);  // DISP_CHANGE_BADMODE (a LONG)
   if (flags & 2) return 0;          // CDS_TEST
   g_display_w = w;
   g_display_h = h;
   UpdateFullscreenAll();
   return 0;
 }
+HLE64("user32.dll", ChangeDisplaySettingsA, 2) { return ChangeDisplaySettings(c, false); }
+HLE64("user32.dll", ChangeDisplaySettingsW, 2) { return ChangeDisplaySettings(c, true); }
 
 // ---- painting and GDI device contexts (no GDI drawing reaches the screen;
 // the game renders through DirectDraw) -------------------------------------------------
 
 // Device contexts are named after their window (see DcForWindow); the
 // screen DC (GetDC(NULL)) is a constant.
-HLE("user32.dll", GetDC, 1) { return DcForWindow(Arg(c, 0)); }
-HLE("user32.dll", ReleaseDC, 2) { return 1; }
+HLE64("user32.dll", GetDC, 1) { return HandleRet(DcForWindow(uint32_t(Arg(c, 0)))); }
+HLE64("user32.dll", ReleaseDC, 2) { return 1; }
 HLE("user32.dll", BeginPaint, 2) {
   uint32_t ps = Arg(c, 1), dc = DcForWindow(Arg(c, 0));
   std::memset(GPtr(ps), 0, 64);
@@ -4619,11 +4764,14 @@ HLE("user32.dll", DrawFrameControl, 4) { return 1; }
 
 // ---- clipboard (not wired to the host yet) --------------------------------------------
 
-HLE("user32.dll", OpenClipboard, 1) { return 0; }
-HLE("user32.dll", CloseClipboard, 0) { return 1; }
-HLE("user32.dll", EmptyClipboard, 0) { return 0; }
-HLE("user32.dll", GetClipboardData, 1) { return 0; }
-HLE("user32.dll", SetClipboardData, 2) { return 0; }
+// IsClipboardFormatAvailable(format): the clipboard is never opened
+// (OpenClipboard fails), so it holds nothing.
+HLE64("user32.dll", IsClipboardFormatAvailable, 1) { return 0; }
+HLE64("user32.dll", OpenClipboard, 1) { return 0; }
+HLE64("user32.dll", CloseClipboard, 0) { return 1; }
+HLE64("user32.dll", EmptyClipboard, 0) { return 0; }
+HLE64("user32.dll", GetClipboardData, 1) { return 0; }
+HLE64("user32.dll", SetClipboardData, 2) { return 0; }
 
 }  // namespace
 }  // namespace hle
