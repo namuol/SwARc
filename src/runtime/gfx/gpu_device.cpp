@@ -29,6 +29,8 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <functional>
+#include <future>
 #include <map>
 #include <mutex>
 #include <thread>
@@ -535,7 +537,13 @@ class GpuDevice final : public Device {
     if (gamma_tex_) SDL_ReleaseGPUTexture(dev_, gamma_tex_);
     if (gamma_tb_) SDL_ReleaseGPUTransferBuffer(dev_, gamma_tb_);
     for (auto& [k, s] : program_samplers_) SDL_ReleaseGPUSampler(dev_, s);
-    for (auto& [id, sh] : shaders_) SDL_ReleaseGPUShader(dev_, sh.sh);
+    {
+      std::lock_guard<std::mutex> l(compile_mu_);
+      compile_quit_ = true;
+    }
+    compile_cv_.notify_all();
+    for (std::thread& t : compile_threads_) t.join();
+    for (auto& [id, sh] : shaders_) SDL_ReleaseGPUShader(dev_, Gpu(sh));
     for (auto& [k, s] : samplers_) SDL_ReleaseGPUSampler(dev_, s);
     for (auto& [id, t] : textures_) SDL_ReleaseGPUTexture(dev_, t.tex);
     for (auto& [id, d] : depths_) SDL_ReleaseGPUTexture(dev_, d.tex);
@@ -1380,28 +1388,22 @@ void r_color0(inout vec4 c) {
       sh.samplers = std::max(sh.samplers, smp.reg + 1);
     }
     bool vertex = prog.stage == hlsl::Stage::Vertex;
-    if (!vertex) sh.glsl = prog.glsl;  // for its occlusion-counting variant
-    sh.sh = CompileShader(prog.stage, sh.samplers, prog.glsl, false, 0);
+    if (!vertex) sh.glsl = prog.glsl;  // for its variants
+    // Compiled on the pool (CompileAsync): games create their shaders well
+    // before drawing with them (Source: some 2000 before its menu), and
+    // Metal's compiler takes tens of milliseconds for each.
+    DumpShader(prog.stage, sh.samplers, prog.glsl);
+    sh.pending = CompileAsync(sh, prog.glsl);
     ShaderId id = next_id_++;
     shaders_[id] = std::move(sh);
     return id;
   }
 
+
   SDL_GPUShader* CompileShader(hlsl::Stage stage, uint32_t samplers, const std::string& body,
                                bool occl, uint32_t shadow) {
     bool vertex = stage == hlsl::Stage::Vertex;
     std::string glsl = "#version 450\n" + Prelude(stage, samplers, occl, shadow) + body;
-    // Dev aid: <ID>_SHADER_DUMP=DIR writes each translated shader's GLSL
-    // there, as vs_NNNNN.glsl / ps_NNNNN.glsl in creation order.
-    if (const char* dir = Env("SHADER_DUMP")) {
-      static int n = 0;
-      char path[1024];
-      std::snprintf(path, sizeof path, "%s/%s_%05d.glsl", dir, vertex ? "vs" : "ps", n++);
-      if (std::FILE* f = std::fopen(path, "w")) {
-        std::fwrite(glsl.data(), 1, glsl.size(), f);
-        std::fclose(f);
-      }
-    }
     std::vector<uint32_t> spirv;
     std::string log;
     if (!GlslToSpirv(glsl, vertex ? ShaderStage::Vertex : ShaderStage::Fragment, &spirv, &log)) {
@@ -1442,6 +1444,7 @@ void r_color0(inout vec4 c) {
     Shader v = sh;
     v.glsl.clear();
     v.variants.clear();
+    v.pending = {};
     v.sh = CompileShader(sh.stage, sh.samplers, sh.glsl, occl, shadow);
     ShaderId id = next_id_++;
     sh.variants[key] = id;
@@ -1465,7 +1468,7 @@ void r_color0(inout vec4 c) {
     }
     std::vector<ShaderId> variants;
     for (const auto& [k, v] : it->second.variants) variants.push_back(v);
-    SDL_ReleaseGPUShader(dev_, it->second.sh);
+    SDL_ReleaseGPUShader(dev_, Gpu(it->second));
     shaders_.erase(it);
     for (ShaderId v : variants) DestroyShader(v);
   }
@@ -2405,6 +2408,11 @@ void r_color0(inout vec4 c) {
     ShaderKey key{};
     bool occl = false;  // counts for an occlusion query (binds occl_buf_)
   };
+  // A shader's compile: run once, by a pool thread or by Gpu.
+  struct CompileJob {
+    std::atomic<bool> claimed{false};
+    std::packaged_task<SDL_GPUShader*()> task;
+  };
   struct Shader {
     SDL_GPUShader* sh = nullptr;
     hlsl::Stage stage = hlsl::Stage::Vertex;
@@ -2414,7 +2422,74 @@ void r_color0(inout vec4 c) {
     uint32_t float_regs = 0;
     std::string glsl;    // a pixel shader's translation (for its variants)
     std::map<uint32_t, ShaderId> variants;  // Variant's, by shadow << 1 | occl
+    std::shared_future<SDL_GPUShader*> pending;  // sh while compiling (Gpu)
+    std::shared_ptr<CompileJob> job;             // its compile, until done
   };
+
+  // A shader's GPU shader, waiting for its compilation if still pending.
+  // One not started yet is compiled here and now (taken off the pool's
+  // queue): a draw waits for its own shaders only.
+  static SDL_GPUShader* Gpu(Shader& s) {
+    if (!s.sh && s.pending.valid()) {
+      if (s.job && !s.job->claimed.exchange(true)) s.job->task();
+      s.sh = s.pending.get();
+      s.job.reset();
+    }
+    return s.sh;
+  }
+
+  // Dev aid: <ID>_SHADER_DUMP=DIR writes each translated shader's GLSL
+  // there, as vs_NNNNN.glsl / ps_NNNNN.glsl in creation order.
+  void DumpShader(hlsl::Stage stage, uint32_t samplers, const std::string& body) {
+    const char* dir = Env("SHADER_DUMP");
+    if (!dir) return;
+    static int n = 0;
+    const bool vertex = stage == hlsl::Stage::Vertex;
+    const std::string glsl = "#version 450\n" + Prelude(stage, samplers) + body;
+    char path[1024];
+    std::snprintf(path, sizeof path, "%s/%s_%05d.glsl", dir, vertex ? "vs" : "ps", n++);
+    if (std::FILE* f = std::fopen(path, "w")) {
+      std::fwrite(glsl.data(), 1, glsl.size(), f);
+      std::fclose(f);
+    }
+  }
+
+  // CompileShader on the compile pool (whoever claims the job runs it):
+  // the result once done.
+  std::shared_future<SDL_GPUShader*> CompileAsync(Shader& sh, const std::string& body) {
+    const hlsl::Stage stage = sh.stage;
+    const uint32_t samplers = sh.samplers;
+    auto job = std::make_shared<CompileJob>();
+    job->task = std::packaged_task<SDL_GPUShader*()>(
+        [this, stage, samplers, body] { return CompileShader(stage, samplers, body, false, 0); });
+    std::shared_future<SDL_GPUShader*> f = job->task.get_future().share();
+    sh.job = job;
+    {
+      std::lock_guard<std::mutex> l(compile_mu_);
+      if (compile_threads_.empty()) {
+        const unsigned hw = std::thread::hardware_concurrency();
+        const unsigned n = std::clamp(hw > 2 ? hw - 2 : 1u, 1u, 8u);
+        for (unsigned i = 0; i < n; i++) compile_threads_.emplace_back([this] { CompileWorker(); });
+      }
+      compile_jobs_.push_back(job);
+    }
+    compile_cv_.notify_one();
+    return f;
+  }
+
+  void CompileWorker() {
+    for (;;) {
+      std::shared_ptr<CompileJob> job;
+      {
+        std::unique_lock<std::mutex> l(compile_mu_);
+        compile_cv_.wait(l, [&] { return compile_quit_ || !compile_jobs_.empty(); });
+        if (compile_jobs_.empty()) return;  // quitting, nothing left
+        job = std::move(compile_jobs_.front());
+        compile_jobs_.pop_front();
+      }
+      if (!job->claimed.exchange(true)) job->task();
+    }
+  }
   struct BlitTex {
     SDL_GPUTexture* tex;
     int w, h;
@@ -4408,7 +4483,7 @@ void r_color0(inout vec4 c) {
     if (it != shader_pipelines_.end()) return it->second;
     const uint8_t alpha[3] = {k.src_a, k.dst_a, k.op_a};
     SDL_GPUGraphicsPipeline* p =
-        CreatePipeline(k.k, shaders_.at(k.vs).sh, shaders_.at(k.ps).sh, alpha);
+        CreatePipeline(k.k, Gpu(shaders_.at(k.vs)), Gpu(shaders_.at(k.ps)), alpha);
     shader_pipelines_[k] = p;
     return p;
   }
@@ -4957,6 +5032,12 @@ void r_color0(inout vec4 c) {
   std::deque<VariantJob> variant_jobs_;
   bool variant_quit_ = false;
   std::thread variant_worker_;
+  // The translated shaders' compile pool (CompileAsync).
+  std::mutex compile_mu_;
+  std::condition_variable compile_cv_;
+  std::deque<std::shared_ptr<CompileJob>> compile_jobs_;
+  std::vector<std::thread> compile_threads_;
+  bool compile_quit_ = false;
   enum class VariantMode { Async, Sync, Off } variant_mode_ = VariantMode::Async;
   int variant_fs_ = -1;  // FfPipeline's last lookup: fs_list_ index, ...
   bool variant_discard_ = false;
