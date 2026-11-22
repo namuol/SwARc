@@ -276,9 +276,17 @@ echo "    Translating $names to C++..."
 lift=(--exe) args=()
 for ((i = 0; i < LIFT_N; i++)); do
   img=${LIFT_FILES[$i]} sym="$WORK/symbols-${LIFT_FILES[$i]//\//_}"  # images can be in subfolders
-  run "Reading $img" /usr/bin/python3 -I "$KIT/bin/pe_symbols.py" "$game/$img" --out "$sym" --seeds --quiet
+  src="$game/$img" redist=${LIFT_REDISTS[$i]:-}
+  if [ -n "$redist" ]; then
+    # A runtime DLL (msvcp140.dll...) from the Visual C++ redistributable the
+    # game ships; the app carries the extracted DLL in Contents/Resources.
+    src="$WORK/redist/$(basename "$img")"
+    run "Extracting $img from $redist" /usr/bin/python3 -I "$KIT/bin/vcredist.py" \
+      "$game/$redist" "$WORK/redist" "$(basename "$img")"
+  fi
+  run "Reading $img" /usr/bin/python3 -I "$KIT/bin/pe_symbols.py" "$src" --out "$sym" --seeds --quiet
   [ $i -gt 0 ] && lift=(--module)
-  args+=("${lift[@]}" "$game/$img" --symbols "$sym" --manifest "$KIT/data/${LIFT_MANIFESTS[$i]}")
+  args+=("${lift[@]}" "$src" --symbols "$sym" --manifest "$KIT/data/${LIFT_MANIFESTS[$i]}")
   [ -n "${LIFT_BASES[$i]}" ] && args+=(--base "${LIFT_BASES[$i]}")
 done
 run "Translating" "$KIT/bin/recomp_lift" "${LIFT_ARGS[@]+"${LIFT_ARGS[@]}"}" "${args[@]}" --out "$WORK/generated"
@@ -369,6 +377,7 @@ cp "$KIT/VERSION" "$B/Resources/kit-version"
 cp "$KIT/player.sh" "$KIT/game.env" "$B/Resources/"
 cp "$KIT"/lib/*.dylib "$B/Frameworks/"
 cp "$KIT/licenses/THIRD-PARTY.txt" "$B/Resources/"
+[ -d "$WORK/redist" ] && cp "$WORK"/redist/* "$B/Resources/"
 run "Signing" codesign --force --sign - "$B/MacOS/$APP"
 run "Signing" codesign --force --sign - "$WORK/$APP.app"
 ok "Built in $(( (SECONDS - started) / 60 )) min $(( (SECONDS - started) % 60 )) s"
