@@ -50,7 +50,8 @@ constexpr SDL_MouseID kTestRelative = 0xD51D53;
 // TEST_INPUT "shot NAME": an SDL user event whose code indexes g_shot_names.
 constexpr Uint32 kShotEvent = SDL_EVENT_USER + 0x51;
 std::vector<std::string> g_shot_names;
-// TEST_INPUT "wait" (code indexes g_waits) and "exit".
+// TEST_INPUT "wait" (code indexes g_waits) and "exit". "leave" is a host
+// SDL_EVENT_WINDOW_MOUSE_LEAVE: the pointer leaves the game's window.
 constexpr Uint32 kWaitEvent = SDL_EVENT_USER + 0x52;
 constexpr Uint32 kExitEvent = SDL_EVENT_USER + 0x53;
 struct TestWait {
@@ -182,6 +183,9 @@ struct Clip {
 };
 Clip g_clip;
 uint32_t g_capture = 0;  // SetCapture
+// TrackMouseEvent's TME_LEAVE: the window that gets WM_MOUSELEAVE when the
+// pointer leaves it (once: a window asks again after each one), or 0.
+uint32_t g_track_leave = 0;
 
 // RegisterHotKey: a matching key press becomes WM_HOTKEY instead of a key
 // message, as on Windows (here only while one of our windows has focus).
@@ -270,6 +274,17 @@ void Post(uint32_t hwnd, uint32_t msg, uint64_t wp, uint64_t lp) {
     tid = w ? w->tid : CurrentThread()->tid;
   }
   PostTo(tid, Msg{hwnd, msg, wp, lp, TickCount(), g_mouse_x, g_mouse_y});
+}
+
+// WM_MOUSELEAVE to the window TrackMouseEvent tracks, which then isn't
+// tracked any more.
+void PostMouseLeave() {
+  std::lock_guard<std::recursive_mutex> l(g_mu);
+  if (!g_track_leave) return;
+  const uint32_t hwnd = g_track_leave;
+  g_track_leave = 0;
+  RECOMP_TRACE("  WM_MOUSELEAVE -> %X\n", hwnd);
+  Post(hwnd, 0x02A3 /* WM_MOUSELEAVE */, 0, 0);
 }
 
 // Synchronous delivery to the guest WndProc (SendMessage semantics). The
@@ -837,12 +852,16 @@ void HandleSdlEvent(const SDL_Event& e) {
       {
         int cx, cy;
         uint32_t t = RouteMouse(h, g_mouse_x, g_mouse_y, &cx, &cy);
+        // Over another window (a child included) the tracked one has lost
+        // the pointer, as on Windows.
+        if (g_track_leave && g_track_leave != t) PostMouseLeave();
         Post(t, WM_MOUSEMOVE, MouseKeys(), MkLparam(cx, cy));
       }
       break;
     }
     case SDL_EVENT_WINDOW_MOUSE_LEAVE:
       g_pointer_inside = false;
+      PostMouseLeave();
       break;
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
     case SDL_EVENT_MOUSE_BUTTON_UP: {
@@ -1512,6 +1531,10 @@ void InjectTestInput() {
         SDL_Event e{};
         e.type = kExitEvent;
         q.push_back({t, e});
+      } else if (c == "leave") {  // the pointer leaves the window (WM_MOUSELEAVE)
+        SDL_Event e{};
+        e.type = SDL_EVENT_WINDOW_MOUSE_LEAVE;
+        q.push_back({t, e});
       } else {
         WarnF("TEST_INPUT: bad line: %s", line);
       }
@@ -1638,6 +1661,8 @@ void InjectTestInput() {
       e.key.windowID = id;
     } else if (e.type == SDL_EVENT_MOUSE_WHEEL) {
       e.wheel.windowID = id;
+    } else if (e.type == SDL_EVENT_WINDOW_MOUSE_LEAVE) {
+      e.window.windowID = id;
     } else {
       e.button.windowID = id;
     }
@@ -4539,10 +4564,44 @@ HLE64("user32.dll", GetWindowThreadProcessId, 2) {
 // says the window was not active-looking before (FALSE).
 HLE64("user32.dll", FlashWindowEx, 1) { return 0; }
 
-// TrackMouseEvent(TRACKMOUSEEVENT*): a request for WM_MOUSELEAVE or
-// WM_MOUSEHOVER. Accepted; neither message is generated yet, so a window
-// that waits for WM_MOUSELEAVE keeps thinking the pointer is over it.
-HLE64("user32.dll", TrackMouseEvent, 1) { return 1; }
+// TrackMouseEvent(TRACKMOUSEEVENT*): {DWORD cbSize, dwFlags; HWND
+// hwndTrack; DWORD dwHoverTime} (16 bytes; 24 on x64, hwndTrack 8 bytes at
+// the same offset). TME_LEAVE asks for one WM_MOUSELEAVE when the pointer
+// leaves the window: the host window's leave event, or the pointer over
+// another window (PostMouseLeave). Posted at once when the pointer isn't
+// over it now. Only one window is tracked: the game's. TME_HOVER is
+// accepted but WM_MOUSEHOVER isn't generated; TME_NONCLIENT has no
+// non-client area to track here.
+HLE64("user32.dll", TrackMouseEvent, 1) {
+  enum : uint32_t { kLeave = 2, kQuery = 0x40000000, kCancel = 0x80000000 };
+  const gaddr p = Arg(c, 0);
+  if (!p) return 0;
+  const uint32_t flags = Rd32(p + 4);
+  const uint32_t hwnd = uint32_t(RdPtr(p + 8));
+  RECOMP_TRACE("  TrackMouseEvent(%X, flags %X)\n", hwnd, flags);
+  std::lock_guard<std::recursive_mutex> l(g_mu);
+  if (flags & kQuery) {
+    Wr32(p + 4, g_track_leave ? kLeave : 0);
+    WrPtr(p + 8, hle::HandleRet(g_track_leave));
+    return 1;
+  }
+  if (!(flags & kLeave)) return 1;
+  if (flags & kCancel) {
+    if (g_track_leave == hwnd) g_track_leave = 0;
+    return 1;
+  }
+  Window* w = Win(hwnd);
+  if (!w) return 0;
+  g_track_leave = hwnd;
+  uint32_t top = hwnd;
+  for (int depth = 0; w && w->parent && depth < 16; depth++) {
+    top = w->parent;
+    w = Win(top);
+  }
+  int cx, cy;
+  if (!g_pointer_inside || RouteMouse(top, g_mouse_x, g_mouse_y, &cx, &cy) != hwnd) PostMouseLeave();
+  return 1;
+}
 
 // RegisterDeviceNotificationW(recipient, filter, flags): device arrival
 // and removal (WM_DEVICECHANGE) are never reported, so the registration is
