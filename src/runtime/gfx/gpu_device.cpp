@@ -1296,6 +1296,12 @@ vec4 r_srgb_in(int n, vec4 c) {
 )";
       // Metal samplers have no LOD bias (SDL_GPU drops it there): the
       // shader adds it where the level is implicit. Vulkan's apply it.
+      // Dev aid: <ID>_NAN_PAINT=1 paints pixels whose colour is NaN or
+      // infinite magenta.
+      {
+        static const bool paint = [] { const char* e = Env("NAN_PAINT"); return e && *e && *e != '0'; }();
+        p += paint ? "#define R_NAN_PAINT 1\n" : "#define R_NAN_PAINT 0\n";
+      }
       p += metal ? "#define R_BIAS(n) r_bias[(n) >> 2][(n) & 3]\n" : "#define R_BIAS(n) 0.0\n";
       p += R"(// Fog after a pixel shader (before shader model 3): the factor is the
 // vertex stage's FOG output (vertex fog), or from the depth by FOGTABLEMODE
@@ -1314,7 +1320,12 @@ void r_fog(inout vec4 c, float vf) {
 vec2 r_vpos() { return gl_FragCoord.xy - 0.5; }
 float r_vface() { return gl_FrontFacing ? 1.0 : -1.0; }
 // The alpha test, on the alpha at 8-bit precision.
+bool r_nonfinite(vec4 c) {  // by the bits: fast math may fold isnan away
+  uvec4 e = (floatBitsToUint(c) >> 23) & 0xFFu;
+  return any(equal(e, uvec4(0xFFu)));
+}
 void r_color0(inout vec4 c) {
+  if (R_NAN_PAINT != 0 && r_nonfinite(c)) { c = vec4(1.0, 0.0, 1.0, 1.0); return; }
   int a = int(round(clamp(c.a, 0.0, 1.0) * 255.0)), ref = r_alpha.y;
   bool pass = true;
   switch (r_alpha.x) {

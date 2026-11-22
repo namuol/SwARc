@@ -443,8 +443,14 @@ class Translator {
       case MOVA: need(1); return S(s[0]);
       case ADD: need(2); return "(" + S(s[0]) + " + " + S(s[1]) + ")";
       case SUB: need(2); return "(" + S(s[0]) + " - " + S(s[1]) + ")";
-      case MUL: need(2); return "(" + S(s[0]) + " * " + S(s[1]) + ")";
-      case MAD: need(3); return "(" + S(s[0]) + " * " + S(s[1]) + " + " + S(s[2]) + ")";
+      // D3D9's multiplies give 0 when either factor is 0, even with an
+      // infinite or NaN other factor (r_lmul): shaders depend on it (Source's
+      // skin shaders: 0 * log2(0) in a pow).
+      case MUL: need(2); helpers_.insert("lmul"); return "r_lmul(" + S(s[0]) + ", " + S(s[1]) + ")";
+      case MAD:
+        need(3);
+        helpers_.insert("lmul");
+        return "(r_lmul(" + S(s[0]) + ", " + S(s[1]) + ") + " + S(s[2]) + ")";
       case MIN: need(2); return "min(" + S(s[0]) + ", " + S(s[1]) + ")";
       case MAX: need(2); return "max(" + S(s[0]) + ", " + S(s[1]) + ")";
       case SLT: need(2); return "vec4(lessThan(" + S(s[0]) + ", " + S(s[1]) + "))";
@@ -467,23 +473,30 @@ class Translator {
           return "r_logp1(" + S1(s[0]) + ")";
         }
         return "vec4(log2(abs(" + S1(s[0]) + ")))";
-      case POW: need(2); return "vec4(pow(abs(" + S1(s[0]) + "), " + S1(s[1]) + "))";
-      case DP3: need(2); return "vec4(dot((" + S(s[0]) + ").xyz, (" + S(s[1]) + ").xyz))";
-      case DP4: need(2); return "vec4(dot(" + S(s[0]) + ", " + S(s[1]) + "))";
+      case POW: need(2); helpers_.insert("lmul"); return "vec4(r_lpow(" + S1(s[0]) + ", " + S1(s[1]) + "))";
+      case DP3: need(2); helpers_.insert("lmul"); return "vec4(r_ldot3(" + S(s[0]) + ", " + S(s[1]) + "))";
+      case DP4: need(2); helpers_.insert("lmul"); return "vec4(r_ldot4(" + S(s[0]) + ", " + S(s[1]) + "))";
       case DP2ADD:
         need(3);
-        return "vec4(dot((" + S(s[0]) + ").xy, (" + S(s[1]) + ").xy) + " + S1(s[2]) + ")";
+        helpers_.insert("lmul");
+        return "vec4(r_ldot2(" + S(s[0]) + ", " + S(s[1]) + ") + " + S1(s[2]) + ")";
       case LIT: need(1); helpers_.insert("lit"); return "r_lit(" + S(s[0]) + ")";
       case DST:
         need(2);
         return "vec4(1.0, (" + S(s[0]) + ").y * (" + S(s[1]) + ").y, (" + S(s[0]) + ").z, (" +
                S(s[1]) + ").w)";
-      case LRP: need(3); return "mix(" + S(s[2]) + ", " + S(s[1]) + ", " + S(s[0]) + ")";
+      case LRP:
+        need(3);
+        helpers_.insert("lmul");
+        return "(r_lmul(" + S(s[0]) + ", " + S(s[1]) + " - " + S(s[2]) + ") + " + S(s[2]) + ")";
       case FRC: need(1); return "fract(" + S(s[0]) + ")";
       case ABS: need(1); return "abs(" + S(s[0]) + ")";
       case SGN: need(1); return "sign(" + S(s[0]) + ")";
       case CRS: need(2); return "vec4(cross((" + S(s[0]) + ").xyz, (" + S(s[1]) + ").xyz), 0.0)";
-      case NRM: need(1); return "(" + S(s[0]) + " * inversesqrt(dot((" + S(s[0]) + ").xyz, (" + S(s[0]) + ").xyz)))";
+      case NRM:
+        need(1);
+        helpers_.insert("lmul");
+        return "r_lmul(" + S(s[0]) + ", vec4(inversesqrt(r_ldot3(" + S(s[0]) + ", " + S(s[0]) + "))))";
       case SINCOS: need(1); return "vec4(cos(" + S1(s[0]) + "), sin(" + S1(s[0]) + "), 0.0, 0.0)";
       case CMP:
         need(3);
@@ -508,7 +521,8 @@ class Translator {
           Param row = s[1];
           row.num += uint32_t(k);
           std::string b = S(row);
-          r += three ? "dot((" + a + ").xyz, (" + b + ").xyz)" : "dot(" + a + ", " + b + ")";
+          helpers_.insert("lmul");
+          r += (three ? "r_ldot3(" : "r_ldot4(") + a + ", " + b + ")";
         }
         return r + ")";
       }
@@ -1027,6 +1041,22 @@ class Translator {
         help += "  if (i == " + std::to_string(k) + ") return r_dc" + std::to_string(k) + ";\n";
       help += "  return i >= 0 && i < " + std::to_string(max_c_) + " ? c[i] : vec4(0.0);\n}\n";
     }
+    if (helpers_.count("lmul"))
+      help +=
+          "vec4 r_lmul(vec4 a, vec4 b) {\n"
+          "  bvec4 z = bvec4(uvec4(equal(a, vec4(0.0))) | uvec4(equal(b, vec4(0.0))));\n"
+          "  return mix(a * b, vec4(0.0), z);\n"
+          "}\n"
+          "float r_ldot2(vec4 a, vec4 b) { vec4 p = r_lmul(a, b); return p.x + p.y; }\n"
+          "float r_ldot3(vec4 a, vec4 b) { vec4 p = r_lmul(a, b); return p.x + p.y + p.z; }\n"
+          "float r_ldot4(vec4 a, vec4 b) { vec4 p = r_lmul(a, b); return p.x + p.y + p.z + p.w; }\n"
+          "// pow as D3D9's exp2(y * log2(|x|)) with its multiply: x^0 is 1, 0^y 0 (y > 0).\n"
+          "float r_lpow(float x, float y) {\n"
+          "  x = abs(x);\n"
+          "  if (y == 0.0) return 1.0;\n"
+          "  if (x == 0.0) return y > 0.0 ? 0.0 : uintBitsToFloat(0x7F800000u);\n"
+          "  return exp2(y * log2(x));\n"
+          "}\n";
     if (helpers_.count("lit"))
       help += "vec4 r_lit(vec4 s) {\n"
               "  float p = clamp(s.w, -128.0, 128.0);\n"
