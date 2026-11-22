@@ -100,6 +100,9 @@ std::string NarrowPath(const std::u16string& path);
 // merged listings (overlay first). One entry outside the install.
 std::vector<std::string> HostDirs(const std::string& guest_dir);
 std::string GuestCurrentDir();
+// The absolute, normalised form of a guest path ("C:\\x\\y"), as
+// GetFullPathName gives it.
+std::string GuestFullPath(const std::string& path);
 
 // The process's main thread gets the thread object CreateThread gives the
 // others (GetCurrentThread, DuplicateHandle, waits).

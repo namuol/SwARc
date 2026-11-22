@@ -656,6 +656,11 @@ HLE("kernel32.dll", HeapSize, 3) {
   return h ? h->Size(Arg(c, 2)) : 0xFFFFFFFF;
 }
 
+// HeapSetInformation(heap, class, info, length): the low-fragmentation
+// heap and terminate-on-corruption (the CRT's and Source's startup) change
+// nothing a guest can see.
+HLE64("kernel32.dll", HeapSetInformation, 4) { return 1; }
+
 HLE("kernel32.dll", GlobalAlloc, 2) {
   // GMEM_MOVEABLE handles are returned as plain pointers; GlobalLock is
   // then the identity. Only used for clipboard data here.

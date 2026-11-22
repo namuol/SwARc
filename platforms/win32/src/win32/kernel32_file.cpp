@@ -129,6 +129,8 @@ std::string Resolve(const std::string& root, const std::vector<std::string>& com
 
 }  // namespace
 
+std::string GuestFullPath(const std::string& p) { return AbsGuest(p); }
+
 const std::string& GuestGameDir() { return Game().guest_dir; }
 
 std::string GuestExePath() { return GuestGameDir() + "\\" + Game().exe_name; }
@@ -486,35 +488,89 @@ int FdOf(uint64_t h) {
   return o ? FileFd(o.get()) : -1;
 }
 
+// Overlapped I/O (an OVERLAPPED given to ReadFile/WriteFile): done at once,
+// at the OVERLAPPED's offset (Offset, OffsetHigh), as Windows does for a
+// request it can complete without waiting. The OVERLAPPED gets the outcome
+// (Internal: an NTSTATUS, InternalHigh: the bytes moved) and its event, if
+// any, is signalled; GetOverlappedResult reads them back. The layout is
+// {ULONG_PTR Internal, ULONG_PTR InternalHigh, DWORD Offset, DWORD
+// OffsetHigh, HANDLE hEvent}, pointer-sized fields 8 bytes on x64.
+constexpr uint32_t kStatusEndOfFile = 0xC0000011;
+constexpr uint32_t kErrorHandleEof = 38;
+
+uint64_t OverlappedOffset(gaddr ov) {
+  const uint32_t o = g_proc->x64 ? 16 : 8;
+  return uint64_t(Rd32(ov + o)) | uint64_t(Rd32(ov + o + 4)) << 32;
+}
+
+void CompleteOverlapped(gaddr ov, uint32_t status, uint32_t bytes) {
+  const uint32_t ptr = g_proc->x64 ? 8 : 4;
+  WrPtr(ov, status);
+  WrPtr(ov + ptr, bytes);
+  if (gaddr ev = RdPtr(ov + (g_proc->x64 ? 24 : 16))) SignalEventHandle(uint32_t(ev), false);
+}
+
 HLE64("kernel32.dll", ReadFile, 5) {
   int fd = FdOf(Arg(c, 0));
-  gaddr buf = Arg(c, 1), out = Arg(c, 3);
+  gaddr buf = Arg(c, 1), out = Arg(c, 3), ov = Arg(c, 4);
   uint32_t n = uint32_t(Arg(c, 2));
   if (fd < 0) {
     SetLastError(kErrorInvalidHandle);
     return 0;
   }
-  if (Arg(c, 4)) FatalF("ReadFile with OVERLAPPED is not supported");
   lazy::Touch(buf, n);  // the kernel does not fault on lazy pages
-  ssize_t r = n ? read(fd, GPtr(buf), n) : 0;
+  ssize_t r = !n ? 0 : ov ? pread(fd, GPtr(buf), n, off_t(OverlappedOffset(ov)))
+                          : read(fd, GPtr(buf), n);
   if (r < 0) {
     SetLastError(ErrnoToWin(errno));
     return 0;
   }
   if (out) Wr32(out, uint32_t(r));
+  if (ov) {
+    // A read that starts at or past the end fails with ERROR_HANDLE_EOF.
+    bool eof = n && r == 0;
+    CompleteOverlapped(ov, eof ? kStatusEndOfFile : 0, uint32_t(r));
+    if (eof) {
+      SetLastError(kErrorHandleEof);
+      return 0;
+    }
+  }
   return 1;
+}
+
+// GetOverlappedResult(file, OVERLAPPED*, DWORD* bytes, wait): every
+// request has completed already (ReadFile above).
+HLE64("kernel32.dll", GetOverlappedResult, 4) {
+  gaddr ov = Arg(c, 1);
+  const uint32_t ptr = g_proc->x64 ? 8 : 4;
+  uint32_t status = uint32_t(RdPtr(ov)), bytes = uint32_t(RdPtr(ov + ptr));
+  if (Arg(c, 2)) Wr32(Arg(c, 2), bytes);
+  if (status == kStatusEndOfFile) {
+    SetLastError(kErrorHandleEof);
+    return 0;
+  }
+  return 1;
+}
+
+// Nothing is ever pending to cancel.
+HLE64("kernel32.dll", CancelIo, 1) { return 1; }
+HLE64("kernel32.dll", CancelIoEx, 2) {
+  SetLastError(1168);  // ERROR_NOT_FOUND
+  return 0;
 }
 
 HLE64("kernel32.dll", WriteFile, 5) {
   int fd = FdOf(Arg(c, 0));
-  gaddr buf = Arg(c, 1), out = Arg(c, 3);
+  gaddr buf = Arg(c, 1), out = Arg(c, 3), ov = Arg(c, 4);
   uint32_t n = uint32_t(Arg(c, 2));
   if (fd < 0) {
     SetLastError(kErrorInvalidHandle);
     return 0;
   }
   lazy::Touch(buf, n);
-  ssize_t r = n ? write(fd, GPtr(buf), n) : 0;
+  ssize_t r = !n ? 0 : ov ? pwrite(fd, GPtr(buf), n, off_t(OverlappedOffset(ov)))
+                          : write(fd, GPtr(buf), n);
+  if (r >= 0 && ov) CompleteOverlapped(ov, 0, uint32_t(r));
   if (r < 0) {
     SetLastError(ErrnoToWin(errno));
     return 0;

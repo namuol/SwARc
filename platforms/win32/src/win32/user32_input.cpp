@@ -163,8 +163,15 @@ namespace {
 
 using namespace win32;
 
-HLE("user32.dll", MapVirtualKeyA, 2) {
-  uint32_t code = Arg(c, 0), type = Arg(c, 1);
+uint32_t MapVirtualKey(uint32_t code, uint32_t type);
+
+HLE("user32.dll", MapVirtualKeyA, 2) { return MapVirtualKey(Arg(c, 0), Arg(c, 1)); }
+HLE("user32.dll", MapVirtualKeyW, 2) { return MapVirtualKey(Arg(c, 0), Arg(c, 1)); }
+// The Ex forms take a keyboard layout: there is only the US one.
+HLE("user32.dll", MapVirtualKeyExA, 3) { return MapVirtualKey(Arg(c, 0), Arg(c, 1)); }
+HLE("user32.dll", MapVirtualKeyExW, 3) { return MapVirtualKey(Arg(c, 0), Arg(c, 1)); }
+
+uint32_t MapVirtualKey(uint32_t code, uint32_t type) {
   switch (type) {
     case 0: {  // MAPVK_VK_TO_VSC
       bool ext;
@@ -212,7 +219,12 @@ HLE("user32.dll", GetKeyNameTextA, 3) {
   return uint32_t(n.size());
 }
 
+// The one keyboard layout is US English (HKL 0x04090409): loading or
+// activating any layout gives it.
 HLE("user32.dll", GetKeyboardLayout, 1) { return 0x04090409; }
+HLE("user32.dll", LoadKeyboardLayoutA, 2) { return 0x04090409; }
+HLE("user32.dll", LoadKeyboardLayoutW, 2) { return 0x04090409; }
+HLE("user32.dll", ActivateKeyboardLayout, 2) { return 0x04090409; }
 
 // KL_NAMELENGTH (9) chars: the US layout's KLID.
 HLE("user32.dll", GetKeyboardLayoutNameA, 1) {

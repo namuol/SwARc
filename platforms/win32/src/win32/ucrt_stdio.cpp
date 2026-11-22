@@ -18,6 +18,7 @@
 
 #include "runtime/log.h"
 #include "win32/hle.h"
+#include "win32/msvcrt.h"
 #include "win32/kernel32_state.h"
 #include "win32/ucrt.h"
 #include "win32/win32.h"
@@ -376,6 +377,22 @@ HLE("msvcrt.dll", sprintf, kCdecl) {
   std::string s = Format(GStr(Arg(c, 1)), Args{c.esp + 4 + 8, true}, true);
   std::memcpy(GPtr(Arg(c, 0)), s.c_str(), s.size() + 1);
   return uint32_t(s.size());
+}
+// printf(fmt, ...), fprintf(fp, fmt, ...), vfprintf(fp, fmt, va_list):
+// the characters written.
+HLE("msvcrt.dll", printf, kCdecl) {
+  std::string s = Format(GStr(Arg(c, 0)), Args{c.esp + 4 + 4, true}, true);
+  return uint32_t(std::fwrite(s.data(), 1, s.size(), stdout));
+}
+HLE("msvcrt.dll", fprintf, kCdecl) {
+  std::FILE* f = MsvcrtFile(Arg(c, 0), "fprintf");
+  std::string s = Format(GStr(Arg(c, 1)), Args{c.esp + 4 + 8, true}, true);
+  return uint32_t(std::fwrite(s.data(), 1, s.size(), f));
+}
+HLE("msvcrt.dll", vfprintf, kCdecl) {
+  std::FILE* f = MsvcrtFile(Arg(c, 0), "vfprintf");
+  std::string s = Format(GStr(Arg(c, 1)), Args{Arg(c, 2), true}, true);
+  return uint32_t(std::fwrite(s.data(), 1, s.size(), f));
 }
 // _vsnprintf(buf, count, fmt, va_list): -1 if it does not fit.
 HLE("msvcrt.dll", _vsnprintf, kCdecl) {

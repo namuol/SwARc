@@ -410,19 +410,47 @@ HLE("advapi32.dll", GetUserNameW, 2) { return UserName(c, true); }
 
 // ---- ole32 ------------------------------------------------------------------
 
-// SystemFunction036 is RtlGenRandom(buf, len): BOOLEAN, len random bytes
-// (the CRT's rand_s). From the host's random device.
-HLE("advapi32.dll", SystemFunction036, 2) {
+// n random bytes at buf, from the host's random device.
+void RandomBytes(gaddr buf, uint32_t n) {
   static std::mutex mu;
   static std::random_device rd;
   std::lock_guard<std::mutex> l(mu);
-  gaddr buf = Arg(c, 0);
-  for (uint32_t i = 0, n = Arg(c, 1); i < n; i += 4) {
+  for (uint32_t i = 0; i < n; i += 4) {
     uint32_t r = rd();
     for (uint32_t k = 0; k < 4 && i + k < n; k++) Wr8(buf + i + k, uint8_t(r >> (8 * k)));
   }
+}
+
+// SystemFunction036 is RtlGenRandom(buf, len): BOOLEAN, len random bytes
+// (the CRT's rand_s).
+HLE("advapi32.dll", SystemFunction036, 2) {
+  RandomBytes(Arg(c, 0), Arg(c, 1));
   return 1;
 }
+
+// CryptoAPI, for random numbers only: CryptAcquireContext(HCRYPTPROV*,
+// container, provider, type, flags) gives one provider handle whatever is
+// asked (a key container's keys are not available: no key is ever used),
+// CryptGenRandom(prov, len, buf) fills buf, CryptReleaseContext frees
+// nothing.
+constexpr uint32_t kCryptProv = 0xC0DE0001;
+HLE("advapi32.dll", CryptAcquireContextA, 5) {
+  Wr32(Arg(c, 0), kCryptProv);
+  return 1;
+}
+HLE("advapi32.dll", CryptAcquireContextW, 5) {
+  Wr32(Arg(c, 0), kCryptProv);
+  return 1;
+}
+HLE("advapi32.dll", CryptGenRandom, 3) {
+  if (Arg(c, 0) != kCryptProv) {
+    SetLastError(kErrorInvalidHandle);
+    return 0;
+  }
+  RandomBytes(Arg(c, 2), Arg(c, 1));
+  return 1;
+}
+HLE("advapi32.dll", CryptReleaseContext, 2) { return 1; }
 
 HLE("ole32.dll", CoInitialize, 1) { return 0; }  // S_OK
 HLE("ole32.dll", CoInitializeEx, 2) { return 0; }

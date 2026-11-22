@@ -117,7 +117,6 @@ COMM_FAILS(SetCommBreak, 1)
 COMM_FAILS(SetCommState, 2)
 COMM_FAILS(SetCommTimeouts, 2)
 COMM_FAILS(SetupComm, 3)
-COMM_FAILS(GetOverlappedResult, 4)
 #undef COMM_FAILS
 
 // ---- user32 ------------------------------------------------------------------------

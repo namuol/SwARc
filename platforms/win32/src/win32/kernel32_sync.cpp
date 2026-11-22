@@ -839,6 +839,37 @@ HLE("kernel32.dll", GetThreadContext, 2) {
   return 0;
 }
 
+// SetThreadContext(thread, CONTEXT*): only debug registers that set no
+// hardware breakpoint (Dr7 0) are accepted, which leaves the thread as it
+// is: Source's tier0 clears data breakpoints on every thread it creates.
+// Anything else would change a running thread's state: not supported.
+HLE("kernel32.dll", SetThreadContext, 2) {
+  constexpr uint32_t kContextDebugRegisters = 0x00010010;  // CONTEXT_i386 | 0x10
+  gaddr ctx = Arg(c, 1);
+  uint32_t flags = Rd32(ctx);
+  if ((flags & ~kContextDebugRegisters) == 0 && Rd32(ctx + 0x18) == 0) return 1;  // Dr7
+  WarnF("SetThreadContext(flags %08X): not supported\n", flags);
+  SetLastError(kErrorAccessDenied);
+  return 0;
+}
+
+// OpenThread(access, inherit, tid): a new handle to a thread created with
+// CreateThread that has not finished. The main thread has no thread object
+// (it is reached by its pseudo-handle only), so it cannot be opened.
+HLE("kernel32.dll", OpenThread, 3) {
+  std::shared_ptr<ThreadObject> to;
+  {
+    std::lock_guard<std::mutex> l(g_wait_mu);
+    auto it = g_thread_objs.find(uint32_t(Arg(c, 2)));
+    if (it != g_thread_objs.end()) to = it->second;
+  }
+  if (!to) {
+    SetLastError(kErrorInvalidParameter);
+    return 0;
+  }
+  return NewHandle(to);
+}
+
 HLE("kernel32.dll", OpenProcess, 3) {
   SetLastError(kErrorAccessDenied);
   return 0;
