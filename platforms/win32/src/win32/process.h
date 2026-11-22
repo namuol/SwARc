@@ -100,7 +100,11 @@ struct GameConfig : recomp::GameConfig {
   // are read from guest_dir (the host game directory) by file name.
   struct LiftedDll {
     std::string name;   // file name, e.g. "game.dll"
-    uint32_t base = 0;  // the lifter's --base for it; 0 = preferred base
+    gaddr base = 0;     // the lifter's --base for it; 0 = preferred base
+    // The host file to map, when it is not the game folder's `name`: a
+    // runtime DLL taken from the redistributable the game ships (see
+    // tools/vcredist.py), which the guest finds as if it were installed.
+    std::string host_path;
   };
   std::vector<LiftedDll> lifted_dlls;
 };

@@ -286,7 +286,7 @@ int RunProcess(const win32::GameConfig& game, const std::string& exe_path,
   for (const auto& d : game.lifted_dlls) {
     Module& m = w.modules.emplace_back();
     m.name = hle::NormaliseDll(d.name);
-    m.host_path = HostPath(GuestGameDir() + "\\" + d.name);
+    m.host_path = d.host_path.empty() ? HostPath(GuestGameDir() + "\\" + d.name) : d.host_path;
     m.base = d.base;
   }
   // Twice: the first pass maps every DLL (so all export tables are known),
