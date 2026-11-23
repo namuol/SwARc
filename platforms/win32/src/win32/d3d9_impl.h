@@ -41,6 +41,9 @@ enum : uint32_t {
   D3DFMT_DXT1 = 0x31545844, D3DFMT_DXT2 = 0x32545844,
   D3DFMT_DXT3 = 0x33545844, D3DFMT_DXT4 = 0x34545844,
   D3DFMT_DXT5 = 0x35545844,
+  // The NULL render target ('NULL'): a size for depth-only passes, no
+  // colour (a driver extension of the D3D9 era, checked for by games).
+  D3DFMT_NULL = 0x4C4C554E,
 };
 // D3DRESOURCETYPE
 enum : uint32_t {
@@ -202,6 +205,9 @@ struct Device : com::Object {
   // Bound objects: guest pointers the device holds a reference to.
   uint32_t render_targets[4] = {};
   uint32_t depth_stencil = 0;
+  // Colour targets standing in for NULL-format render targets, by size:
+  // the depth buffer's, so a depth-only pass covers it all.
+  std::map<std::pair<uint32_t, uint32_t>, gfx::TextureId> null_targets;
   uint32_t textures[20] = {};  // samplers 0-15, then vertex samplers 0-3
   struct Stream {
     uint32_t buffer = 0, offset = 0, stride = 0, freq = 1;
