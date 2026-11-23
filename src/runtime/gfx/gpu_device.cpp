@@ -1367,7 +1367,11 @@ void r_color0(inout vec4 c) {
       sh.samplers = std::max(sh.samplers, smp.reg + 1);
     }
     bool vertex = prog.stage == hlsl::Stage::Vertex;
-    std::string glsl = "#version 450\n" + Prelude(prog.stage, sh.samplers) + prog.glsl;
+    // Positions invariant across programs (D3D9 multipass draws the same mesh
+    // with different shaders and relies on equal depths).
+    std::string glsl = "#version 450\n" +
+                       std::string(prog.stage == hlsl::Stage::Vertex ? "invariant gl_Position;\n" : "") +
+                       Prelude(prog.stage, sh.samplers) + prog.glsl;
     std::vector<uint32_t> spirv;
     std::string log;
     if (!GlslToSpirv(glsl, vertex ? ShaderStage::Vertex : ShaderStage::Fragment, &spirv, &log)) {
