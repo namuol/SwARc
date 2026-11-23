@@ -165,8 +165,10 @@ std::map<uint32_t, Window> g_windows;
 std::map<uint32_t, Queue> g_queues;  // by tid
 std::vector<Timer> g_timers;
 
-// ClipCursor: while the game confines the cursor to one of our windows
-// (mouse look), the cursor is virtual, as in exclusive mode.
+// ClipCursor: while the game confines the cursor to one of our windows and
+// hides it (mouse look), the cursor is virtual, as in exclusive mode; while
+// it shows it (a menu confined to the window), it stays the host pointer,
+// grabbed to the window (ApplyClipMode).
 struct Clip {
   bool on = false;
   int32_t l = 0, t = 0, r = 0, b = 0;  // screen coordinates
@@ -212,6 +214,27 @@ uint32_t NextHook(int32_t type, uint32_t after) {
 }
 uint32_t NextCbtHook(uint32_t after) { return NextHook(kWhCbt, after); }
 int g_cursor_count = 0;  // ShowCursor display counter
+
+// How a clipped window holds the host pointer: hidden and in SDL's relative
+// mode while the game's cursor is hidden (it steers by motion), else shown
+// and confined to the window, its position read as it is.
+bool ClipVirtual() { return g_cursor_count < 0; }
+void ApplyClipMode(SDL_Window* w) {
+  if (!w || Background()) return;
+  if (ClipVirtual()) {
+    SDL_SetWindowMouseGrab(w, false);
+    SDL_SetWindowRelativeMouseMode(w, true);
+  } else {
+    SDL_SetWindowRelativeMouseMode(w, false);
+    SDL_SetWindowMouseGrab(w, true);
+    SDL_ShowCursor();
+  }
+}
+void ReleaseClipMode(SDL_Window* w) {
+  if (!w) return;
+  SDL_SetWindowRelativeMouseMode(w, false);
+  SDL_SetWindowMouseGrab(w, false);
+}
 int32_t g_mouse_x = 0, g_mouse_y = 0;  // screen coordinates
 // The host pointer over the game window, in client (mode) coordinates;
 // valid while g_pointer_inside. Written on the main thread.
@@ -564,7 +587,7 @@ void AttachClip() {
     g_clip.hwnd = ClipWindow();
     if (Window* w = Win(g_clip.hwnd)) grab = w->sdl;
   }
-  if (grab && !Background()) SDL_SetWindowRelativeMouseMode(grab, true);
+  ApplyClipMode(grab);
 }
 
 // Where a key typed into top-level `h` goes: the focus window when it is
@@ -698,7 +721,7 @@ void HandleSdlEvent(const SDL_Event& e) {
         if (dy) EmitRawInput(RawInput::MouseY, 0, dy);
       }
       AttachClip();
-      bool clipped = g_clip.on && g_clip.hwnd == h;
+      bool clipped = g_clip.on && g_clip.hwnd == h && ClipVirtual();
       // In exclusive mode the cursor is virtual only while the game
       // re-centres it (mouse look). A game that just reads GetCursorPos,
       // as RTS menus and maps do, gets the host pointer's position mapped
@@ -741,6 +764,10 @@ void HandleSdlEvent(const SDL_Event& e) {
         }
         g_mouse_x = ox + x;
         g_mouse_y = oy + y;
+        if (g_clip.on && g_clip.hwnd == h) {  // a visible, clipped cursor
+          g_mouse_x = std::clamp(g_mouse_x, g_clip.l, std::max(g_clip.l, g_clip.r - 1));
+          g_mouse_y = std::clamp(g_mouse_y, g_clip.t, std::max(g_clip.t, g_clip.b - 1));
+        }
       }
       {
         int cx, cy;
@@ -1927,7 +1954,7 @@ HLE("user32.dll", DestroyWindow, 1) {
     if (g_clip.hwnd == hwnd) {
       // The clip stays; AttachClip gives it to the next window over it.
       g_clip.hwnd = 0;
-      if (w->sdl) SDL_SetWindowRelativeMouseMode(w->sdl, false);
+      ReleaseClipMode(w->sdl);
     }
     if (w->sdl) SDL_DestroyWindow(w->sdl);
     w->sdl = nullptr;
@@ -2524,6 +2551,23 @@ HLE("user32.dll", GetWindowTextLengthA, 1) {
   std::lock_guard<std::recursive_mutex> l(g_mu);
   Window* w = Win(Arg(c, 0));
   return w ? uint32_t(w->title.size()) : 0;
+}
+
+// The W forms: the title (kept in the ANSI code page) as WCHARs.
+HLE("user32.dll", GetWindowTextW, 3) {
+  std::lock_guard<std::recursive_mutex> l(g_mu);
+  Window* w = Win(Arg(c, 0));
+  uint32_t buf = Arg(c, 1), cap = Arg(c, 2);
+  if (!w || !cap) return 0;
+  std::u16string t = Widen(w->title).substr(0, cap - 1);
+  std::memcpy(GPtr(buf), t.c_str(), 2 * (t.size() + 1));
+  return uint32_t(t.size());
+}
+
+HLE("user32.dll", GetWindowTextLengthW, 1) {
+  std::lock_guard<std::recursive_mutex> l(g_mu);
+  Window* w = Win(Arg(c, 0));
+  return w ? uint32_t(Widen(w->title).size()) : 0;
 }
 
 HLE("user32.dll", GetWindowLongA, 2) {
@@ -4067,12 +4111,23 @@ HLE64("user32.dll", CallNextHookEx, 4) {
 // ---- cursor ------------------------------------------------------------------------
 
 HLE("user32.dll", ShowCursor, 1) {
+  const bool was_virtual = ClipVirtual();
   g_cursor_count += Arg(c, 0) ? 1 : -1;
   if (g_sdl_up && !Background()) {
     if (g_cursor_count >= 0)
       SDL_ShowCursor();
     else
       SDL_HideCursor();
+    // A clipped window switches between a virtual and a confined pointer.
+    if (ClipVirtual() != was_virtual) {
+      SDL_Window* w = nullptr;
+      {
+        std::lock_guard<std::recursive_mutex> l(g_mu);
+        if (g_clip.on)
+          if (Window* cw = Win(g_clip.hwnd)) w = cw->sdl;
+      }
+      ApplyClipMode(w);
+    }
   }
   return uint32_t(g_cursor_count);
 }
@@ -4168,8 +4223,8 @@ HLE("user32.dll", ClipCursor, 1) {
       g_mouse_y = std::clamp(g_mouse_y, g_clip.t, std::max(g_clip.t, g_clip.b - 1));
     }
   }
-  if (release && release != grab) SDL_SetWindowRelativeMouseMode(release, false);
-  if (grab && !Background()) SDL_SetWindowRelativeMouseMode(grab, true);
+  if (release && release != grab) ReleaseClipMode(release);
+  ApplyClipMode(grab);
   return 1;
 }
 
@@ -4403,6 +4458,82 @@ void CursorInClient(uint32_t hwnd, int* x, int* y) {
   WindowOrigin(hwnd, &ox, &oy);
   *x = sx - ox;
   *y = sy - oy;
+}
+
+}  // namespace recomp
+
+namespace recomp {
+namespace {
+// A cursor from the EXE's resources (LoadCursorA(hInstance, id) handles,
+// 0x10000 | id) as an SDL colour cursor: the RT_GROUP_CURSOR's first image,
+// an RT_CURSOR (hotspot x, y as WORDs, then a DIB of twice the height: the
+// colour rows, then the 1-bit AND mask, both bottom up, rows padded to 4
+// bytes). 32-bit images use their alpha (the mask when it is all 0), 1/4/8
+// -bit ones their palette with the mask. Null if there is no such resource
+// (system cursors, IDC_*, have none: the host's arrow stands for them).
+SDL_Cursor* ResourceCursor(uint32_t id) {
+  uint32_t grp, grp_size;
+  if (!ExeResource("#12", "#" + std::to_string(id), &grp, &grp_size) || grp_size < 20) return nullptr;
+  if (Rd16(grp + 4) == 0) return nullptr;
+  const uint32_t image_id = Rd16(grp + 6 + 12);  // GRPCURSORDIRENTRY[0].nID
+  uint32_t cur, cur_size;
+  if (!ExeResource("#1", "#" + std::to_string(image_id), &cur, &cur_size) || cur_size < 44)
+    return nullptr;
+  const int hx = Rd16(cur), hy = Rd16(cur + 2);
+  const uint32_t dib = cur + 4;
+  const int32_t w = int32_t(Rd32(dib + 4)), h2 = int32_t(Rd32(dib + 8));
+  const uint32_t bits = Rd16(dib + 14), hsize = Rd32(dib);
+  const int h = h2 / 2;
+  if (w <= 0 || h <= 0 || w > 256 || h > 256 || (bits != 1 && bits != 4 && bits != 8 && bits != 32))
+    return nullptr;
+  uint32_t colors = bits <= 8 ? (Rd32(dib + 32) ? Rd32(dib + 32) : 1u << bits) : 0;
+  const uint32_t palette = dib + hsize;
+  const uint32_t xor_rows = palette + 4 * colors;
+  const uint32_t xor_pitch = ((uint32_t(w) * bits + 31) / 32) * 4;
+  const uint32_t and_rows = xor_rows + xor_pitch * uint32_t(h);
+  const uint32_t and_pitch = ((uint32_t(w) + 31) / 32) * 4;
+  if (and_rows + and_pitch * uint32_t(h) > cur + cur_size) return nullptr;
+  SDL_Surface* s = SDL_CreateSurface(w, h, SDL_PIXELFORMAT_ARGB8888);
+  if (!s) return nullptr;
+  bool any_alpha = false;
+  if (bits == 32)
+    for (int y = 0; y < h && !any_alpha; y++)
+      for (int x = 0; x < w; x++)
+        if (Rd8(xor_rows + uint32_t(y) * xor_pitch + uint32_t(x) * 4 + 3)) { any_alpha = true; break; }
+  for (int y = 0; y < h; y++) {
+    const uint32_t src_y = uint32_t(h - 1 - y);  // bottom up
+    auto* row = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(s->pixels) + size_t(y) * s->pitch);
+    for (int x = 0; x < w; x++) {
+      const bool masked = (Rd8(and_rows + src_y * and_pitch + uint32_t(x) / 8) >> (7 - x % 8)) & 1;
+      uint32_t argb;
+      if (bits == 32) {
+        argb = Rd32(xor_rows + src_y * xor_pitch + uint32_t(x) * 4);  // BGRA = ARGB in memory
+        if (!any_alpha) argb = (argb & 0xFFFFFFu) | (masked ? 0u : 0xFF000000u);
+      } else {
+        uint32_t bitpos = uint32_t(x) * bits;
+        uint32_t idx = (Rd8(xor_rows + src_y * xor_pitch + bitpos / 8) >> (8 - bits - bitpos % 8)) &
+                       ((1u << bits) - 1);
+        argb = (Rd32(palette + 4 * idx) & 0xFFFFFFu) | (masked ? 0u : 0xFF000000u);
+      }
+      row[x] = argb;
+    }
+  }
+  SDL_Cursor* sc = SDL_CreateColorCursor(s, std::clamp(hx, 0, w - 1), std::clamp(hy, 0, h - 1));
+  SDL_DestroySurface(s);
+  return sc;
+}
+
+}  // namespace
+
+void SetHostCursor(uint32_t hcursor) {
+  static std::map<uint32_t, SDL_Cursor*> made;  // resource cursors, kept for the process
+  if (!g_sdl_up || Background()) return;
+  SDL_Cursor* sc = nullptr;
+  if ((hcursor & 0xFFFF0000u) == 0x00010000u) {
+    auto it = made.find(hcursor);
+    sc = it != made.end() ? it->second : (made[hcursor] = ResourceCursor(hcursor & 0xFFFF));
+  }
+  SDL_SetCursor(sc ? sc : SDL_GetDefaultCursor());
 }
 
 }  // namespace recomp

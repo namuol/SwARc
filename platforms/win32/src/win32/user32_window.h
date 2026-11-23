@@ -76,6 +76,10 @@ void SetPointerRemap(uint32_t hwnd, int shown_l, int shown_t, int shown_w, int s
 
 // The cursor as GetCursorPos reports it, in hwnd's client coordinates.
 void CursorInClient(uint32_t hwnd, int* x, int* y);
+// SetCursor's cursor shown as the host pointer's image: one from the EXE's
+// resources (LoadCursorA(hInstance, id): 0x10000 | id) as made from its
+// RT_CURSOR, any other the host's default arrow.
+void SetHostCursor(uint32_t hcursor);
 // PostMessage from host code (any thread): queues msg for hwnd's thread.
 // False if hwnd is not a window.
 bool PostWindowMessage(uint32_t hwnd, uint32_t msg, uint32_t wparam, uint32_t lparam);
