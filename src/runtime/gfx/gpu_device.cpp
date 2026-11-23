@@ -1465,7 +1465,10 @@ void r_color0(inout vec4 c) {
   SDL_GPUShader* CompileShader(hlsl::Stage stage, uint32_t samplers, const std::string& body,
                                bool occl, uint32_t shadow) {
     bool vertex = stage == hlsl::Stage::Vertex;
-    std::string glsl = "#version 450\n" + Prelude(stage, samplers, occl, shadow) + body;
+    // Positions invariant across programs (D3D9 multipass draws the same mesh
+    // with different shaders and relies on equal depths).
+    std::string glsl = "#version 450\n" + std::string(vertex ? "invariant gl_Position;\n" : "") +
+                       Prelude(stage, samplers, occl, shadow) + body;
     std::vector<uint32_t> spirv;
     std::string log;
     if (!GlslToSpirv(glsl, vertex ? ShaderStage::Vertex : ShaderStage::Fragment, &spirv, &log)) {
