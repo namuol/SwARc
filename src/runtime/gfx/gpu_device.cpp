@@ -3206,6 +3206,10 @@ void r_color0(inout vec4 c) {
       k.depth_test = st.rs[7] ? 1 : 0;
       k.depth_write = (st.rs[7] && st.rs[14]) ? 1 : 0;
       k.depth_func = uint8_t(D3DCompareOp(st.rs[23]));
+      {  // TEMP diagnostic: not for landing. <ID>_FORCE_LEQUAL=1 turns EQUAL depth tests into LESSEQUAL.
+        static const bool force = [] { const char* e = Env("FORCE_LEQUAL"); return e && *e == '1'; }();
+        if (force && st.rs[23] == 3 /* D3DCMP_EQUAL */) k.depth_func = uint8_t(D3DCompareOp(4));
+      }
       if (pass_stencil_ && st.rs[52]) {
         k.stencil = 1;
         k.s_fail = uint8_t(D3DStencilOp(st.rs[53]));

@@ -16,18 +16,24 @@
 // declaration (no FVF), are not supported yet (fatal, named).
 
 #include <algorithm>
+#include <cmath>
 #include <array>
+#include <chrono>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <set>
 #include <string>
 #include <vector>
 
+#include "runtime/env.h"
 #include "runtime/log.h"
 #include "win32/d3d9_impl.h"
 #include "win32/hle.h"
 
 namespace recomp::d3d9 {
+// TEMP diagnostic: not for landing.
+#define ProbeLog(...) WarnF(__VA_ARGS__)
 
 namespace {
 
@@ -666,10 +672,172 @@ void Draw(Device& d, gfx::ShaderDraw& sd, const char* what) {
     sd.textures[i] = t ? t->tex : 0;
   }
   sd.sampler_states = d.ss;
+  {  // TEMP diagnostic: not for landing. <ID>_SKIP_PS=hash,hash skips those pixel shaders' draws.
+    static const char* skip = recomp::Env("SKIP_PS");
+    if (skip && *skip && ps) {
+      char h[24];
+      uint64_t fnv = 1469598103934665603ull;
+      for (uint32_t t : ps->tokens)
+        for (int i = 0; i < 4; i++) fnv = (fnv ^ ((t >> (8 * i)) & 0xFF)) * 1099511628211ull;
+      std::snprintf(h, sizeof h, "%016llx", (unsigned long long)fnv);
+      if (std::strstr(skip, h)) return;
+    }
+  }
+  {  // TEMP diagnostic: not for landing. After <ID>_DUMP_AT seconds, dumps every sampler texture
+     // of the first draw whose pixel shader has a sampler named <ID>_DUMP_SAMPLER.
+    static const char* at = recomp::Env("DUMP_AT");
+    static const char* want = recomp::Env("DUMP_SAMPLER");
+    static const char* dir = recomp::Env("SHOT_DIR");
+    static bool done = false;
+    static const auto start = std::chrono::steady_clock::now();
+    if (at && want && dir && !done && ps && ps->program &&
+        std::chrono::steady_clock::now() - start > std::chrono::seconds(std::atoi(at))) {
+      const char* b = reinterpret_cast<const char*>(ps->tokens.data());
+      const bool has = std::search(b, b + ps->tokens.size() * 4, want, want + std::strlen(want)) !=
+                       b + ps->tokens.size() * 4;
+      if (has) {
+        done = true;
+        for (const auto& smp : ps->program->samplers) {
+          struct { std::string name; uint32_t index; } k{"s" + std::to_string(smp.reg), smp.reg};
+          auto* t = com::As<Texture>(d.textures[k.index]);
+          WarnF("TEMP dump %s s%u: %ux%u fmt %X\n", k.name.c_str(), k.index, t ? t->width : 0,
+                t ? t->height : 0, t ? t->format : 0);
+          if (!t || t->volume || t->cube || gfx::IsCompressed(t->fmt)) continue;
+          const uint32_t w = t->width, h = t->height, bpp = gfx::BitsPerPixel(t->fmt) / 8;
+          std::vector<uint8_t> px(size_t(w) * h * bpp);
+          d.gfx->ReadImage(t->tex, 0, 0, {0, 0, int32_t(w), int32_t(h)}, px.data(), w * bpp);
+          char path[512];
+          std::snprintf(path, sizeof path, "%s/dump_%s_%ux%u_fmt%X.raw", dir, k.name.c_str(), w, h, t->format);
+          if (FILE* f = std::fopen(path, "wb")) {
+            std::fwrite(px.data(), 1, px.size(), f);
+            std::fclose(f);
+          }
+        }
+      }
+    }
+  }
+  {  // TEMP diagnostic: not for landing. Dumps the s0..s3 textures of the 400th big strip draw.
+    static int big = 0;
+    static const char* dir = recomp::Env("SHOT_DIR");
+    if (dir && sd.prim == 5 && sd.primitives > 40000 && ++big == 400) {
+      if (ps && ps->program)
+        for (const auto& k : ps->program->constants)
+          if (k.set == hlsl::RegisterSet::Sampler)
+            WarnF("TEMP big draw ps sampler %s -> s%u\n", k.name.c_str(), k.index);
+      for (int sm = 0; sm < 8; sm++) {
+        auto* t = com::As<Texture>(d.textures[sm]);
+        if (!t) continue;
+        const uint32_t w = t->width, h = t->height;
+        RECOMP_TRACE("  TEMP big draw s%d: %ux%u fmt %X usage %X\n", sm, w, h, t->format, t->usage);
+        WarnF("TEMP big draw s%d: %ux%u fmt %X usage %X\n", sm, w, h, t->format, t->usage);
+        if (!w || !h || (t->format != 21 && t->format != 22)) continue;
+        std::vector<uint8_t> px(size_t(w) * h * 4);
+        d.gfx->ReadImage(t->tex, 0, 0, {0, 0, int32_t(w), int32_t(h)}, px.data(), w * 4);
+        char path[512];
+        std::snprintf(path, sizeof path, "%s/tex_s%d.ppm", dir, sm);
+        if (FILE* f = std::fopen(path, "wb")) {
+          std::fprintf(f, "P6 %u %u 255\n", w, h);
+          for (size_t i = 0; i < size_t(w) * h; i++) {
+            const uint8_t rgb[3] = {px[i * 4 + 2], px[i * 4 + 1], px[i * 4]};
+            std::fwrite(rgb, 1, 3, f);
+          }
+          std::fclose(f);
+        }
+      }
+    }
+  }
+  if (recomp::g_trace && ps && ps->program) {  // TEMP diagnostic: not for landing
+    static std::set<uint64_t> seen;
+    for (const auto& smp : ps->program->samplers) {
+      if (sd.textures[smp.reg]) continue;
+      if (seen.insert(uint64_t(ps->id) << 8 | smp.reg).second)
+        RECOMP_TRACE("  TEMP ps %08X samples s%u (type %d) with no texture\n", ps->id, smp.reg,
+                     int(smp.type));
+    }
+  }
   const gfx::FfState state = DrawState(d, false);
   sd.state = &state;
   BindTargets(d);
   d.gfx->DrawShader(sd);
+  // TEMP diagnostic: not for landing. <ID>_PROBE=x,y,seconds: for one second from `seconds`
+  // after the first draw, logs each draw that changes pixel (x, y) of a 1024x768 target.
+  static int probe_x = 60, probe_y = 440, probe_at = -1;
+  static const bool probe_parsed = [] {
+    if (const char* e = recomp::Env("PROBE")) std::sscanf(e, "%d,%d,%d", &probe_x, &probe_y, &probe_at);
+    return true;
+  }();
+  (void)probe_parsed;
+  static const auto probe_start = std::chrono::steady_clock::now();
+  const double probe_t = std::chrono::duration<double>(std::chrono::steady_clock::now() - probe_start).count();
+  const bool probe_window = probe_at >= 0 && probe_t >= probe_at && probe_t < probe_at + 6;
+  const bool probe_on = recomp::g_trace || probe_window;
+  static bool probe_announced = false;
+  if (probe_window && !probe_announced) {
+    probe_announced = true;
+    WarnF("TEMP probe window open at %.1f s after the first draw\n", probe_t);
+  }
+  if (recomp::g_trace || probe_window) {  // TEMP diagnostic: not for landing
+    auto* rt = com::As<Surface>(d.render_targets[0]);
+    if (rt && rt->kind == Surface::Kind::TextureLevel && rt->desc.Format == D3DFMT_R32F &&
+        true) {
+      float v[4] = {};
+      const int32_t cx = int32_t(rt->desc.Width / 2), cy = int32_t(rt->desc.Height / 2);
+      d.gfx->ReadImage(rt->texture->tex, rt->level, 0, {0, 0, 1, 1}, v, 4);
+      d.gfx->ReadImage(rt->texture->tex, rt->level, 0, {cx, cy, cx + 1, cy + 1}, v + 1, 4);
+      RECOMP_TRACE("  TEMP %ux%u R32F after draw (ps %08X): corner %g centre %g\n", rt->desc.Width,
+                   rt->desc.Height, d.ps, v[0], v[1]);
+    }
+    if (probe_on && rt && rt->kind == Surface::Kind::TextureLevel && rt->desc.Format == D3DFMT_A16B16G16R16F &&
+        rt->desc.Width == 1024 && rt->desc.Height == 768) {
+      // Probe pixel (512, 200): log each draw that changes it, with its shader hash.
+      static uint16_t last[4];
+      uint16_t h[4] = {};
+      d.gfx->ReadImage(rt->texture->tex, rt->level, 0, {probe_x, probe_y, probe_x + 1, probe_y + 1}, h, 8);
+      if (std::memcmp(h, last, 8)) {
+        std::memcpy(last, h, 8);
+        uint64_t fnv = 1469598103934665603ull;
+        if (auto* p = com::As<Shader>(d.ps))
+          for (uint32_t t : p->tokens)
+            for (int i = 0; i < 4; i++) fnv = (fnv ^ ((t >> (8 * i)) & 0xFF)) * 1099511628211ull;
+        auto half = [](uint16_t x) {
+          int e = (x >> 10) & 0x1F, m = x & 0x3FF;
+          float v = e == 0 ? m / 1024.0f / 16384.0f : e == 31 ? INFINITY : (1 + m / 1024.0f) * std::ldexp(1.0f, e - 15);
+          return x & 0x8000 ? -v : v;
+        };
+        ProbeLog("  TEMP probe %016llx prim %u n %u: %g %g %g %g\n", (unsigned long long)fnv,
+                     sd.prim, sd.primitives, half(h[0]), half(h[1]), half(h[2]), half(h[3]));
+      }
+    }
+    if (probe_on && rt && rt->desc.Width == 1024 && rt->desc.Height == 768 &&
+        ((rt->desc.Format != D3DFMT_A16B16G16R16F && rt->desc.Format != D3DFMT_R32F) ||
+         rt->kind != Surface::Kind::TextureLevel)) {
+      static uint32_t last8 = 0;
+      uint32_t px = 0;
+      d.gfx->ReadBack({probe_x, probe_y, probe_x + 1, probe_y + 1}, &px, 4, gfx::Format::A8R8G8B8);
+      if (px != last8) {
+        last8 = px;
+        uint64_t fnv = 1469598103934665603ull;
+        if (auto* p = com::As<Shader>(d.ps))
+          for (uint32_t t : p->tokens)
+            for (int i = 0; i < 4; i++) fnv = (fnv ^ ((t >> (8 * i)) & 0xFF)) * 1099511628211ull;
+        ProbeLog("  TEMP probe8 kind %d fmt %u %016llx prim %u n %u: %08X\n", int(rt->kind),
+                     rt->desc.Format, (unsigned long long)fnv, sd.prim, sd.primitives, px);
+      }
+    }
+    if (rt && rt->kind == Surface::Kind::TextureLevel && rt->desc.Format == D3DFMT_A16B16G16R16F &&
+        rt->desc.Width != 1024) {
+      uint16_t h[4] = {};
+      const int32_t cx = int32_t(rt->desc.Width / 2), cy = int32_t(rt->desc.Height / 2);
+      d.gfx->ReadImage(rt->texture->tex, rt->level, 0, {cx, cy, cx + 1, cy + 1}, h, 8);
+      auto half = [](uint16_t x) {
+        int e = (x >> 10) & 0x1F, m = x & 0x3FF;
+        float v = e == 0 ? m / 1024.0f / 16384.0f : e == 31 ? INFINITY : (1 + m / 1024.0f) * std::ldexp(1.0f, e - 15);
+        return x & 0x8000 ? -v : v;
+      };
+      RECOMP_TRACE("  TEMP %ux%u F16 centre after draw (ps %08X): %g %g %g %g\n", rt->desc.Width,
+                   rt->desc.Height, d.ps, half(h[0]), half(h[1]), half(h[2]), half(h[3]));
+    }
+  }
 }
 
 }  // namespace
