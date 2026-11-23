@@ -261,6 +261,20 @@ SDL_GPUSamplerAddressMode D3DAddressMode(uint32_t d3d) {
   }
 }
 
+// IEEE half from a float in [0, 1] (fills): round to nearest, no NaN/inf input.
+uint16_t HalfFromFloat(float v) {
+  uint32_t b;
+  std::memcpy(&b, &v, 4);
+  const uint32_t sign = (b >> 16) & 0x8000;
+  int e = int((b >> 23) & 0xFF) - 127 + 15;
+  uint32_t m = b & 0x7FFFFF;
+  if (e <= 0) return uint16_t(sign);  // tiny: zero
+  if (e >= 31) return uint16_t(sign | 0x7C00);
+  uint32_t h = sign | uint32_t(e) << 10 | (m >> 13);
+  if (m & 0x1000) h++;  // round half up
+  return uint16_t(h);
+}
+
 bool HasAlpha(Format f) {
   switch (f) {
     case Format::A8R8G8B8: case Format::A1R5G5B5: case Format::A4R4G4B4:
@@ -661,6 +675,31 @@ class GpuDevice final : public Device {
     if (w <= 0 || h <= 0) return;
     if (Pending(it->second.tex)) Flush();
     NoteAlpha(it->second, 0, c, uint8_t(argb >> 24));
+    const Format f = it->second.fmt;
+    if (IsFloat(f)) {
+      // The colour converted to the target's own format (channels in the
+      // order R, G, B, A of the format's GPU layout), as D3D9 does.
+      const float ch[4] = {float((argb >> 16) & 0xFF) / 255.0f, float((argb >> 8) & 0xFF) / 255.0f,
+                           float(argb & 0xFF) / 255.0f, float(argb >> 24) / 255.0f};
+      const int n = f == Format::R16F || f == Format::R32F ? 1
+                    : f == Format::G16R16F || f == Format::G32R32F ? 2 : 4;
+      const bool half = f == Format::R16F || f == Format::G16R16F || f == Format::A16B16G16R16F;
+      const uint32_t bpp = uint32_t(n) * (half ? 2u : 4u);
+      std::vector<uint8_t> px(size_t(w) * h * bpp);
+      uint8_t one[16];
+      for (int i = 0; i < n; i++) {
+        if (half) {
+          const uint16_t hv = HalfFromFloat(ch[i]);
+          std::memcpy(one + i * 2, &hv, 2);
+        } else {
+          std::memcpy(one + i * 4, &ch[i], 4);
+        }
+      }
+      for (size_t i = 0; i < size_t(w) * h; i++) std::memcpy(px.data() + i * bpp, one, bpp);
+      QueueUpload(it->second.tex, 0, c.left, c.top, w, h, px.data(), uint32_t(w) * bpp,
+                  uint32_t(h), uint32_t(w) * bpp, false, false);
+      return;
+    }
     std::vector<uint32_t> px(size_t(w) * h, argb);
     QueueUpload(it->second.tex, 0, c.left, c.top, w, h, px.data(), uint32_t(w) * 4,
                 uint32_t(h), uint32_t(w) * 4);
