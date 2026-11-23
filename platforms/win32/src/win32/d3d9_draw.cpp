@@ -817,8 +817,54 @@ void Draw(Device& d, gfx::ShaderDraw& sd, const char* what) {
       const int32_t cx = int32_t(rt->desc.Width / 2), cy = int32_t(rt->desc.Height / 2);
       d.gfx->ReadImage(rt->texture->tex, rt->level, 0, {0, 0, 1, 1}, v, 4);
       d.gfx->ReadImage(rt->texture->tex, rt->level, 0, {cx, cy, cx + 1, cy + 1}, v + 1, 4);
-      RECOMP_TRACE("  TEMP %ux%u R32F after draw (ps %08X): corner %g centre %g\n", rt->desc.Width,
+      ProbeLog("  TEMP %ux%u R32F after draw (ps %08X): corner %g centre %g\n", rt->desc.Width,
                    rt->desc.Height, d.ps, v[0], v[1]);
+      if (rt->desc.Width <= 256) {
+        uint64_t fnv = 1469598103934665603ull;
+        if (auto* p = com::As<Shader>(d.ps))
+          for (uint32_t t : p->tokens)
+            for (int i = 0; i < 4; i++) fnv = (fnv ^ ((t >> (8 * i)) & 0xFF)) * 1099511628211ull;
+        ProbeLog("    TEMP ps hash %016llx\n", (unsigned long long)fnv);
+        const auto& v = d.viewport;
+        auto* ds = com::As<Surface>(d.depth_stencil);
+        ProbeLog("    TEMP state prim %u n %u vp %u,%u %ux%u z %u zw %u zf %u at %u af %u ar %u ab %u sb %u db %u "
+                 "cw %X st %u cull %u sc %u ds %ux%u\n", sd.prim, sd.primitives, v.X, v.Y, v.Width, v.Height,
+                 d.rs[7], d.rs[14], d.rs[23], d.rs[15], d.rs[25], d.rs[24], d.rs[27], d.rs[19], d.rs[20],
+                 d.rs[168], d.rs[52], d.rs[22], d.rs[174], ds ? ds->desc.Width : 0, ds ? ds->desc.Height : 0);
+        ProbeLog("    TEMP clipplanes %X minz %g maxz %g\n", d.rs[152], v.MinZ, v.MaxZ);
+        {
+          uint64_t vh = 1469598103934665603ull;
+          if (vs)
+            for (uint32_t t : vs->tokens)
+              for (int i = 0; i < 4; i++) vh = (vh ^ ((t >> (8 * i)) & 0xFF)) * 1099511628211ull;
+          const auto& s0 = sd.streams[0];
+          ProbeLog("    TEMP vs %016llx fvf %X decl %d stride %u base %u indices %d\n", (unsigned long long)vh, d.fvf,
+                   com::As<VertexDecl>(d.decl) != nullptr, s0.stride, sd.base_vertex, sd.indices != nullptr);
+          ProbeLog("    TEMP vs c0 %g %g %g %g  ps c16 %g %g %g %g\n", d.vs_f[0][0], d.vs_f[0][1], d.vs_f[0][2],
+                   d.vs_f[0][3], d.ps_f[16][0], d.ps_f[16][1], d.ps_f[16][2], d.ps_f[16][3]);
+          if (auto* decl = com::As<VertexDecl>(d.decl))
+            for (const auto& e : decl->elements) {
+              if (e.Stream == 0xFF) break;
+              ProbeLog("    TEMP decl stream %u off %u type %u usage %u idx %u\n", e.Stream, e.Offset, e.Type,
+                       e.Usage, e.UsageIndex);
+            }
+          for (size_t i = 0; i < sd.input_count; i++)
+            ProbeLog("    TEMP input %zu: stream %u off %u type %u\n", i, sd.inputs[i].stream, sd.inputs[i].offset,
+                     sd.inputs[i].type);
+          if (s0.data && s0.stride)
+            for (int k = 0; k < 3; k++) {
+              float f[6] = {};
+              std::memcpy(f, s0.data + (size_t(sd.base_vertex) + size_t(k)) * s0.stride, std::min<size_t>(24, s0.stride));
+              ProbeLog("    TEMP v%d: %g %g %g %g %g %g\n", k, f[0], f[1], f[2], f[3], f[4], f[5]);
+            }
+        }
+        if (ps && ps->program)
+          for (const auto& k : ps->program->constants)
+            if (k.set == hlsl::RegisterSet::Sampler) ProbeLog("    TEMP sampler %s -> s%u\n", k.name.c_str(), k.index);
+        for (int sm = 0; sm < 8; sm++)
+          if (auto* t = com::As<Texture>(d.textures[sm]))
+            ProbeLog("    TEMP s%d: %ux%u fmt %u usage %X\n", sm, t->width, t->height, t->format, t->usage);
+      }
     }
     if (probe_on && rt && rt->kind == Surface::Kind::TextureLevel && rt->desc.Format == D3DFMT_A16B16G16R16F &&
         rt->desc.Width == 1024 && rt->desc.Height == 768) {

@@ -32,6 +32,7 @@
 #include <map>
 #include <mutex>
 #include <thread>
+#include <set>
 #include <tuple>
 #include <unordered_map>
 #include <vector>
@@ -1445,6 +1446,12 @@ void r_color0(inout vec4 c) {
     WarnUnsupportedShaderState(state);
 
     Cmd c{};
+    if (state.viewport.width == 64 && state.viewport.height == 64 && std::getenv("CRYSIS_PROBE")) {  // TEMP diagnostic
+      static std::set<std::tuple<int, int, int>> seen;
+      if (seen.insert({pass_w_, pass_h_, int(pass_fmts_[0])}).second)
+        WarnF("TEMP DrawShader vp 64x64: pass %dx%d targets %d fmt %d color %p bb %p\n", pass_w_, pass_h_,
+              pass_targets_, int(pass_fmts_[0]), (void*)pass_color_, (void*)backbuffer_);
+    }
     if (!SetupScissor(state, c, false)) return;
     c.viewport = D3DViewport(state);
     c.stencil_ref = uint8_t(state.rs[57]);
@@ -1727,11 +1734,17 @@ void r_color0(inout vec4 c) {
                  uint32_t pitch) override {
     std::lock_guard<std::recursive_mutex> l(mu_);
     auto it = textures_.find(id);
-    if (it == textures_.end() || level < 0 || level >= it->second.levels) return;
+    if (it == textures_.end() || level < 0 || level >= it->second.levels) {
+      if (std::getenv("CRYSIS_PROBE")) WarnF("TEMP ReadImage: texture %u level %d not found\n", unsigned(id), level);
+      return;
+    }
     const Tex& t = it->second;
     const Rect c = Clip(r, LevelSize(t.w, level), LevelSize(t.h, level));
     const uint32_t w = uint32_t(c.right - c.left), h = uint32_t(c.bottom - c.top);
-    if (!w || !h || IsCompressed(t.fmt)) return;
+    if (!w || !h || IsCompressed(t.fmt)) {
+      if (std::getenv("CRYSIS_PROBE")) WarnF("TEMP ReadImage: empty rect %ux%u level %d (%dx%d)\n", w, h, level, t.w, t.h);
+      return;
+    }
     Flush();
     const uint32_t row = RowPitch(t.fmt, w), size = row * h;
     SDL_GPUTransferBufferCreateInfo tbi{};
