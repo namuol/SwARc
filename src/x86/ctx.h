@@ -13,8 +13,10 @@ struct Flags {
   bool cf, pf, af, zf, sf, of, df;
   // AC (bit 18) and ID (bit 21) are just storage, but user code can flip
   // them on every CPU since the 486 (AC) and every one with CPUID (ID),
-  // and that is how it detects them.
-  bool ac, id;
+  // and that is how it detects them. NT (bit 14) likewise: user mode can
+  // set it on a 386 and later, not on a 286 (and IOPL, bits 12-13, stays
+  // 0), which is how old CPU checks tell them apart.
+  bool ac, id, nt;
 };
 
 struct Thread;
@@ -66,8 +68,8 @@ struct Ctx {
 [[gnu::always_inline]] inline uint32_t PackEFlags(const Flags& f) {
   return (f.cf ? 0x1u : 0) | 0x2u | (f.pf ? 0x4u : 0) | (f.af ? 0x10u : 0) |
          (f.zf ? 0x40u : 0) | (f.sf ? 0x80u : 0) | 0x200u |
-         (f.df ? 0x400u : 0) | (f.of ? 0x800u : 0) | (f.ac ? 0x40000u : 0) |
-         (f.id ? 0x200000u : 0);
+         (f.df ? 0x400u : 0) | (f.of ? 0x800u : 0) | (f.nt ? 0x4000u : 0) |
+         (f.ac ? 0x40000u : 0) | (f.id ? 0x200000u : 0);
 }
 [[gnu::always_inline]] inline void UnpackEFlags(Flags& f, uint32_t v) {
   f.cf = v & 0x1;
@@ -77,6 +79,7 @@ struct Ctx {
   f.sf = v & 0x80;
   f.df = v & 0x400;
   f.of = v & 0x800;
+  f.nt = v & 0x4000;
   f.ac = v & 0x40000;
   f.id = v & 0x200000;
 }

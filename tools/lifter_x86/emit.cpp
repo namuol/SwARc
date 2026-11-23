@@ -3694,6 +3694,21 @@ void InsnEmitter::Emit() {
     case ZYDIS_MNEMONIC_POPFD:
       L("::recomp::UnpackEFlags(F, ::recomp::lift::Rd<uint32_t>(B, esp)); esp += 4;");
       return;
+    // The 16-bit forms (66 prefix): FLAGS, the low half; popf keeps the
+    // high half (AC, ID).
+    case ZYDIS_MNEMONIC_PUSHF:
+      L("esp -= 2; ::recomp::lift::Wr<uint16_t>(B, esp, uint16_t(::recomp::PackEFlags(F)));");
+      return;
+    case ZYDIS_MNEMONIC_POPF:
+      L("{ const uint32_t v = ::recomp::lift::Rd<uint16_t>(B, esp); esp += 2; "
+        "::recomp::UnpackEFlags(F, (::recomp::PackEFlags(F) & 0xFFFF0000u) | v); }");
+      return;
+    // SMSW: CR0's low word (all of CR0's low 32 bits into a 32-bit
+    // register), as Windows user mode reads it: protected mode with paging
+    // (PE MP ET NE WP AM PG). Old CPU checks test PE.
+    case ZYDIS_MNEMONIC_SMSW:
+      L(Write(0, Bytes(0) == 2 ? "0x0033u" : "0x80050033u"));
+      return;
     case ZYDIS_MNEMONIC_XCHG:
       if (IsMem(0) || IsMem(1)) {
         int mi = IsMem(0) ? 0 : 1, ri = 1 - mi;
