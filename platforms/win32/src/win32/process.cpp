@@ -36,8 +36,19 @@ gaddr g_next_teb = 0;  // the next new TEB is below it (kTebTop, kTebTop64)
 std::vector<gaddr> g_free_tebs;
 std::set<gaddr> g_live_tebs;
 
-// The image's .text, where its lifted functions are.
+// The image's code, where its lifted functions are: from the first
+// executable section to the end of the last, as the lifter takes it
+// (platforms/win32/lifter/pe_reader.cpp); .text by name when no section is
+// marked executable.
 std::pair<gaddr, uint64_t> TextOf(const PeImage& img) {
+  constexpr uint32_t kCntCode = 0x20, kMemExecute = 0x20000000;
+  gaddr lo = 0, hi = 0;
+  for (const auto& s : img.sections) {
+    if (!(s.characteristics & (kCntCode | kMemExecute))) continue;
+    if (!hi || s.va < lo) lo = s.va;
+    hi = std::max<gaddr>(hi, s.va + s.vsize);
+  }
+  if (hi) return {lo, hi - lo};
   for (const auto& s : img.sections)
     if (s.name == ".text") return {s.va, s.vsize};
   return {0, 0};
@@ -188,13 +199,11 @@ void MapModule(Module& m) {
   };
   if (!m.img.Load(m.host_path, p.mem, &err, m.base, bind))
     FatalF("lifted DLL %s: %s", m.name.c_str(), err.c_str());
-  // Windows XP did not set up static TLS for LoadLibrary'd DLLs either,
-  // so 32-bit DLLs of that era have none. x64 ones get a slot of their own
-  // after the EXE's (slot 0), kept across remaps.
+  // A DLL with static TLS gets a slot of its own after the EXE's (slot 0),
+  // kept across remaps, as Vista and later set up for LoadLibrary'd DLLs.
+  // (Windows XP did not, so most 32-bit DLLs have none; those of games that
+  // also targeted Vista can.)
   if (m.img.has_tls) {
-    if (!p.x64)
-      FatalF("lifted DLL %s has static TLS (__declspec(thread)): not supported",
-             m.name.c_str());
     CheckNoTlsCallbacks(m.img, m.name);
     if (m.tls_index < 0) {
       int next = 1;

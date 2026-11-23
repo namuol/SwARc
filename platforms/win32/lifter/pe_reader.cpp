@@ -49,8 +49,18 @@ bool Load(Program& p, Module& m, const std::string& path, uint64_t base, std::st
   if (!img.Load(path, p.mem, err, base)) return false;
   m.base = img.image_base;
   m.preferred_base = img.preferred_base;
+  // Code: from the first executable section to the end of the last (an
+  // image can have more than .text, e.g. a section of hand-written or
+  // separately compiled routines after it; the alignment padding between
+  // them is never entered). By name when no section is marked executable.
+  constexpr uint32_t kCntCode = 0x20, kMemExecute = 0x20000000;
   for (const auto& s : img.sections) {
-    if (s.name == ".text") {
+    if (!(s.characteristics & (kCntCode | kMemExecute))) continue;
+    if (!m.text_hi || s.va < m.text_lo) m.text_lo = s.va;
+    m.text_hi = std::max<uint64_t>(m.text_hi, s.va + s.vsize);
+  }
+  for (const auto& s : img.sections) {
+    if (!m.text_hi && s.name == ".text") {
       m.text_lo = s.va;
       m.text_hi = s.va + s.vsize;
     }

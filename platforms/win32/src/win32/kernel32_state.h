@@ -18,6 +18,8 @@ inline constexpr uint32_t kGuestPid = 0x1000;
 // full guest path of its EXE.
 const std::string& GuestGameDir();
 std::string GuestExePath();
+// The EXE's file name, lower case, without GameConfig::exe_name's folder.
+std::string ExeFileName();
 
 void InitKernel32State();
 

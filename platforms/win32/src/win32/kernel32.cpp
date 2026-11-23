@@ -182,7 +182,7 @@ std::string GArg(gaddr p, bool wide) { return wide ? Narrow(GWStr(p)) : GStr(p);
 gaddr ModuleHandleOf(gaddr name, bool wide) {
   if (!name) return g_win32->img.image_base;
   std::string n = GArg(name, wide);
-  std::string exe = Lower(Game().exe_name);
+  std::string exe = ExeFileName();
   if (NormaliseDll(n) == exe || Lower(n) == exe.substr(0, exe.rfind('.')))
     return g_win32->img.image_base;
   if (Module* m = LiftedDll(n)) {

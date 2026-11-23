@@ -133,6 +133,12 @@ const std::string& GuestGameDir() { return Game().guest_dir; }
 
 std::string GuestExePath() { return GuestGameDir() + "\\" + Game().exe_name; }
 
+std::string ExeFileName() {
+  std::string e = win32::Lower(Game().exe_name);
+  size_t slash = e.find_last_of("\\/");
+  return slash == std::string::npos ? e : e.substr(slash + 1);
+}
+
 std::string GuestCurrentDir() {
   std::lock_guard<std::mutex> l(g_cwd_mu);
   return g_cwd.empty() ? GuestGameDir() : g_cwd;
