@@ -408,6 +408,64 @@ uint32_t UserName(Ctx& c, bool wide) {
 HLE("advapi32.dll", GetUserNameA, 2) { return UserName(c, false); }
 HLE("advapi32.dll", GetUserNameW, 2) { return UserName(c, true); }
 
+// ---- security ---------------------------------------------------------------
+// One user, who may do anything to the files the game sees (they are the
+// player's own). Objects' security descriptors have a NULL DACL (everyone
+// has full access), tokens are opaque, and access checks grant what is
+// asked: the "can I write here?" probe games run on their own folder
+// passes.
+
+constexpr uint32_t kErrorSuccess = 0;
+
+// DWORD GetNamedSecurityInfoA(name, type, info, PSID* owner, PSID* group,
+// PACL* dacl, PACL* sacl, PSECURITY_DESCRIPTOR* sd): a self-relative
+// descriptor with no owner or group and a NULL DACL, which the caller frees
+// with LocalFree; the four component pointers are NULL.
+HLE("advapi32.dll", GetNamedSecurityInfoA, 8) {
+  for (int i = 3; i <= 6; i++)
+    if (Arg(c, i)) Wr32(Arg(c, i), 0);
+  if (gaddr psd = Arg(c, 7)) {
+    gaddr sd = HeapAllocProcess(20, true);
+    Wr8(sd, 1);                 // Revision
+    Wr16(sd + 2, 0x8000 | 0x4);  // SE_SELF_RELATIVE | SE_DACL_PRESENT (NULL DACL)
+    Wr32(psd, uint32_t(sd));
+  }
+  return kErrorSuccess;
+}
+
+struct Token : KObject {
+  Token() : KObject(Type::Token) {}
+};
+
+HLE("advapi32.dll", ImpersonateSelf, 1) { return 1; }
+HLE("advapi32.dll", RevertToSelf, 0) { return 1; }
+
+// BOOL OpenThreadToken(thread, access, open_as_self, HANDLE* token).
+HLE("advapi32.dll", OpenThreadToken, 4) {
+  Wr32(Arg(c, 3), NewHandle(std::make_shared<Token>()));
+  return 1;
+}
+
+// void MapGenericMask(DWORD* mask, GENERIC_MAPPING* map): GENERIC_READ,
+// _WRITE, _EXECUTE and _ALL become the mapping's rights.
+HLE("advapi32.dll", MapGenericMask, 2) {
+  gaddr pm = Arg(c, 0), map = Arg(c, 1);
+  uint32_t m = Rd32(pm);
+  static constexpr uint32_t kGeneric[4] = {0x80000000, 0x40000000, 0x20000000, 0x10000000};
+  for (int i = 0; i < 4; i++)
+    if (m & kGeneric[i]) m = (m & ~kGeneric[i]) | Rd32(map + 4 * i);
+  Wr32(pm, m);
+  return 0;
+}
+
+// BOOL AccessCheck(sd, token, desired, mapping, privileges, privileges_len,
+// DWORD* granted, BOOL* status): everything desired is granted.
+HLE("advapi32.dll", AccessCheck, 8) {
+  if (Arg(c, 6)) Wr32(Arg(c, 6), Arg(c, 2));
+  if (Arg(c, 7)) Wr32(Arg(c, 7), 1);
+  return 1;
+}
+
 // ---- ole32 ------------------------------------------------------------------
 
 // SystemFunction036 is RtlGenRandom(buf, len): BOOLEAN, len random bytes

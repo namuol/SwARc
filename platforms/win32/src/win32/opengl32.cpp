@@ -203,11 +203,6 @@ HLE("opengl32.dll", wglDescribePixelFormat, 4) {
 HLE("opengl32.dll", wglSetPixelFormat, 3) { return Arg(c, 1) == 1 ? 1 : 0; }
 HLE("opengl32.dll", wglGetPixelFormat, 1) { return 1; }
 
-// No hardware gamma ramp: games fall back to their own brightness
-// handling, as on drivers without one.
-HLE("gdi32.dll", GetDeviceGammaRamp, 2) { return 0; }
-HLE("gdi32.dll", SetDeviceGammaRamp, 2) { return 0; }
-
 HLE("opengl32.dll", wglCreateContext, 1) {
   uint32_t hwnd = WindowForDc(Arg(c, 0));
   if (!hwnd || !SdlWindowFor(hwnd)) {

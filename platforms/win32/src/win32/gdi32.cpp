@@ -110,5 +110,11 @@ HLE("gdi32.dll", GetDIBits, 7) {
   return 0;
 }
 
+// ---- gamma ------------------------------------------------------------------
+// No hardware gamma ramp: games fall back to their own brightness
+// handling, as on drivers without one.
+HLE("gdi32.dll", GetDeviceGammaRamp, 2) { return 0; }
+HLE("gdi32.dll", SetDeviceGammaRamp, 2) { return 0; }
+
 }  // namespace
 }  // namespace recomp::hle

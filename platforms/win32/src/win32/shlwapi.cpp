@@ -1,4 +1,4 @@
-// shlwapi: the path and URL string helpers (ANSI). Pure string work on
+// shlwapi: the path and URL string helpers (ANSI, and a few wide ones). Pure string work on
 // guest memory, as shlwapi does it: '\\', '/' and ':' separate path
 // components; nothing touches the file system.
 
@@ -124,6 +124,52 @@ HLE("shlwapi.dll", UrlUnescapeA, 4) {
   PutStr(out, r);
   Wr32(pcch, uint32_t(r.size()));
   return kSOk;
+}
+
+// ---- wide versions -------------------------------------------------------
+
+char16_t* WPtr(uint32_t va) { return reinterpret_cast<char16_t*>(GPtr(va)); }
+
+// BOOL PathRemoveFileSpecW(WCHAR* path): cuts the last component and the
+// backslash before it, in place, keeping a root ("C:\", "\"); a path with
+// no backslash keeps only a drive ("C:") or becomes empty. TRUE if the
+// path changed.
+HLE("shlwapi.dll", PathRemoveFileSpecW, 1) {
+  uint32_t p = Arg(c, 0);
+  if (!p) return 0;
+  std::u16string s = GWStr(p);
+  size_t keep;
+  size_t slash = s.rfind(u'\\');
+  if (slash == std::u16string::npos)
+    keep = s.size() >= 2 && s[1] == u':' ? 2 : 0;
+  else if (slash == 0 || (slash == 2 && s[1] == u':'))
+    keep = slash + 1;  // the root's backslash stays
+  else
+    keep = slash;
+  if (keep >= s.size()) return 0;
+  WPtr(p)[keep] = 0;
+  return 1;
+}
+
+char16_t FoldW(char16_t ch) {
+  if (ch >= u'A' && ch <= u'Z') return char16_t(ch + 32);
+  if (ch >= 0xC0 && ch <= 0xDE && ch != 0xD7) return char16_t(ch + 32);  // Latin-1
+  return ch;
+}
+
+// WCHAR* StrStrIW(const WCHAR* hay, const WCHAR* needle): the first match
+// ignoring case, or NULL; an empty needle matches nothing.
+HLE("shlwapi.dll", StrStrIW, 2) {
+  uint32_t h = Arg(c, 0), n = Arg(c, 1);
+  if (!h || !n) return 0;
+  std::u16string hs = GWStr(h), ns = GWStr(n);
+  if (ns.empty() || ns.size() > hs.size()) return 0;
+  for (size_t i = 0; i + ns.size() <= hs.size(); i++) {
+    size_t k = 0;
+    while (k < ns.size() && FoldW(hs[i + k]) == FoldW(ns[k])) k++;
+    if (k == ns.size()) return h + uint32_t(2 * i);
+  }
+  return 0;
 }
 
 }  // namespace

@@ -285,14 +285,85 @@ HLE_NAMED("wsock32.dll", "#1111", wsock_EnumProtocolsA, 3) {
 HLE_NAMED("wsock32.dll", "#8", wsock_htonl, 1) { return __builtin_bswap32(Arg(c, 0)); }
 HLE_NAMED("wsock32.dll", "#9", wsock_htons, 1) { return __builtin_bswap16(uint16_t(Arg(c, 0))); }
 HLE_NAMED("wsock32.dll", "#15", wsock_ntohs, 1) { return __builtin_bswap16(uint16_t(Arg(c, 0))); }
+// wsock32 numbers its first 23 exports in name order, so 10 is inet_addr,
+// 11 inet_ntoa and 12 ioctlsocket (ws2_32 numbers those three otherwise).
 // inet_addr("a.b.c.d"), network byte order; INADDR_NONE otherwise.
-HLE_NAMED("wsock32.dll", "#11", wsock_inet_addr, 1) {
+HLE_NAMED("wsock32.dll", "#10", wsock_inet_addr, 1) {
   unsigned a, b, cc, d;
   char tail;
   if (std::sscanf(GStr(Arg(c, 0)).c_str(), "%u.%u.%u.%u%c", &a, &b, &cc, &d, &tail) != 4 ||
       a > 255 || b > 255 || cc > 255 || d > 255)
     return 0xFFFFFFFF;
   return a | b << 8 | cc << 16 | d << 24;
+}
+
+// inet_ntoa(struct in_addr, by value): "a.b.c.d" in a buffer the guest may
+// keep until the next call, as Winsock's per-thread one.
+HLE_NAMED("wsock32.dll", "#11", wsock_inet_ntoa, 1) {
+  static thread_local uint32_t buf = 0;
+  if (!buf) buf = HeapAllocProcess(16, true);
+  uint32_t a = Arg(c, 0);
+  char s[16];
+  std::snprintf(s, sizeof s, "%u.%u.%u.%u", a & 0xFF, (a >> 8) & 0xFF, (a >> 16) & 0xFF, a >> 24);
+  PutStr(buf, s);
+  return buf;
+}
+
+// The rest of the socket calls fail the same way (no socket exists to use).
+HLE_NAMED("wsock32.dll", "#1", wsock_accept, 3) { return SockFail(); }
+HLE_NAMED("wsock32.dll", "#4", wsock_connect, 3) { return SockFail(); }
+HLE_NAMED("wsock32.dll", "#5", wsock_getpeername, 3) { return SockFail(); }
+HLE_NAMED("wsock32.dll", "#6", wsock_getsockname, 3) { return SockFail(); }
+HLE_NAMED("wsock32.dll", "#12", wsock_ioctlsocket, 3) { return SockFail(); }
+HLE_NAMED("wsock32.dll", "#13", wsock_listen, 2) { return SockFail(); }
+HLE_NAMED("wsock32.dll", "#16", wsock_recv, 4) { return SockFail(); }
+HLE_NAMED("wsock32.dll", "#18", wsock_select, 5) { return SockFail(); }
+HLE_NAMED("wsock32.dll", "#19", wsock_send, 4) { return SockFail(); }
+HLE_NAMED("wsock32.dll", "#22", wsock_shutdown, 2) { return SockFail(); }
+HLE_NAMED("wsock32.dll", "#112", wsock_WSASetLastError, 1) {
+  g_wsa_error = Arg(c, 0);
+  return 0;
+}
+
+// Lookups find nothing: NULL with WSANO_DATA (a valid name, no record).
+constexpr uint32_t kWsaNoData = 11004;
+uint32_t NoRecord() {
+  g_wsa_error = kWsaNoData;
+  return 0;
+}
+HLE_NAMED("wsock32.dll", "#51", wsock_gethostbyaddr, 3) { return NoRecord(); }
+HLE_NAMED("wsock32.dll", "#55", wsock_getservbyname, 2) { return NoRecord(); }
+HLE_NAMED("wsock32.dll", "#56", wsock_getservbyport, 2) { return NoRecord(); }
+// WSAAsyncGetHostByName(hwnd, msg, name, buf, buflen): no task handle (0).
+HLE_NAMED("wsock32.dll", "#103", wsock_WSAAsyncGetHostByName, 5) {
+  SockFail();
+  return 0;
+}
+
+// __WSAFDIsSet(SOCKET s, fd_set* set): whether s is among the set's
+// fd_count sockets (u_int fd_count; SOCKET fd_array[]).
+HLE_NAMED("wsock32.dll", "#151", wsock___WSAFDIsSet, 2) {
+  uint32_t s = Arg(c, 0), set = Arg(c, 1);
+  uint32_t n = std::min<uint32_t>(Rd32(set), 64);
+  for (uint32_t i = 0; i < n; i++)
+    if (Rd32(set + 4 + 4 * i) == s) return 1;
+  return 0;
+}
+
+// The Microsoft extensions: AcceptEx(listen, accept, buf, recv len, local
+// len, remote len, &bytes, overlapped) fails; GetAcceptExSockaddrs(buf,
+// recv len, local len, remote len, &local, &local len, &remote, &remote
+// len) has no addresses to give.
+HLE_NAMED("wsock32.dll", "#1141", wsock_AcceptEx, 8) {
+  SockFail();
+  return 0;
+}
+HLE_NAMED("wsock32.dll", "#1142", wsock_GetAcceptExSockaddrs, 8) {
+  for (int i : {4, 6})
+    if (Arg(c, i)) Wr32(Arg(c, i), 0);
+  for (int i : {5, 7})
+    if (Arg(c, i)) Wr32(Arg(c, i), 0);
+  return 0;
 }
 
 }  // namespace
