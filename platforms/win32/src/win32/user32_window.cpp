@@ -235,10 +235,6 @@ std::atomic<int32_t> g_real_x{0}, g_real_y{0};
 // it steers its own pointer by relative motion).
 std::atomic<int64_t> g_last_recentre_ms{-100000};
 std::atomic<int32_t> g_recentre_x{0}, g_recentre_y{0};  // screen coordinates
-// Mouse look's re-centring of the host pointer (SDL_WarpMouseInWindow):
-// where it went, and whether its motion event is still to come.
-bool g_warp_echo = false;
-float g_warp_x = 0, g_warp_y = 0;
 // Mouse-look motion past the screen's edge, for after the next re-centre.
 std::atomic<int32_t> g_look_carry_x{0}, g_look_carry_y{0};
 bool g_sdl_up = false;
@@ -822,29 +818,7 @@ void HandleSdlEvent(const SDL_Event& e) {
       // onto its screen, so its own cursor stays under the real one.
       bool relative = e.motion.which == kTestRelative ||
                       int64_t(TickCount()) - g_last_recentre_ms <= 250;
-      // The echo of our own re-centring warp (below) is no motion.
-      if (g_warp_echo && std::fabs(e.motion.x - g_warp_x) < 1 && std::fabs(e.motion.y - g_warp_y) < 1) {
-        g_warp_echo = false;
-        break;
-      }
       if (clipped || (relative && (ExclusiveSize(h, &mw, &mh) || LookSize(h, &mw, &mh)))) {
-        // The host pointer should be held still by the grab (SDL's relative
-        // mode), but on macOS it can still drift, and at the edge of the
-        // screen its motion stops: mouse look could only turn so far. Near
-        // an edge it goes back to the window's centre.
-        if (!Background() && e.motion.which != kTestRelative)
-          if (SDL_Window* sw = SDL_GetWindowFromID(e.motion.windowID)) {
-            int pw = 0, ph = 0;
-            SDL_GetWindowSize(sw, &pw, &ph);
-            if (pw > 8 && ph > 8 &&
-                (e.motion.x < pw / 4.0f || e.motion.x > pw * 3 / 4.0f ||
-                 e.motion.y < ph / 4.0f || e.motion.y > ph * 3 / 4.0f)) {
-              g_warp_x = pw / 2.0f;
-              g_warp_y = ph / 2.0f;
-              g_warp_echo = true;
-              SDL_WarpMouseInWindow(sw, g_warp_x, g_warp_y);
-            }
-          }
         // Virtual cursor: the game recentres it with SetCursorPos every
         // frame and steers its own pointer by the difference, as on a
         // fullscreen Windows desktop. Real motion moves the virtual
