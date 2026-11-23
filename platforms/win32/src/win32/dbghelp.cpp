@@ -129,6 +129,24 @@ HLE("dbghelp.dll", StackWalk, 9) { return 0; }  // no frames: report ends
 HLE("dbghelp.dll", SymGetSymFromAddr, 4) { return 0; }
 HLE("dbghelp.dll", SymGetLineFromAddr, 4) { return 0; }
 HLE("dbghelp.dll", SymGetModuleInfo, 3) { return 0; }
+// The 64-bit-address forms (a DWORD64 takes two stack slots), the same.
+HLE("dbghelp.dll", SymGetModuleBase64, 3) {
+  uint32_t a = Arg(c, 1);
+  const PeImage& img = g_win32->img;
+  return a >= img.image_base && a < img.image_base + img.image_size ? img.image_base : 0;
+}
+HLE("dbghelp.dll", SymFunctionTableAccess64, 3) { return 0; }
+HLE("dbghelp.dll", StackWalk64, 9) { return 0; }  // no frames: report ends
+HLE("dbghelp.dll", SymFromAddr, 5) { return 0; }
+HLE("dbghelp.dll", SymGetLineFromAddr64, 5) { return 0; }
+HLE("dbghelp.dll", SymGetModuleInfo64, 4) { return 0; }
+HLE("dbghelp.dll", SymEnumerateModules64, 3) { return 1; }  // none listed
+// SearchTreeForFile(root, name, out): games look for their symbol files
+// (.pdb), which are never shipped: not found.
+HLE("dbghelp.dll", SearchTreeForFile, 3) {
+  SetLastError(2);  // ERROR_FILE_NOT_FOUND
+  return 0;
+}
 HLE("dbghelp.dll", MiniDumpWriteDump, 7) {
   WarnF("MiniDumpWriteDump: not supported\n");
   return 0;

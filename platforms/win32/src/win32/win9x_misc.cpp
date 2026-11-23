@@ -286,6 +286,8 @@ HLE_NAMED("wsock32.dll", "#1111", wsock_EnumProtocolsA, 3) {
 HLE_NAMED("wsock32.dll", "#8", wsock_htonl, 1) { return __builtin_bswap32(Arg(c, 0)); }
 HLE_NAMED("wsock32.dll", "#9", wsock_htons, 1) { return __builtin_bswap16(uint16_t(Arg(c, 0))); }
 HLE_NAMED("wsock32.dll", "#15", wsock_ntohs, 1) { return __builtin_bswap16(uint16_t(Arg(c, 0))); }
+// wsock32 numbers its first 23 exports in name order, so 10 is inet_addr,
+// 11 inet_ntoa and 12 ioctlsocket (ws2_32 numbers those three otherwise).
 // inet_addr("a.b.c.d"), network byte order; INADDR_NONE otherwise.
 HLE_NAMED("wsock32.dll", "#10", wsock_inet_addr, 1) {
   unsigned a, b, cc, d;
@@ -325,6 +327,41 @@ HLE_NAMED("wsock32.dll", "#151", wsock___WSAFDIsSet, 2) {
   uint32_t n = Rd32(set);
   for (uint32_t i = 0; i < n && i < 64; i++)
     if (Rd32(set + 4 + 4 * i) == Arg(c, 0)) return 1;
+  return 0;
+}
+
+// The rest of the socket calls fail the same way (no socket exists to use).
+HLE_NAMED("wsock32.dll", "#5", wsock_getpeername, 3) { return SockFail(); }
+HLE_NAMED("wsock32.dll", "#12", wsock_ioctlsocket, 3) { return SockFail(); }
+
+// Lookups find nothing: NULL with WSANO_DATA (a valid name, no record).
+constexpr uint32_t kWsaNoData = 11004;
+uint32_t NoRecord() {
+  g_wsa_error = kWsaNoData;
+  return 0;
+}
+HLE_NAMED("wsock32.dll", "#51", wsock_gethostbyaddr, 3) { return NoRecord(); }
+HLE_NAMED("wsock32.dll", "#55", wsock_getservbyname, 2) { return NoRecord(); }
+HLE_NAMED("wsock32.dll", "#56", wsock_getservbyport, 2) { return NoRecord(); }
+// WSAAsyncGetHostByName(hwnd, msg, name, buf, buflen): no task handle (0).
+HLE_NAMED("wsock32.dll", "#103", wsock_WSAAsyncGetHostByName, 5) {
+  SockFail();
+  return 0;
+}
+
+// The Microsoft extensions: AcceptEx(listen, accept, buf, recv len, local
+// len, remote len, &bytes, overlapped) fails; GetAcceptExSockaddrs(buf,
+// recv len, local len, remote len, &local, &local len, &remote, &remote
+// len) has no addresses to give.
+HLE_NAMED("wsock32.dll", "#1141", wsock_AcceptEx, 8) {
+  SockFail();
+  return 0;
+}
+HLE_NAMED("wsock32.dll", "#1142", wsock_GetAcceptExSockaddrs, 8) {
+  for (int i : {4, 6})
+    if (Arg(c, i)) Wr32(Arg(c, i), 0);
+  for (int i : {5, 7})
+    if (Arg(c, i)) Wr32(Arg(c, i), 0);
   return 0;
 }
 

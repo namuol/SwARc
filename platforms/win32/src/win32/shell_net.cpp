@@ -160,10 +160,17 @@ HLE("shell32.dll", SHCreateDirectoryExA, 3) {
 
 // ---- wsock32 ------------------------------------------------------------------------
 
-HLE_NAMED("wsock32.dll", "#115", WSAStartup, 2) {  // WSAStartup(version, WSADATA*)
-  uint32_t wsa = Arg(c, 1);
+// WSAStartup(version, WSADATA*): wVersion is the version the caller will
+// use, the lower of the one it asked for and the highest supported (2.2),
+// as on Windows (whose wsock32 is a front for ws2_32); callers check it.
+// Below 1.0 is WSAVERNOTSUPPORTED.
+HLE_NAMED("wsock32.dll", "#115", WSAStartup, 2) {
+  uint32_t want = Arg(c, 0) & 0xFFFF, wsa = Arg(c, 1);
+  uint32_t major = want & 0xFF, minor = want >> 8;
+  if (major == 0) return 10092;  // WSAVERNOTSUPPORTED
+  uint16_t use = major > 2 || (major == 2 && minor > 2) ? 0x0202 : uint16_t(want);
   std::memset(GPtr(wsa), 0, 400);
-  Wr16(wsa + 0, 0x0101);
+  Wr16(wsa + 0, use);
   Wr16(wsa + 2, 0x0202);
   PutStr(wsa + 4, "WinSock 2.0");
   PutStr(wsa + 261, "Running");
@@ -205,10 +212,6 @@ HLE_NAMED("wsock32.dll", "#52", gethostbyname, 1) {
 // 11 inet_ntoa, 12 ioctlsocket, 14 ntohl, 15 ntohs, ...): ws2_32's own
 // numbering differs from 10 on. The socket calls are in win9x_misc.cpp.
 HLE_NAMED("wsock32.dll", "#14", ntohl, 1) { return __builtin_bswap32(Arg(c, 0)); }  // ntohl
-
-HLE_NAMED("wsock32.dll", "#12", ioctlsocket, 3) {  // ioctlsocket: no sockets exist
-  return 0xFFFFFFFF;
-}
 
 }  // namespace
 // CommandLineToArgvW(line, &argc): one LocalAlloc block holding the
