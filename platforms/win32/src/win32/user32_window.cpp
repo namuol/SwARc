@@ -4689,6 +4689,18 @@ uint64_t EnumDisplaySettings(Ctx& c, bool wide) {
 HLE64("user32.dll", EnumDisplaySettingsA, 3) { return EnumDisplaySettings(c, false); }
 HLE64("user32.dll", EnumDisplaySettingsW, 3) { return EnumDisplaySettings(c, true); }
 
+// A device name the game passes (CHAR or WCHAR, ASCII in practice), and
+// one written back.
+std::string DeviceName(gaddr p, bool wide) {
+  if (!wide) return GStr(p);
+  std::string out;
+  for (char16_t ch : GWStr(p)) out += char(ch < 0x80 ? ch : '?');
+  return out;
+}
+void PutName(gaddr p, const std::string& s, bool wide) {
+  if (wide) PutWStr(p, s); else PutStr(p, s);
+}
+
 // ---- monitors -----------------------------------------------------------------
 // One monitor, the primary, covering the screen the game sees (the
 // virtual display mode); its work area is all of it (no taskbar).
@@ -4716,13 +4728,14 @@ HLE("user32.dll", EnumDisplayMonitors, 4) {
   return 1;
 }
 
-// GetMonitorInfoA(hmonitor, MONITORINFO(EXA)*): cbSize 40, or 72 with the
-// device name.
-HLE("user32.dll", GetMonitorInfoA, 2) {
+// GetMonitorInfoA/W(hmonitor, MONITORINFO(EX)*): cbSize 40, or with the
+// device name 72 (A) or 104 (W).
+uint64_t GetMonitorInfo(Ctx& c, bool wide) {
   EnsureSdlVideo();
   gaddr mi = Arg(c, 1);
   uint32_t cb = Rd32(mi);
-  if (Arg(c, 0) != kPrimaryMonitor || (cb != 40 && cb != 72)) return 0;
+  const uint32_t ex = wide ? 104 : 72;
+  if (Arg(c, 0) != kPrimaryMonitor || (cb != 40 && cb != ex)) return 0;
   for (gaddr r : {mi + 4, mi + 20}) {
     Wr32(r + 0, 0);
     Wr32(r + 4, 0);
@@ -4730,35 +4743,41 @@ HLE("user32.dll", GetMonitorInfoA, 2) {
     Wr32(r + 12, uint32_t(g_display_h));
   }
   Wr32(mi + 36, 1);  // MONITORINFOF_PRIMARY
-  if (cb == 72) {
-    std::memset(GPtr(mi + 40), 0, 32);
-    PutStr(mi + 40, "\\\\.\\DISPLAY1");
+  if (cb == ex) {
+    std::memset(GPtr(mi + 40), 0, ex - 40);
+    PutName(mi + 40, "\\\\.\\DISPLAY1", wide);
   }
   return 1;
 }
+HLE("user32.dll", GetMonitorInfoA, 2) { return GetMonitorInfo(c, false); }
+HLE("user32.dll", GetMonitorInfoW, 2) { return GetMonitorInfo(c, true); }
 
-// EnumDisplayDevicesA(device, index, DISPLAY_DEVICEA*, flags): with no
+// EnumDisplayDevicesA/W(device, index, DISPLAY_DEVICE*, flags): with no
 // device, the adapters (one, "\\.\DISPLAY1"); with an adapter's name,
-// its monitors (one). DISPLAY_DEVICEA: cb, DeviceName[32],
-// DeviceString[128], StateFlags, DeviceID[128], DeviceKey[128].
-HLE("user32.dll", EnumDisplayDevicesA, 4) {
-  std::string dev = Arg(c, 0) ? GStr(Arg(c, 0)) : "";
+// its monitors (one). DISPLAY_DEVICE: cb, DeviceName[32],
+// DeviceString[128], StateFlags, DeviceID[128], DeviceKey[128], in CHARs
+// (A, 424 bytes) or WCHARs (W, 840).
+uint64_t EnumDisplayDevices(Ctx& c, bool wide) {
+  std::string dev = Arg(c, 0) ? DeviceName(Arg(c, 0), wide) : "";
   gaddr dd = Arg(c, 2);
   if (Arg(c, 1) != 0 || (!dev.empty() && Lower(dev) != "\\\\.\\display1")) return 0;
+  const uint32_t ch = wide ? 2 : 1, name = 4, str = name + 32 * ch, state = str + 128 * ch;
   uint32_t cb = Rd32(dd);
-  if (cb < 168) return 0;
-  std::memset(GPtr(dd + 4), 0, std::min<uint32_t>(cb, 424) - 4);
+  if (cb < state + 4) return 0;
+  std::memset(GPtr(dd + 4), 0, std::min<uint32_t>(cb, state + 4 + 256 * ch) - 4);
   if (dev.empty()) {
-    PutStr(dd + 4, "\\\\.\\DISPLAY1");
-    PutStr(dd + 36, "Display Adapter");
-    Wr32(dd + 164, 0x1 | 0x4);  // ATTACHED_TO_DESKTOP | PRIMARY_DEVICE
+    PutName(dd + name, "\\\\.\\DISPLAY1", wide);
+    PutName(dd + str, "Display Adapter", wide);
+    Wr32(dd + state, 0x1 | 0x4);  // ATTACHED_TO_DESKTOP | PRIMARY_DEVICE
   } else {
-    PutStr(dd + 4, "\\\\.\\DISPLAY1\\Monitor0");
-    PutStr(dd + 36, "Generic PnP Monitor");
-    Wr32(dd + 164, 0x1 | 0x2);  // DISPLAY_DEVICE_ACTIVE | ATTACHED
+    PutName(dd + name, "\\\\.\\DISPLAY1\\Monitor0", wide);
+    PutName(dd + str, "Generic PnP Monitor", wide);
+    Wr32(dd + state, 0x1 | 0x2);  // DISPLAY_DEVICE_ACTIVE | ATTACHED
   }
   return 1;
 }
+HLE("user32.dll", EnumDisplayDevicesA, 4) { return EnumDisplayDevices(c, false); }
+HLE("user32.dll", EnumDisplayDevicesW, 4) { return EnumDisplayDevices(c, true); }
 
 // DwmSetWindowAttribute(hwnd, attribute, data, size): frame colours,
 // rounded corners, dark title bars; nothing the host window takes.
@@ -4768,10 +4787,8 @@ HLE("dwmapi.dll", DwmSetWindowAttribute, 4) { return 0; }  // S_OK
 // the game switches to becomes the screen it sees (GetSystemMetrics,
 // EnumDisplaySettings), as after a real switch; a window covering it goes
 // host fullscreen (UpdateFullscreen). NULL restores the desktop size.
-uint64_t ChangeDisplaySettings(Ctx& c, bool wide) {
+uint64_t ChangeDisplaySettings(gaddr dm, uint32_t flags, bool wide) {
   EnsureSdlVideo();
-  gaddr dm = Arg(c, 0);
-  uint32_t flags = uint32_t(Arg(c, 1));
   const DevModeLayout f = DevModeFields(wide);
   if (!dm) {
     g_display_w = g_desktop_w;
@@ -4792,8 +4809,18 @@ uint64_t ChangeDisplaySettings(Ctx& c, bool wide) {
   UpdateFullscreenAll();
   return 0;
 }
-HLE64("user32.dll", ChangeDisplaySettingsA, 2) { return ChangeDisplaySettings(c, false); }
-HLE64("user32.dll", ChangeDisplaySettingsW, 2) { return ChangeDisplaySettings(c, true); }
+HLE64("user32.dll", ChangeDisplaySettingsA, 2) { return ChangeDisplaySettings(Arg(c, 0), uint32_t(Arg(c, 1)), false); }
+HLE64("user32.dll", ChangeDisplaySettingsW, 2) { return ChangeDisplaySettings(Arg(c, 0), uint32_t(Arg(c, 1)), true); }
+// ChangeDisplaySettingsEx(device, devmode, hwnd, flags, lparam): the same for
+// the one display; another device's name is DISP_CHANGE_BADPARAM.
+uint64_t ChangeDisplaySettingsEx(Ctx& c, bool wide) {
+  if (gaddr dev = Arg(c, 0)) {
+    if (Lower(DeviceName(dev, wide)) != "\\\\.\\display1") return uint32_t(-5);  // DISP_CHANGE_BADPARAM
+  }
+  return ChangeDisplaySettings(Arg(c, 1), uint32_t(Arg(c, 3)), wide);
+}
+HLE64("user32.dll", ChangeDisplaySettingsExA, 5) { return ChangeDisplaySettingsEx(c, false); }
+HLE64("user32.dll", ChangeDisplaySettingsExW, 5) { return ChangeDisplaySettingsEx(c, true); }
 
 // ---- painting and GDI device contexts (no GDI drawing reaches the screen;
 // the game renders through DirectDraw) -------------------------------------------------
