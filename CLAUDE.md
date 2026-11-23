@@ -47,6 +47,20 @@ OS or middleware API goes here, even when a game is where it came up.
   rebuild each one listed under Layout, re-lift if the lifter changed, and
   run its ctest (with <ID>_GAME_EXE set, the EXE-derived oracle tests run
   too).
+- Moving game checkouts to a new SwARc commit (after landing, or to
+  pick up main): `python3 -I tools/repin.py [--ref REF] [--push
+  --trailer LINE] REPO...`, never by hand repo by repo. For each repo it
+  checks it is clean and its old pin is an ancestor of the new one, runs
+  `./recomp pin`, tools/lift.sh, the rebuild and smoke.py headless and
+  muted, then commits "Pin SwARc <sha>" (and pushes) only what passed. A
+  failure stops that repo, uncommitted, and the run goes on; the end
+  prints a Markdown table (also LOG_DIR/summary.md). Agents: run it in
+  the background (it takes minutes per repo; without a terminal it
+  prints one line per stage with the time left), pass a game repo's own
+  commit trailers with --trailer, and read the failed stage's log
+  (LOG_DIR/<repo>/<stage>.log) before deciding whether SwARc or the game
+  is at fault. Leave out a repo whose pin is on a branch that has not
+  landed: the ancestor check refuses it unless --force.
 - The oracle tests of the PowerPC and AArch64 cores need a Python with
   their packages: pass -DRECOMP_PYTHON=<venv>/bin/python (the venv's own
   path, not its resolved symlink) when the tree has no `.venv/`

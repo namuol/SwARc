@@ -38,7 +38,7 @@ SwARc commit the game pins, and changing them here reaches every game at its nex
 | `./recomp install [ARGS]` | `kit` if needed, then the game's `install.sh` with that kit, as a player would install (`ARGS` go to `build.sh`: `--no-launch`, `--game-dir DIR`) |
 | `./recomp test [ARGS]` | `kit` if needed, then `vm-test.sh` on this repo (`--keep-base`, `--keep`, `--update`, `--steam`) |
 | `./recomp uninstall` | `install.sh --uninstall` |
-| `./recomp pin [REF]` | Checks out SwARc's `REF` (default `origin/main`; it must be on the fork), pins it in `tools/swarc.sh`, then `sync`. Commit `tools/swarc.sh` and the generated files together |
+| `./recomp pin [REF]` | Checks out SwARc's `REF` (default `origin/main`; it must be on the fork), pins it in `tools/swarc.sh`, then `sync`. Commit `tools/swarc.sh` and the generated files together. For several game repos at once (pin, lift, build, smoke, commit, push), SwARc's `tools/repin.py` |
 
 `kit`, `install` and `test` stop when `external/SwARc` isn't the pinned commit or has uncommitted changes, since
 the kit would then be built from something the game doesn't pin; `--allow-unpinned` goes ahead anyway, for trying
