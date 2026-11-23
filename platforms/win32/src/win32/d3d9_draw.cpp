@@ -806,11 +806,58 @@ void Draw(Device& d, gfx::ShaderDraw& sd, const char* what) {
   const gfx::FfState state = DrawState(d, false);
   sd.state = &state;
   BindTargets(d);
+  if (std::getenv("CRYSIS_CULL_STATS")) {  // TEMP diagnostic: not for landing. Draw counts by cull mode.
+    static uint64_t n[2][4] = {}, total = 0;
+    n[(d.rs[168] & 0xF) ? 1 : 0][d.rs[22] & 3]++;
+    if (++total % 200000 == 0)
+      ProbeLog("TEMP cull stats: colour off: none %llu cw %llu ccw %llu | colour on: none %llu cw %llu ccw %llu\n",
+               (unsigned long long)n[0][1], (unsigned long long)n[0][2], (unsigned long long)n[0][3],
+               (unsigned long long)n[1][1], (unsigned long long)n[1][2], (unsigned long long)n[1][3]);
+  }
+  {  // TEMP diagnostic: not for landing. One CULL_CW shadow-map draw: vs, decl, indices, positions, c0-c11.
+    auto* ds = com::As<Surface>(d.depth_stencil);
+    static int dumped = 0;
+    if (std::getenv("CRYSIS_SHADOW_TRI") && ds && ds->kind == Surface::Kind::TextureLevel && ds->desc.Width == 1024 &&
+        d.rs[22] == 2 && vs && dumped < 3 && sd.prim == 4 && sd.indices && sd.streams[0].data) {
+      dumped++;
+      uint64_t vh = 1469598103934665603ull;
+      for (uint32_t t : vs->tokens)
+        for (int i = 0; i < 4; i++) vh = (vh ^ ((t >> (8 * i)) & 0xFF)) * 1099511628211ull;
+      ProbeLog("TEMP shadowtri vs %016llx prim %u n %u base %d stride %u idxsize %u\n", (unsigned long long)vh,
+               sd.prim, sd.primitives, sd.base_vertex, sd.streams[0].stride, sd.index_size);
+      for (size_t i = 0; i < sd.input_count; i++)
+        ProbeLog("TEMP shadowtri input %zu: stream %u off %u type %u\n", i, sd.inputs[i].stream, sd.inputs[i].offset,
+                 sd.inputs[i].type);
+      for (int k = 0; k < 3; k++) {
+        uint32_t ix = sd.index_size == 4 ? static_cast<const uint32_t*>(sd.indices)[k]
+                                         : static_cast<const uint16_t*>(sd.indices)[k];
+        const auto& s0 = sd.streams[0];
+        const uint8_t* v = s0.data + (size_t(int64_t(sd.base_vertex) + ix)) * s0.stride + sd.inputs[0].offset;
+        float f[4] = {0, 0, 0, 1};
+        if (sd.inputs[0].type <= 3) std::memcpy(f, v, 4 * (sd.inputs[0].type + 1));
+        else if (sd.inputs[0].type == 15) {  // FLOAT16_4
+          const uint16_t* hv = reinterpret_cast<const uint16_t*>(v);
+          for (int j = 0; j < 4; j++) {
+            uint32_t h = hv[j], e = (h >> 10) & 0x1F, m = h & 0x3FF; float x = e ? std::ldexp(float(m | 0x400), int(e) - 25) : std::ldexp(float(m), -24);
+            f[j] = (h & 0x8000) ? -x : x;
+          }
+        }
+        ProbeLog("TEMP shadowtri v%d idx %u: %g %g %g %g\n", k, ix, f[0], f[1], f[2], f[3]);
+      }
+      for (int r : {0, 1, 2, 35, 36, 37, 38, 39})
+        ProbeLog("TEMP shadowtri c%d: %g %g %g %g\n", r, d.vs_f[r][0], d.vs_f[r][1], d.vs_f[r][2], d.vs_f[r][3]);
+    }
+  }
   {  // TEMP diagnostic: not for landing. Depth-bias states of draws into depth textures (shadow maps).
     auto* ds = com::As<Surface>(d.depth_stencil);
     if (std::getenv("CRYSIS_PROBE") && ds && ds->kind == Surface::Kind::TextureLevel) {
       static std::set<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>> seen;
       if (seen.insert({ds->desc.Width, d.rs[195], d.rs[175], d.rs[22], d.rs[23]}).second)
+        if (auto* c0 = com::As<Surface>(d.render_targets[0]))
+          ProbeLog("TEMP shadow-map colour target: kind %d %ux%u fmt %u\n", int(c0->kind), c0->desc.Width, c0->desc.Height,
+                   c0->desc.Format);
+        else
+          ProbeLog("TEMP shadow-map colour target: none\n");
         ProbeLog("TEMP shadow-map draw: %ux%u fmt %u bias %g slope %g cull %u zf %u cw %X vp %u,%u %ux%u minz %g maxz %g\n",
                  ds->desc.Width, ds->desc.Height, ds->desc.Format, *reinterpret_cast<const float*>(&d.rs[195]),
                  *reinterpret_cast<const float*>(&d.rs[175]), d.rs[22], d.rs[23], d.rs[168], d.viewport.X,

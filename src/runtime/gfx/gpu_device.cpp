@@ -1714,6 +1714,14 @@ void r_color0(inout vec4 c) {
       auto dit = it == textures_.end() && !vertex && want == hlsl::ParamType::Sampler2D
                      ? depths_.find(d.textures[r])
                      : depths_.end();
+      if (dit != depths_.end() && std::getenv("CRYSIS_RAW_SHADOW")) {  // TEMP experiment: raw depth reads
+        sc.tex[r] = dit->second.tex;
+        SamplerKey sk = D3D9Sampler(d.sampler_states ? d.sampler_states[r] : nullptr);
+        sk.mip = 0xFF;
+        sk.min = sk.mag = SDL_GPU_FILTER_NEAREST;
+        sc.smp[r] = Sampler(sk);
+        continue;
+      }
       if (dit != depths_.end()) {
         sc.tex[r] = dit->second.tex;
         shadow |= 1u << reg;

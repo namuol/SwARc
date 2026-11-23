@@ -386,7 +386,8 @@ uint32_t NewTexture(Device& d, uint32_t device, bool cube, uint32_t w, uint32_t 
     t->vram = bytes;
   }
   if (depth) {
-    t->tex = d.gfx->CreateDepth(int(w), int(h), f);
+    const gfx::Format df = std::getenv("CRYSIS_DEPTHTEX_NOSTENCIL") && f == gfx::Format::D24S8 ? gfx::Format::D24X8 : f;  // TEMP experiment
+    t->tex = d.gfx->CreateDepth(int(w), int(h), df);
     if (!t->tex) return 0x8876017C;  // D3DERR_OUTOFVIDEOMEMORY
   } else if (pool != D3DPOOL_SYSTEMMEM && pool != D3DPOOL_SCRATCH) {
     t->tex = cube ? d.gfx->CreateCubeTexture(int(w), int(levels), f)
