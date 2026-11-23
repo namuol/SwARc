@@ -146,16 +146,8 @@ void CallThunk(Ctx& c, gaddr thunk) {
   const Def& d = *s->def;
   // <ID>_TRACE_FILTER=mss32 (substring of "dll!name") narrows the trace.
   static const char* filter = Env("TRACE_FILTER");
-  bool trace = g_trace && !filter;
-  if (g_trace && filter) {  // TEMP: comma-separated substrings
-    const std::string full = s->dll + "!" + s->name, f = filter;
-    for (size_t at = 0; at <= f.size() && !trace;) {
-      size_t end = f.find(',', at);
-      if (end == std::string::npos) end = f.size();
-      trace = end > at && full.find(f.substr(at, end - at)) != std::string::npos;
-      at = end + 1;
-    }
-  }
+  const bool trace = g_trace && (!filter || (s->dll + "!" + s->name).find(filter) !=
+                                                std::string::npos);
   if (trace) {
     std::string args;
     for (int i = 0; i < std::max(d.nargs, 0) && i < 8; i++) {

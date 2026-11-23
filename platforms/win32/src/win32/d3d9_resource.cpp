@@ -204,15 +204,6 @@ uint32_t UnlockLevel(Texture& t, uint32_t face, uint32_t level) {
     return D3DERR_INVALIDCALL;
   Texture::Level& l = t.At(face, level);
   l.locked = false;
-  if (recomp::g_trace && !gfx::IsCompressed(t.fmt)) {  // TEMP diagnostic: not for landing
-    const gfx::Rect& r = l.locked_rect;
-    uint32_t bpp = gfx::BitsPerPixel(t.fmt) / 8, nz = 0, n = 0;
-    for (int32_t y = r.top; y < r.bottom; y++)
-      for (int32_t x = r.left; x < r.right; x++, n++)
-        for (uint32_t b = 0; b < bpp; b++) nz += Rd8(l.mem + uint32_t(y) * l.pitch + uint32_t(x) * bpp + b) != 0;
-    RECOMP_TRACE("  TEMP unlock %ux%u fmt %X rect %d,%d-%d,%d: %u of %u bytes nonzero\n", l.w, l.h,
-                 t.format, r.left, r.top, r.right, r.bottom, nz, n * bpp);
-  }
   if (t.tex && !l.lock_readonly) UploadLevel(t, face, level, l.locked_rect);
   return D3D_OK;
 }
@@ -386,8 +377,7 @@ uint32_t NewTexture(Device& d, uint32_t device, bool cube, uint32_t w, uint32_t 
     t->vram = bytes;
   }
   if (depth) {
-    const gfx::Format df = std::getenv("CRYSIS_DEPTHTEX_NOSTENCIL") && f == gfx::Format::D24S8 ? gfx::Format::D24X8 : f;  // TEMP experiment
-    t->tex = d.gfx->CreateDepth(int(w), int(h), df);
+    t->tex = d.gfx->CreateDepth(int(w), int(h), f);
     if (!t->tex) return 0x8876017C;  // D3DERR_OUTOFVIDEOMEMORY
   } else if (pool != D3DPOOL_SYSTEMMEM && pool != D3DPOOL_SCRATCH) {
     t->tex = cube ? d.gfx->CreateCubeTexture(int(w), int(levels), f)
@@ -721,35 +711,6 @@ uint32_t CreateShader(Ctx& c, bool pixel) {
       FatalF("d3d9: Create%sShader: %s (<ID>_SHADER_DUMP writes the tokens)",
              pixel ? "Pixel" : "Vertex", err.c_str());
     s->program = std::move(p);
-  }
-  // TEMP diagnostic: not for landing. <ID>_PS_DEBUG=hash:expr replaces that pixel
-  // shader's colour output with the GLSL expression `expr` (e.g. r_t[4]).
-  if (const char* dbg = Env("PS_DEBUG"); dbg && pixel) {
-    char h[24];
-    std::snprintf(h, sizeof h, "%016llx", (unsigned long long)TokenHash(*s));
-    const std::string spec = dbg;
-    const size_t colon = spec.find(':');
-    // hash@N:expr ends the shader after its Nth temp-register write instead.
-    const size_t atsign = spec.find('@');
-    const size_t hash_end = atsign != std::string::npos && atsign < colon ? atsign : colon;
-    if (colon != std::string::npos && spec.compare(0, hash_end, h) == 0) {
-      auto p = std::make_shared<hlsl::Program>(*s->program);
-      const std::string expr = spec.substr(colon + 1);
-      size_t at = std::string::npos;
-      if (hash_end == atsign) {
-        int n = std::atoi(spec.c_str() + atsign + 1);
-        size_t pos = p->glsl.find("void main()");
-        while (n-- > 0 && pos != std::string::npos) pos = p->glsl.find("\n    r_t[", pos + 1);
-        if (pos != std::string::npos) at = p->glsl.find("\n", pos + 1) + 1;
-        if (at != std::string::npos)
-          p->glsl.insert(at, "  r_c0 = vec4(" + expr + "); r_color0(r_c0); return;\n");
-      } else {
-        at = p->glsl.find("  r_c0 = r_oc[0];");
-        if (at != std::string::npos) p->glsl.insert(at, "  r_oc[0] = vec4(" + expr + ");\n");
-      }
-      if (at != std::string::npos) WarnF("TEMP PS_DEBUG applied to %s\n", h);
-      s->program = std::move(p);
-    }
   }
   if ((s->program->stage == hlsl::Stage::Pixel) != pixel)
     FatalF("d3d9: Create%sShader with a %s shader", pixel ? "Pixel" : "Vertex",

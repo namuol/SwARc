@@ -949,16 +949,6 @@ HLE_NAMED("d3d9.dll", "IDirect3DDevice9::Clear", D3DDev9_Clear, 7) {
       gfx::ClipRects(uint32_t(given.size()), given.empty() ? nullptr : given.data(), area);
   if (r.empty()) return D3D_OK;
   BindTargets(*d);
-  if (std::getenv("CRYSIS_PROBE")) {  // TEMP diagnostic: clears with a depth texture bound
-    auto* ds = com::As<Surface>(d->depth_stencil);
-    if (ds && ds->kind == Surface::Kind::TextureLevel) {
-      static int n = 0;
-      if (n++ < 12)
-        WarnF("TEMP clear depth texture %ux%u flags %X z %g stencil %u rects %zu first %d,%d-%d,%d vp %ux%u\n",
-              ds->desc.Width, ds->desc.Height, Arg(c, 3), z, Arg(c, 6), r.size(), r[0].left, r[0].top, r[0].right,
-              r[0].bottom, v.Width, v.Height);
-    }
-  }
   d->gfx->Clear(uint32_t(r.size()), r.data(), Arg(c, 3), Arg(c, 4), z, Arg(c, 6));
   return D3D_OK;
 }

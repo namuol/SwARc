@@ -34,7 +34,6 @@
 #include <map>
 #include <mutex>
 #include <thread>
-#include <set>
 #include <tuple>
 #include <unordered_map>
 #include <vector>
@@ -1563,12 +1562,6 @@ void r_color0(inout vec4 c) {
     WarnUnsupportedShaderState(state);
 
     Cmd c{};
-    if (state.viewport.width == 64 && state.viewport.height == 64 && std::getenv("CRYSIS_PROBE")) {  // TEMP diagnostic
-      static std::set<std::tuple<int, int, int>> seen;
-      if (seen.insert({pass_w_, pass_h_, int(pass_fmts_[0])}).second)
-        WarnF("TEMP DrawShader vp 64x64: pass %dx%d targets %d fmt %d color %p bb %p\n", pass_w_, pass_h_,
-              pass_targets_, int(pass_fmts_[0]), (void*)pass_color_, (void*)backbuffer_);
-    }
     if (!SetupScissor(state, c, false)) return;
     c.viewport = D3DViewport(state);
     c.stencil_ref = uint8_t(state.rs[57]);
@@ -1579,11 +1572,6 @@ void r_color0(inout vec4 c) {
     if (k.cull != SDL_GPU_CULLMODE_NONE)
       k.cull = state.rs[22] == 2 ? SDL_GPU_CULLMODE_FRONT : SDL_GPU_CULLMODE_BACK;
     k.front = SDL_GPU_FRONTFACE_CLOCKWISE;
-    if (k.cull != SDL_GPU_CULLMODE_NONE && (((state.rs[168] & 0xF) == 0 && std::getenv("CRYSIS_FLIP_SHADOW_CULL")) || std::getenv("CRYSIS_FLIP_ALL_CULL"))) {  // TEMP experiment
-      static bool once = false;
-      if (!once) { once = true; WarnF("TEMP flipping cull in depth-only passes\n"); }
-      k.cull = k.cull == SDL_GPU_CULLMODE_FRONT ? SDL_GPU_CULLMODE_BACK : SDL_GPU_CULLMODE_FRONT;
-    }
     for (int i = 1; i < 4; i++) k.mask[i - 1] = i < pass_targets_ ? uint8_t(state.rs[189 + i] & 0xF) : 0;
     sc.key.vs = d.vs;
     sc.key.ps = d.ps;  // or its variant (below, after the samplers)
@@ -1714,14 +1702,6 @@ void r_color0(inout vec4 c) {
       auto dit = it == textures_.end() && !vertex && want == hlsl::ParamType::Sampler2D
                      ? depths_.find(d.textures[r])
                      : depths_.end();
-      if (dit != depths_.end() && std::getenv("CRYSIS_RAW_SHADOW")) {  // TEMP experiment: raw depth reads
-        sc.tex[r] = dit->second.tex;
-        SamplerKey sk = D3D9Sampler(d.sampler_states ? d.sampler_states[r] : nullptr);
-        sk.mip = 0xFF;
-        sk.min = sk.mag = SDL_GPU_FILTER_NEAREST;
-        sc.smp[r] = Sampler(sk);
-        continue;
-      }
       if (dit != depths_.end()) {
         sc.tex[r] = dit->second.tex;
         shadow |= 1u << reg;
@@ -1891,17 +1871,11 @@ void r_color0(inout vec4 c) {
                  uint32_t pitch) override {
     std::lock_guard<std::recursive_mutex> l(mu_);
     auto it = textures_.find(id);
-    if (it == textures_.end() || level < 0 || level >= it->second.levels) {
-      if (std::getenv("CRYSIS_PROBE")) WarnF("TEMP ReadImage: texture %u level %d not found\n", unsigned(id), level);
-      return;
-    }
+    if (it == textures_.end() || level < 0 || level >= it->second.levels) return;
     const Tex& t = it->second;
     const Rect c = Clip(r, LevelSize(t.w, level), LevelSize(t.h, level));
     const uint32_t w = uint32_t(c.right - c.left), h = uint32_t(c.bottom - c.top);
-    if (!w || !h || IsCompressed(t.fmt)) {
-      if (std::getenv("CRYSIS_PROBE")) WarnF("TEMP ReadImage: empty rect %ux%u level %d (%dx%d)\n", w, h, level, t.w, t.h);
-      return;
-    }
+    if (!w || !h || IsCompressed(t.fmt)) return;
     Flush();
     const uint32_t row = RowPitch(t.fmt, w), size = row * h;
     SDL_GPUTransferBufferCreateInfo tbi{};
@@ -3699,8 +3673,6 @@ void r_color0(inout vec4 c) {
       k.cull = SDL_GPU_CULLMODE_BACK;
       k.front = SDL_GPU_FRONTFACE_CLOCKWISE;
     }
-    if (tri && !pass_color_ && (st.rs[22] == 2 || st.rs[22] == 3) && std::getenv("CRYSIS_FLIP_SHADOW_CULL"))  // TEMP experiment
-      k.front = k.front == SDL_GPU_FRONTFACE_CLOCKWISE ? SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE : SDL_GPU_FRONTFACE_CLOCKWISE;
     if (st.rs[27]) {
       k.blend = 1;
       uint32_t s = st.rs[19], d = st.rs[20];
@@ -3715,10 +3687,6 @@ void r_color0(inout vec4 c) {
       k.depth_test = st.rs[7] ? 1 : 0;
       k.depth_write = (st.rs[7] && st.rs[14]) ? 1 : 0;
       k.depth_func = uint8_t(D3DCompareOp(st.rs[23]));
-      {  // TEMP diagnostic: not for landing. <ID>_FORCE_LEQUAL=1 turns EQUAL depth tests into LESSEQUAL.
-        static const bool force = [] { const char* e = Env("FORCE_LEQUAL"); return e && *e == '1'; }();
-        if (force && st.rs[23] == 3 /* D3DCMP_EQUAL */) k.depth_func = uint8_t(D3DCompareOp(4));
-      }
       if (pass_stencil_ && st.rs[52]) {
         k.stencil = 1;
         k.s_fail = uint8_t(D3DStencilOp(st.rs[53]));
@@ -3733,7 +3701,6 @@ void r_color0(inout vec4 c) {
       float bias = AsFloat(st.rs[195]) - float(st.rs[47]) * 0.000005f;
       k.bias_const = bias * pass_bias_scale_;
       k.bias_slope = AsFloat(st.rs[175]);
-      if (const char* e = std::getenv("CRYSIS_SLOPE_MUL")) k.bias_slope *= float(std::atof(e));  // TEMP experiment
     }
     return k;
   }
