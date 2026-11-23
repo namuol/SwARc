@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "runtime/guest_memory.h"
@@ -58,6 +59,12 @@ using ImportBinder =
     std::function<gaddr(const std::string& dll, const std::string& name)>;
 
 struct PeImage {
+  // The code the lifter lifts and the runtime dispatches into: .text and
+  // the executable sections right after it (Miles 9 keeps code in
+  // MSSMIXER and RADCODE), as one range [va, va + size); the gaps between
+  // them are alignment padding. {0, 0} without a .text.
+  std::pair<gaddr, uint64_t> CodeRange() const;
+
   gaddr image_base = 0;  // where it is mapped
   gaddr preferred_base = 0;
   uint32_t image_size = 0;

@@ -23,6 +23,8 @@
 // - Stretching between bitmaps is nearest-neighbour whatever
 //   SetStretchBltMode asked for.
 
+#include <sys/stat.h>
+
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -513,11 +515,11 @@ Palette* DcPalette(uint32_t hdc) {
 // ---- object creation and selection ---------------------------------------------------
 
 // (hdc, const BITMAPINFO*, iUsage, void** ppvBits, hSection, offset)
-HLE("gdi32.dll", CreateDIBSection, 6) {
+HLE64("gdi32.dll", CreateDIBSection, 6) {
   std::lock_guard<std::recursive_mutex> l(g_mu);
   Bitmap b;
-  if (!ParseBitmapInfo(Arg(c, 1), Arg(c, 2), DcPalette(Arg(c, 0)), &b)) {
-    if (Arg(c, 3)) Wr32(Arg(c, 3), 0);
+  if (!ParseBitmapInfo(Arg(c, 1), uint32_t(Arg(c, 2)), DcPalette(uint32_t(Arg(c, 0))), &b)) {
+    if (Arg(c, 3)) WrPtr(Arg(c, 3), 0);
     return 0;
   }
   if (Arg(c, 4)) WarnF("CreateDIBSection: file mapping sections not supported; using memory\n");
@@ -525,10 +527,35 @@ HLE("gdi32.dll", CreateDIBSection, 6) {
   if (!b.bits) return 0;
   uint32_t h = NewHandle();
   g_bitmaps[h] = b;
-  if (Arg(c, 3)) Wr32(Arg(c, 3), b.bits);
-  RECOMP_TRACE("  gdi: DIB section %08X %dx%d %d bpp%s at %08X\n", h, b.w, b.h, b.bpp,
-               b.bottom_up ? " bottom-up" : "", uint32_t(b.bits));
-  return h;
+  if (Arg(c, 3)) WrPtr(Arg(c, 3), b.bits);
+  RECOMP_TRACE("  gdi: DIB section %08X %dx%d %d bpp%s at %08llX\n", h, b.w, b.h, b.bpp,
+               b.bottom_up ? " bottom-up" : "", (unsigned long long)b.bits);
+  return HandleRet(h);
+}
+
+// CreateBitmap(w, h, planes, bits per pixel, bits): a device-dependent
+// bitmap of one plane, its rows WORD-aligned, initialised from bits if
+// given (monochrome masks for cursors and icons, among others).
+HLE64("gdi32.dll", CreateBitmap, 5) {
+  std::lock_guard<std::recursive_mutex> l(g_mu);
+  int w = int32_t(Arg(c, 0)), h = int32_t(Arg(c, 1));
+  uint32_t planes = uint32_t(Arg(c, 2)), bpp = uint32_t(Arg(c, 3));
+  if (w <= 0 || h <= 0 || planes != 1 ||
+      (bpp != 1 && bpp != 4 && bpp != 8 && bpp != 16 && bpp != 24 && bpp != 32)) {
+    SetLastError(87);  // ERROR_INVALID_PARAMETER
+    return 0;
+  }
+  Bitmap b;
+  b.w = w;
+  b.h = h;
+  b.bpp = int(bpp);
+  b.pitch = (uint32_t(w) * bpp + 15) / 16 * 2;
+  b.bits = HeapAllocProcess(uint64_t(b.pitch) * uint64_t(h), true);
+  if (!b.bits) return 0;
+  if (gaddr src = Arg(c, 4)) std::memcpy(GPtr(b.bits), GPtr(src), size_t(b.pitch) * size_t(h));
+  uint32_t hb = NewHandle();
+  g_bitmaps[hb] = b;
+  return HandleRet(hb);
 }
 
 // (hdc, w, h): the screen's format, 32 bpp.
@@ -603,9 +630,9 @@ HLE("gdi32.dll", CreatePalette, 1) {
   return h;
 }
 
-HLE("gdi32.dll", DeleteObject, 1) {
+HLE64("gdi32.dll", DeleteObject, 1) {
   std::lock_guard<std::recursive_mutex> l(g_mu);
-  uint32_t h = Arg(c, 0);
+  uint32_t h = uint32_t(Arg(c, 0));
   auto b = g_bitmaps.find(h);
   if (b != g_bitmaps.end()) {
     for (auto& [_, d] : g_dcs)
@@ -1073,6 +1100,26 @@ HLE("gdi32.dll", CreateFontIndirectA, 1) {
 // (height, width, escapement, orientation, weight, italic, underline,
 // strikeout, charset, out precision, clip precision, quality, pitch and
 // family, face)
+// AddFontResource{,Ex}A(path[, flags, reserved]): the fonts in the file,
+// for this process (FR_PRIVATE or not: there are no other processes to see
+// them). The number of fonts added: 1 for a font file, 0 for anything else.
+uint32_t AddFontResource(const std::string& guest_path) {
+  struct stat st;
+  std::string host = HostPath(guest_path);
+  if (stat(host.c_str(), &st) != 0) return 0;
+  if (!AddPrivateFont(host)) {
+    WarnF("gdi32: AddFontResource(%s): not a font the host can use\n", guest_path.c_str());
+    return 0;
+  }
+  return 1;
+}
+HLE("gdi32.dll", AddFontResourceA, 1) { return AddFontResource(GStr(Arg(c, 0))); }
+HLE("gdi32.dll", AddFontResourceExA, 3) { return AddFontResource(GStr(Arg(c, 0))); }
+HLE("gdi32.dll", RemoveFontResourceA, 1) { return RemovePrivateFont(HostPath(GStr(Arg(c, 0)))) ? 1 : 0; }
+HLE("gdi32.dll", RemoveFontResourceExA, 3) {
+  return RemovePrivateFont(HostPath(GStr(Arg(c, 0)))) ? 1 : 0;
+}
+
 HLE("gdi32.dll", CreateFontA, 14) {
   std::lock_guard<std::recursive_mutex> l(g_mu);
   FontDesc f;

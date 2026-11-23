@@ -29,6 +29,8 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <functional>
+#include <future>
 #include <map>
 #include <mutex>
 #include <thread>
@@ -38,6 +40,7 @@
 #include <vector>
 
 #include "runtime/gfx/device.h"
+#include "runtime/gfx/present.h"
 #include "runtime/env.h"
 #include "runtime/gfx/shader_compile.h"
 #include "runtime/log.h"
@@ -367,7 +370,7 @@ struct BytesHash {
 
 struct SamplerKey {
   uint8_t min, mag, mip, u, v, aniso;
-  uint8_t w, pad;
+  uint8_t w, pad;  // pad: 1 for a shadow map's comparison sampler
   float lod_bias, min_lod;
   bool operator<(const SamplerKey& o) const { return std::memcmp(this, &o, sizeof *this) < 0; }
 };
@@ -545,8 +548,17 @@ class GpuDevice final : public Device {
     for (auto& [k, p] : program_pipelines_) SDL_ReleaseGPUGraphicsPipeline(dev_, p);
     for (auto& [id, pr] : programs_) ReleaseProgram(pr);
     if (present_pipeline_) SDL_ReleaseGPUGraphicsPipeline(dev_, present_pipeline_);
+    if (gamma_pipeline_) SDL_ReleaseGPUGraphicsPipeline(dev_, gamma_pipeline_);
+    if (gamma_tex_) SDL_ReleaseGPUTexture(dev_, gamma_tex_);
+    if (gamma_tb_) SDL_ReleaseGPUTransferBuffer(dev_, gamma_tb_);
     for (auto& [k, s] : program_samplers_) SDL_ReleaseGPUSampler(dev_, s);
-    for (auto& [id, sh] : shaders_) SDL_ReleaseGPUShader(dev_, sh.sh);
+    {
+      std::lock_guard<std::mutex> l(compile_mu_);
+      compile_quit_ = true;
+    }
+    compile_cv_.notify_all();
+    for (std::thread& t : compile_threads_) t.join();
+    for (auto& [id, sh] : shaders_) SDL_ReleaseGPUShader(dev_, Gpu(sh));
     for (auto& [k, s] : samplers_) SDL_ReleaseGPUSampler(dev_, s);
     for (auto& [id, t] : textures_) SDL_ReleaseGPUTexture(dev_, t.tex);
     for (auto& [id, d] : depths_) SDL_ReleaseGPUTexture(dev_, d.tex);
@@ -556,8 +568,11 @@ class GpuDevice final : public Device {
     for (auto& b : blit_pool_) SDL_ReleaseGPUTexture(dev_, b.tex);
     for (SDL_GPUBuffer* b : {vbuf_, ibuf_, pbuf_, cro_, crw_, heap_, pvbuf_})
       if (b) SDL_ReleaseGPUBuffer(dev_, b);
-    for (SDL_GPUTransferBuffer* b : {upload_tb_, download_tb_})
+    for (SDL_GPUTransferBuffer* b : {upload_tb_, download_tb_, occl_zeros_})
       if (b) SDL_ReleaseGPUTransferBuffer(dev_, b);
+    if (occl_buf_) SDL_ReleaseGPUBuffer(dev_, occl_buf_);
+    for (const OcclRead& r : occl_reads_) SDL_ReleaseGPUTransferBuffer(dev_, r.tb);
+    for (SDL_GPUTransferBuffer* b : occl_free_) SDL_ReleaseGPUTransferBuffer(dev_, b);
     if (vs_) SDL_ReleaseGPUShader(dev_, vs_);
     if (fs_) SDL_ReleaseGPUShader(dev_, fs_);
     if (fs_alpha_test_) SDL_ReleaseGPUShader(dev_, fs_alpha_test_);
@@ -566,6 +581,20 @@ class GpuDevice final : public Device {
   }
 
   // ---- swap chain
+
+  bool SetWindow(SDL_Window* w) override {
+    std::lock_guard<std::recursive_mutex> l(mu_);
+    if (w == window_) return true;
+    Flush();
+    if (window_) SDL_ReleaseWindowFromGPUDevice(dev_, window_);
+    window_ = w;
+    if (window_ && !SDL_ClaimWindowForGPUDevice(dev_, window_)) {
+      WarnF("gfx: SDL_ClaimWindowForGPUDevice: %s\n", SDL_GetError());
+      window_ = nullptr;
+      return false;
+    }
+    return true;
+  }
 
   void ResetSwapChain(int w, int h, bool vsync) override {
     std::lock_guard<std::recursive_mutex> l(mu_);
@@ -727,7 +756,7 @@ class GpuDevice final : public Device {
       QueueUpload(t.tex, level, c.left, c.top, w, h, s, pitch, rows, row, false, true, layer);
       return;
     }
-    if (IsFloat(t.fmt)) {  // same layout as the GPU format
+    if (IsFloat(t.fmt) || t.fmt == Format::R16G16B16A16) {  // same layout as the GPU format
       QueueUpload(t.tex, level, c.left, c.top, w, h, s, pitch, uint32_t(h),
                   RowPitch(t.fmt, uint32_t(w)), false, false, layer);
       return;
@@ -957,6 +986,14 @@ class GpuDevice final : public Device {
 
   void StretchRect(ColorTarget src, const Rect& sr, ColorTarget dst, const Rect& dr,
                    bool linear) override {
+    Stretch(src, sr, dst, dr, linear, false);
+  }
+  void StretchRectFlipped(ColorTarget src, const Rect& sr, ColorTarget dst, const Rect& dr,
+                          bool linear) override {
+    Stretch(src, sr, dst, dr, linear, true);
+  }
+  void Stretch(ColorTarget src, const Rect& sr, ColorTarget dst, const Rect& dr, bool linear,
+               bool flip) {
     std::lock_guard<std::recursive_mutex> l(mu_);
     auto target = [&](ColorTarget t, int* w, int* h) -> SDL_GPUTexture* {
       if (!t.tex) {
@@ -995,6 +1032,7 @@ class GpuDevice final : public Device {
     bi.destination.h = Uint32(b.bottom - b.top);
     bi.load_op = SDL_GPU_LOADOP_LOAD;
     bi.filter = linear ? SDL_GPU_FILTER_LINEAR : SDL_GPU_FILTER_NEAREST;
+    if (flip) bi.flip_mode = SDL_FLIP_VERTICAL;
     SDL_BlitGPUTexture(cmd, &bi);
     Submit(cmd);
   }
@@ -1234,9 +1272,19 @@ class GpuDevice final : public Device {
     float fog_color[4];
     float fog[4];          // FOGSTART, FOGEND, FOGDENSITY
     int32_t fog_mode[4];   // 0 off, 1 vertex (the FOG varying), 2 table; FOGTABLEMODE
+    // Bit per sampler register: SRGBTEXTURE (texels decoded from sRGB);
+    // SRGBWRITEENABLE (the colour output encoded to sRGB).
+    int32_t srgb[4];
+    int32_t occl[4];  // the occlusion query's counter (r_oq), in a counting variant
   };
 
-  static std::string Prelude(hlsl::Stage stage, uint32_t samplers) {
+  // A pixel shader's variant (Variant below): occl, occlusion counting
+  // (early depth and stencil tests, and R_OCCL_COUNT, which the translated
+  // shader calls last, adds 1 to the query's counter); shadow, a bit per
+  // sampler register with a depth texture bound (R_SHADOW_n: a shadow map
+  // comparison sampler).
+  static std::string Prelude(hlsl::Stage stage, uint32_t samplers, bool occl = false,
+                             uint32_t shadow = 0) {
 #if defined(__APPLE__)
     const bool metal = true;
 #else
@@ -1315,9 +1363,38 @@ vec4 r_position(vec4 p) {
       p += std::string("#define R_SAMPLER_BINDING(n) set = ") + (metal ? "0" : "2") + ", binding = n\n";
       p += "layout(std140, " + binding(3, 2) +
            ") uniform r_ps_state { ivec4 r_alpha; vec4 r_bias[4]; vec4 r_fogc; vec4 r_fogp;"
-           " ivec4 r_fogm; };\n";
+           " ivec4 r_fogm; ivec4 r_srgb; ivec4 r_occl; };\n";
+      for (uint32_t r = 0; r < 16; r++)
+        if (shadow & (1u << r)) p += "#define R_SHADOW_" + std::to_string(r) + "\n";
+      if (occl) {
+        p += "layout(early_fragment_tests) in;\n";
+        p += "layout(std430, " + binding(2, metal ? 3 : int(samplers)) +
+             ") buffer r_occl_counts { uint r_oq[]; };\n";
+        p += "#define R_OCCL_COUNT() atomicAdd(r_oq[r_occl.x], 1u)\n";
+      }
+      p += R"(// sRGB reads (SRGBTEXTURE) and writes (SRGBWRITEENABLE): the texel
+// decoded after filtering, the output encoded before blending, as
+// Direct3D 9 hardware did them.
+vec3 r_to_linear(vec3 c) {
+  return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), c));
+}
+vec3 r_to_srgb(vec3 c) {
+  c = clamp(c, 0.0, 1.0);
+  return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), c));
+}
+vec4 r_srgb_in(int n, vec4 c) {
+  return (r_srgb.x & (1 << n)) != 0 ? vec4(r_to_linear(c.rgb), c.a) : c;
+}
+#define R_SRGB(n, c) r_srgb_in(n, c)
+)";
       // Metal samplers have no LOD bias (SDL_GPU drops it there): the
       // shader adds it where the level is implicit. Vulkan's apply it.
+      // Dev aid: <ID>_NAN_PAINT=1 paints pixels whose colour is NaN or
+      // infinite magenta.
+      {
+        static const bool paint = [] { const char* e = Env("NAN_PAINT"); return e && *e && *e != '0'; }();
+        p += paint ? "#define R_NAN_PAINT 1\n" : "#define R_NAN_PAINT 0\n";
+      }
       p += metal ? "#define R_BIAS(n) r_bias[(n) >> 2][(n) & 3]\n" : "#define R_BIAS(n) 0.0\n";
       p += R"(// Fog after a pixel shader (before shader model 3): the factor is the
 // vertex stage's FOG output (vertex fog), or from the depth by FOGTABLEMODE
@@ -1336,7 +1413,12 @@ void r_fog(inout vec4 c, float vf) {
 vec2 r_vpos() { return gl_FragCoord.xy - 0.5; }
 float r_vface() { return gl_FrontFacing ? 1.0 : -1.0; }
 // The alpha test, on the alpha at 8-bit precision.
+bool r_nonfinite(vec4 c) {  // by the bits: fast math may fold isnan away
+  uvec4 e = (floatBitsToUint(c) >> 23) & 0xFFu;
+  return any(equal(e, uvec4(0xFFu)));
+}
 void r_color0(inout vec4 c) {
+  if (R_NAN_PAINT != 0 && r_nonfinite(c)) { c = vec4(1.0, 0.0, 1.0, 1.0); return; }
   int a = int(round(clamp(c.a, 0.0, 1.0) * 255.0)), ref = r_alpha.y;
   bool pass = true;
   switch (r_alpha.x) {
@@ -1349,6 +1431,7 @@ void r_color0(inout vec4 c) {
     case 7: pass = a >= ref; break;
   }
   if (!pass) discard;
+  if (r_srgb.y != 0) c.rgb = r_to_srgb(c.rgb);
 }
 )";
     }
@@ -1368,11 +1451,25 @@ void r_color0(inout vec4 c) {
       sh.samplers = std::max(sh.samplers, smp.reg + 1);
     }
     bool vertex = prog.stage == hlsl::Stage::Vertex;
+    if (!vertex) sh.glsl = prog.glsl;  // for its variants
+    // Compiled on the pool (CompileAsync): games create their shaders well
+    // before drawing with them (Source: some 2000 before its menu), and
+    // Metal's compiler takes tens of milliseconds for each.
+    DumpShader(prog.stage, sh.samplers, prog.glsl);
+    sh.pending = CompileAsync(sh, prog.glsl);
+    ShaderId id = next_id_++;
+    shaders_[id] = std::move(sh);
+    return id;
+  }
+
+
+  SDL_GPUShader* CompileShader(hlsl::Stage stage, uint32_t samplers, const std::string& body,
+                               bool occl, uint32_t shadow) {
+    bool vertex = stage == hlsl::Stage::Vertex;
     // Positions invariant across programs (D3D9 multipass draws the same mesh
     // with different shaders and relies on equal depths).
-    std::string glsl = "#version 450\n" +
-                       std::string(prog.stage == hlsl::Stage::Vertex ? "invariant gl_Position;\n" : "") +
-                       Prelude(prog.stage, sh.samplers) + prog.glsl;
+    std::string glsl = "#version 450\n" + std::string(vertex ? "invariant gl_Position;\n" : "") +
+                       Prelude(stage, samplers, occl, shadow) + body;
     std::vector<uint32_t> spirv;
     std::string log;
     if (!GlslToSpirv(glsl, vertex ? ShaderStage::Vertex : ShaderStage::Fragment, &spirv, &log)) {
@@ -1394,13 +1491,30 @@ void r_color0(inout vec4 c) {
     si.format = SDL_GPU_SHADERFORMAT_SPIRV;
 #endif
     si.stage = vertex ? SDL_GPU_SHADERSTAGE_VERTEX : SDL_GPU_SHADERSTAGE_FRAGMENT;
-    si.num_samplers = sh.samplers;
-    si.num_storage_buffers = vertex ? 1 : 0;
+    si.num_samplers = samplers;
+    si.num_storage_buffers = vertex || occl ? 1 : 0;
     si.num_uniform_buffers = 3;
-    sh.sh = SDL_CreateGPUShader(dev_, &si);
-    if (!sh.sh) FatalF("gfx: SDL_CreateGPUShader (translated): %s", SDL_GetError());
+    SDL_GPUShader* sh = SDL_CreateGPUShader(dev_, &si);
+    if (!sh) FatalF("gfx: SDL_CreateGPUShader (translated): %s", SDL_GetError());
+    return sh;
+  }
+
+  // A pixel shader's variant (Prelude's occl and shadow), made on first
+  // use; the shader itself for neither.
+  ShaderId Variant(ShaderId ps, bool occl, uint32_t shadow) {
+    if (!occl && !shadow) return ps;
+    Shader& sh = shaders_.at(ps);
+    const uint32_t key = shadow << 1 | (occl ? 1 : 0);
+    auto it = sh.variants.find(key);
+    if (it != sh.variants.end()) return it->second;
+    Shader v = sh;
+    v.glsl.clear();
+    v.variants.clear();
+    v.pending = {};
+    v.sh = CompileShader(sh.stage, sh.samplers, sh.glsl, occl, shadow);
     ShaderId id = next_id_++;
-    shaders_[id] = sh;
+    sh.variants[key] = id;
+    shaders_[id] = std::move(v);
     return id;
   }
 
@@ -1418,8 +1532,11 @@ void r_color0(inout vec4 c) {
         ++p;
       }
     }
-    SDL_ReleaseGPUShader(dev_, it->second.sh);
+    std::vector<ShaderId> variants;
+    for (const auto& [k, v] : it->second.variants) variants.push_back(v);
+    SDL_ReleaseGPUShader(dev_, Gpu(it->second));
     shaders_.erase(it);
+    for (ShaderId v : variants) DestroyShader(v);
   }
 
   void DrawShader(const ShaderDraw& d) override {
@@ -1464,7 +1581,11 @@ void r_color0(inout vec4 c) {
     k.front = SDL_GPU_FRONTFACE_CLOCKWISE;
     for (int i = 1; i < 4; i++) k.mask[i - 1] = i < pass_targets_ ? uint8_t(state.rs[189 + i] & 0xF) : 0;
     sc.key.vs = d.vs;
-    sc.key.ps = d.ps;
+    sc.key.ps = d.ps;  // or its variant (below, after the samplers)
+    if (occl_open_) {
+      sc.occl = true;
+      occl_draws_ = true;
+    }
     if (k.blend && state.rs[206]) {  // SEPARATEALPHABLENDENABLE
       sc.key.src_a = uint8_t(D3DBlendFactor(state.rs[207], pass_alpha_));
       sc.key.dst_a = uint8_t(D3DBlendFactor(state.rs[208], pass_alpha_));
@@ -1561,9 +1682,14 @@ void r_color0(inout vec4 c) {
     }
     Argb(pst.fog_color, state.rs[34]);
     for (int i = 0; i < 3; i++) pst.fog[i] = AsFloat(state.rs[36 + i]);
+    for (uint32_t r = 0; r < 16 && d.sampler_states; r++)
+      if (d.sampler_states[r][11]) pst.srgb[0] |= 1 << r;  // SRGBTEXTURE
+    pst.srgb[1] = state.rs[194] ? 1 : 0;                     // SRGBWRITEENABLE
+    if (occl_open_) pst.occl[0] = int32_t(occl_.at(occl_open_).slot);
     PushUniform(sc, 5, &pst, sizeof pst);
 
     // Samplers: pixel 0-15 at 0-15, vertex 0-3 at 16-19.
+    uint32_t shadow = 0;  // pixel sampler registers reading a depth buffer
     sc.nps = ps.samplers;
     sc.nvs = vs.samplers;
     for (uint32_t r = 0; r < 20; r++) {
@@ -1576,17 +1702,39 @@ void r_color0(inout vec4 c) {
                               : want == hlsl::ParamType::Sampler3D ? dummy_3d_
                                                                    : dummy_2d_;
       sc.tex[r] = dummy;
+      // A texture of the kind the sampler declares (2D, cube or 3D); any
+      // other reads as the dummy, as an unbound one. A depth buffer in a
+      // pixel shader's 2D sampler: a shadow map (Variant's shadow).
       auto it = textures_.find(d.textures[r]);
-      // The bound texture when its kind is the sampler's (2D, cube or 3D).
-      if (it != textures_.end() && it->second.cube == (want == hlsl::ParamType::SamplerCube) &&
-          (it->second.kind == TextureKind::Tex3D) == (want == hlsl::ParamType::Sampler3D))
-        sc.tex[r] = it->second.tex;
+      auto dit = it == textures_.end() && !vertex && want == hlsl::ParamType::Sampler2D
+                     ? depths_.find(d.textures[r])
+                     : depths_.end();
+      if (dit != depths_.end()) {
+        sc.tex[r] = dit->second.tex;
+        shadow |= 1u << reg;
+        SamplerKey sk = D3D9Sampler(d.sampler_states ? d.sampler_states[r] : nullptr);
+        sk.pad = 1;  // comparing
+        sk.mip = 0xFF;
+#if defined(__APPLE__)
+        sk.lod_bias = 0;
+#endif
+        sc.smp[r] = Sampler(sk);
+        continue;
+      }
+      if (it != textures_.end()) {
+        const TextureKind k = it->second.cube ? TextureKind::Cube : it->second.kind;
+        const TextureKind w = want == hlsl::ParamType::SamplerCube ? TextureKind::Cube
+                              : want == hlsl::ParamType::Sampler3D ? TextureKind::Tex3D
+                                                                   : TextureKind::Tex2D;
+        if (k == w) sc.tex[r] = it->second.tex;
+      }
       SamplerKey sk = D3D9Sampler(d.sampler_states ? d.sampler_states[r] : nullptr);
 #if defined(__APPLE__)
       sk.lod_bias = 0;  // in the shader (R_BIAS)
 #endif
       sc.smp[r] = Sampler(sk);
     }
+    sc.key.ps = Variant(d.ps, sc.occl, shadow);
     ShaderPipeline(sc.key);
     c.shader = int(shader_cmds_.size());
     shader_cmds_.push_back(sc);
@@ -1598,9 +1746,6 @@ void r_color0(inout vec4 c) {
   ProgramId CreateProgram(const ProgramDesc& d) override {
     std::lock_guard<std::recursive_mutex> l(mu_);
     if (!heap_) GrowHeap(0);  // bound beside the arenas
-#if defined(__APPLE__)
-    FatalF("gfx: programs on Metal are not implemented yet");
-#endif
     // What a draw or dispatch binds: ProgramStageCmd's textures and
     // DispatchProgram's storage images.
     for (const ProgramStage* st : {&d.vs, &d.fs, &d.cs})
@@ -1613,13 +1758,12 @@ void r_color0(inout vec4 c) {
     pr.cs = d.cs;
     if (!d.cs.glsl.empty()) {
       pr.compute = true;
-      const std::vector<uint32_t> spirv =
-          CompileProgramStage(d.cs, ShaderStage::Compute, d.local_size);
+      const ProgramCode code(CompileProgramStage(d.cs, ShaderStage::Compute, d.local_size));
       SDL_GPUComputePipelineCreateInfo ci{};
-      ci.code = reinterpret_cast<const Uint8*>(spirv.data());
-      ci.code_size = spirv.size() * 4;
-      ci.entrypoint = "main";
-      ci.format = SDL_GPU_SHADERFORMAT_SPIRV;
+      ci.code = code.code;
+      ci.code_size = code.size;
+      ci.entrypoint = code.entry;
+      ci.format = code.format;
       ci.num_samplers = d.cs.textures;
       ci.num_readonly_storage_buffers = d.cs.buffers ? 2 : 0;
       ci.num_readwrite_storage_textures = d.cs.rw_images;
@@ -1633,13 +1777,13 @@ void r_color0(inout vec4 c) {
     } else {
       for (bool vertex : {true, false}) {
         const ProgramStage& st = vertex ? d.vs : d.fs;
-        const std::vector<uint32_t> spirv =
-            CompileProgramStage(st, vertex ? ShaderStage::Vertex : ShaderStage::Fragment, nullptr);
+        const ProgramCode code(
+            CompileProgramStage(st, vertex ? ShaderStage::Vertex : ShaderStage::Fragment, nullptr));
         SDL_GPUShaderCreateInfo si{};
-        si.code = reinterpret_cast<const Uint8*>(spirv.data());
-        si.code_size = spirv.size() * 4;
-        si.entrypoint = "main";
-        si.format = SDL_GPU_SHADERFORMAT_SPIRV;
+        si.code = code.code;
+        si.code_size = code.size;
+        si.entrypoint = code.entry;
+        si.format = code.format;
         si.stage = vertex ? SDL_GPU_SHADERSTAGE_VERTEX : SDL_GPU_SHADERSTAGE_FRAGMENT;
         si.num_samplers = st.textures;
         si.num_storage_buffers = st.buffers ? 2 : 0;
@@ -2100,6 +2244,126 @@ void r_color0(inout vec4 c) {
     }
   }
 
+  // ---- occlusion queries (see occl_buf_). Metal only: SDL_GPU gives
+  // graphics shaders read-only storage buffers; Metal lets them write
+  // (Vulkan would need fragmentStoresAndAtomics, which SDL may not enable).
+  bool SupportsOcclusion() override {
+#if defined(__APPLE__)
+    return true;
+#else
+    return false;
+#endif
+  }
+
+  uint32_t BeginOcclusion() override {
+    std::lock_guard<std::recursive_mutex> l(mu_);
+    if (!SupportsOcclusion()) return 0;
+    if (!occl_buf_) {
+      SDL_GPUBufferCreateInfo bi{};
+      bi.usage = SDL_GPU_BUFFERUSAGE_GRAPHICS_STORAGE_READ;
+      bi.size = kOcclSlots * 4;
+      occl_buf_ = SDL_CreateGPUBuffer(dev_, &bi);
+      SDL_GPUTransferBufferCreateInfo ti{};
+      ti.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
+      ti.size = 4;
+      occl_zeros_ = SDL_CreateGPUTransferBuffer(dev_, &ti);
+      if (!occl_buf_ || !occl_zeros_) FatalF("gfx: occlusion counters: %s", SDL_GetError());
+      std::memset(SDL_MapGPUTransferBuffer(dev_, occl_zeros_, false), 0, 4);
+      SDL_UnmapGPUTransferBuffer(dev_, occl_zeros_);
+    }
+    if (occl_open_) EndOcclusion(occl_open_);
+    uint32_t id = occl_next_id_++;
+    if (!id) id = occl_next_id_++;  // never 0
+    const uint32_t slot = occl_next_slot_++ % kOcclSlots;
+    occl_[id] = {slot, 0};
+    occl_zero_.push_back(slot);
+    occl_open_ = id;
+    return id;
+  }
+
+  void EndOcclusion(uint32_t id) override {
+    std::lock_guard<std::recursive_mutex> l(mu_);
+    auto it = occl_.find(id);
+    if (it == occl_.end() || it->second.end_flush) return;
+    it->second.end_flush = flushes_ + 1;  // the next flush draws what it counted
+    if (occl_open_ == id) occl_open_ = 0;
+  }
+
+  bool OcclusionResult(uint32_t id, uint64_t* count, bool wait) override {
+    std::lock_guard<std::recursive_mutex> l(mu_);
+    *count = 0;
+    auto it = occl_.find(id);
+    if (it == occl_.end()) return true;
+    if (!it->second.end_flush) EndOcclusion(id);
+    const OcclQuery q = it->second;
+    // Its draws are recorded but not flushed: flush them (D3D9's
+    // GetData flushes too), so that the GPU starts on them.
+    if (q.end_flush > flushes_) Flush();
+    const OcclRead* r = nullptr;
+    for (const OcclRead& o : occl_reads_)
+      if (o.flush >= q.end_flush) {
+        r = &o;
+        break;
+      }
+    if (!r) return true;  // nothing was flushed for it (cannot happen): 0
+    if (r->submission > submitted_) {  // still in the open command buffer
+      if (!wait) {
+        SubmitOpen();  // started, not waited for
+        return false;
+      }
+      SubmitOpen();
+    }
+    while (!in_flight_.empty() && in_flight_.front().submission <= r->submission &&
+           (wait || SDL_QueryGPUFence(dev_, in_flight_.front().fence)))
+      Retire();
+    if (r->submission > retired_) return false;
+    const auto* counts = static_cast<const uint32_t*>(SDL_MapGPUTransferBuffer(dev_, r->tb, false));
+    *count = counts ? counts[q.slot] : 0;
+    SDL_UnmapGPUTransferBuffer(dev_, r->tb);
+    occl_.erase(it);
+    // Reads no query still needs (all before the oldest one waiting's
+    // flush, keeping the newest) go back to the pool.
+    uint64_t oldest = ~0ull;
+    for (const auto& [qid, oq] : occl_) oldest = std::min(oldest, oq.end_flush ? oq.end_flush : ~0ull);
+    while (occl_reads_.size() > 1 && occl_reads_.front().flush < oldest &&
+           occl_reads_.front().submission <= retired_) {
+      occl_free_.push_back(occl_reads_.front().tb);
+      occl_reads_.pop_front();
+    }
+    return true;
+  }
+
+  // A download transfer buffer for the counters, from the pool.
+  SDL_GPUTransferBuffer* OcclTransfer() {
+    if (!occl_free_.empty()) {
+      SDL_GPUTransferBuffer* tb = occl_free_.back();
+      occl_free_.pop_back();
+      return tb;
+    }
+    SDL_GPUTransferBufferCreateInfo ti{};
+    ti.usage = SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD;
+    ti.size = kOcclSlots * 4;
+    SDL_GPUTransferBuffer* tb = SDL_CreateGPUTransferBuffer(dev_, &ti);
+    if (!tb) FatalF("gfx: occlusion read-back: %s", SDL_GetError());
+    return tb;
+  }
+
+  void SetGammaRamp(const uint16_t ramp[3 * 256]) override {
+    std::lock_guard<std::recursive_mutex> l(mu_);
+    bool identity = true;
+    for (int i = 0; i < 3 * 256; i++) identity = identity && ramp[i] / 257 == i % 256;
+    gamma_on_ = !identity;
+    NoteShownGamma(ramp);
+    // As a 256 x 1 RGBA16 texture: texel i holds entry i of each channel.
+    for (int i = 0; i < 256; i++) {
+      gamma_lut_[i * 4 + 0] = ramp[i];
+      gamma_lut_[i * 4 + 1] = ramp[256 + i];
+      gamma_lut_[i * 4 + 2] = ramp[512 + i];
+      gamma_lut_[i * 4 + 3] = 65535;
+    }
+    gamma_dirty_ = true;
+  }
+
   void DrawImage(TextureId id, const Rect& r) override {
     std::lock_guard<std::recursive_mutex> l(mu_);
     auto it = textures_.find(id);
@@ -2216,6 +2480,12 @@ void r_color0(inout vec4 c) {
     uint32_t uoff[6] = {}, ulen[6] = {};
     SDL_FColor blend_constant{};
     ShaderKey key{};
+    bool occl = false;  // counts for an occlusion query (binds occl_buf_)
+  };
+  // A shader's compile: run once, by a pool thread or by Gpu.
+  struct CompileJob {
+    std::atomic<bool> claimed{false};
+    std::packaged_task<SDL_GPUShader*()> task;
   };
   struct Shader {
     SDL_GPUShader* sh = nullptr;
@@ -2224,7 +2494,76 @@ void r_color0(inout vec4 c) {
     std::array<hlsl::ParamType, 16> sampler_type{};  // per register; Void if unused
     uint32_t samplers = 0;  // highest register used + 1
     uint32_t float_regs = 0;
+    std::string glsl;    // a pixel shader's translation (for its variants)
+    std::map<uint32_t, ShaderId> variants;  // Variant's, by shadow << 1 | occl
+    std::shared_future<SDL_GPUShader*> pending;  // sh while compiling (Gpu)
+    std::shared_ptr<CompileJob> job;             // its compile, until done
   };
+
+  // A shader's GPU shader, waiting for its compilation if still pending.
+  // One not started yet is compiled here and now (taken off the pool's
+  // queue): a draw waits for its own shaders only.
+  static SDL_GPUShader* Gpu(Shader& s) {
+    if (!s.sh && s.pending.valid()) {
+      if (s.job && !s.job->claimed.exchange(true)) s.job->task();
+      s.sh = s.pending.get();
+      s.job.reset();
+    }
+    return s.sh;
+  }
+
+  // Dev aid: <ID>_SHADER_DUMP=DIR writes each translated shader's GLSL
+  // there, as vs_NNNNN.glsl / ps_NNNNN.glsl in creation order.
+  void DumpShader(hlsl::Stage stage, uint32_t samplers, const std::string& body) {
+    const char* dir = Env("SHADER_DUMP");
+    if (!dir) return;
+    static int n = 0;
+    const bool vertex = stage == hlsl::Stage::Vertex;
+    const std::string glsl = "#version 450\n" + Prelude(stage, samplers) + body;
+    char path[1024];
+    std::snprintf(path, sizeof path, "%s/%s_%05d.glsl", dir, vertex ? "vs" : "ps", n++);
+    if (std::FILE* f = std::fopen(path, "w")) {
+      std::fwrite(glsl.data(), 1, glsl.size(), f);
+      std::fclose(f);
+    }
+  }
+
+  // CompileShader on the compile pool (whoever claims the job runs it):
+  // the result once done.
+  std::shared_future<SDL_GPUShader*> CompileAsync(Shader& sh, const std::string& body) {
+    const hlsl::Stage stage = sh.stage;
+    const uint32_t samplers = sh.samplers;
+    auto job = std::make_shared<CompileJob>();
+    job->task = std::packaged_task<SDL_GPUShader*()>(
+        [this, stage, samplers, body] { return CompileShader(stage, samplers, body, false, 0); });
+    std::shared_future<SDL_GPUShader*> f = job->task.get_future().share();
+    sh.job = job;
+    {
+      std::lock_guard<std::mutex> l(compile_mu_);
+      if (compile_threads_.empty()) {
+        const unsigned hw = std::thread::hardware_concurrency();
+        const unsigned n = std::clamp(hw > 2 ? hw - 2 : 1u, 1u, 8u);
+        for (unsigned i = 0; i < n; i++) compile_threads_.emplace_back([this] { CompileWorker(); });
+      }
+      compile_jobs_.push_back(job);
+    }
+    compile_cv_.notify_one();
+    return f;
+  }
+
+  void CompileWorker() {
+    for (;;) {
+      std::shared_ptr<CompileJob> job;
+      {
+        std::unique_lock<std::mutex> l(compile_mu_);
+        compile_cv_.wait(l, [&] { return compile_quit_ || !compile_jobs_.empty(); });
+        if (compile_jobs_.empty()) return;  // quitting, nothing left
+        job = std::move(compile_jobs_.front());
+        compile_jobs_.pop_front();
+      }
+      if (!job->claimed.exchange(true)) job->task();
+    }
+  }
   struct BlitTex {
     SDL_GPUTexture* tex;
     int w, h;
@@ -2552,7 +2891,8 @@ void r_color0(inout vec4 c) {
 
   void Flush() {
     bool draw = !cmds_.empty() || pass_clear_color_ || pass_clear_depth_ || pass_clear_stencil_;
-    if (!draw && uploads_.empty()) return;
+    if (!draw && uploads_.empty() && occl_zero_.empty()) return;
+    const bool occl = !occl_zero_.empty() || occl_draws_;
     SDL_GPUCommandBuffer* cmd = nullptr;
     size_t vbytes = verts_.size(), ibytes = indices_.size() * 4, pbytes = pmem_.size();
     size_t ubytes = (upload_bytes_.size() + 15) & ~size_t(15);
@@ -2625,6 +2965,16 @@ void r_color0(inout vec4 c) {
     }
 
     if (!cmd) cmd = Begin();
+    if (!occl_zero_.empty()) {  // the queries begun since: their counters from 0
+      SDL_GPUCopyPass* cp = SDL_BeginGPUCopyPass(cmd);
+      for (uint32_t slot : occl_zero_) {
+        SDL_GPUTransferBufferLocation src{occl_zeros_, 0};
+        SDL_GPUBufferRegion dst{occl_buf_, slot * 4, 4};
+        SDL_UploadToGPUBuffer(cp, &src, &dst, false);
+      }
+      SDL_EndGPUCopyPass(cp);
+      occl_zero_.clear();
+    }
     if (draw && (pass_color_ || pass_depth_)) {
       // A clear clears every target, as D3D9's does.
       SDL_GPUColorTargetInfo cts[4]{};
@@ -2773,6 +3123,7 @@ void r_color0(inout vec4 c) {
             pushed[i] = sc.uoff[i];
           }
           vs = fs = vl = -1;  // the fixed-function uniforms' slots were overwritten
+          if (sc.occl) SDL_BindGPUFragmentStorageBuffers(rp, 0, &occl_buf_, 1);
           SDL_GPUTextureSamplerBinding tb[20];
           for (uint32_t i = 0; i < 20; i++) tb[i] = {sc.tex[i], sc.smp[i]};
           if (sc.nvs) SDL_BindGPUVertexSamplers(rp, 0, tb + 16, sc.nvs);
@@ -2825,6 +3176,17 @@ void r_color0(inout vec4 c) {
       }
       SDL_EndGPURenderPass(rp);
       if (Labels()) SDL_PopGPUDebugGroup(cmd);
+    }
+    flushes_++;
+    if (occl) {  // the counters as this flush leaves them
+      OcclRead r{flushes_, submitted_ + 1, OcclTransfer()};
+      SDL_GPUCopyPass* cp = SDL_BeginGPUCopyPass(cmd);
+      SDL_GPUBufferRegion src{occl_buf_, 0, kOcclSlots * 4};
+      SDL_GPUTransferBufferLocation dst{r.tb, 0};
+      SDL_DownloadFromGPUBuffer(cp, &src, &dst);
+      SDL_EndGPUCopyPass(cp);
+      occl_reads_.push_back(r);
+      occl_draws_ = false;
     }
     Submit(cmd);
 
@@ -2896,8 +3258,127 @@ void r_color0(inout vec4 c) {
       b.load_op = SDL_GPU_LOADOP_LOAD;
     }
     b.filter = (w == bb_w_ && h == bb_h_) ? SDL_GPU_FILTER_NEAREST : SDL_GPU_FILTER_LINEAR;
-    SDL_BlitGPUTexture(cmd, &b);
+    if (gamma_on_) ShowGamma(cmd, sc, r, b.filter, b.load_op);
+    else SDL_BlitGPUTexture(cmd, &b);
     NotePresentation({bb_w_, bb_h_, int(sw), int(sh), r});
+  }
+
+  // Show's blit through the gamma ramp (SetGammaRamp): the front buffer
+  // drawn over `r` of the swap chain image, each channel looked up in the
+  // ramp (between its entries, as the 8-bit value lands on one).
+  void ShowGamma(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* sc, const Rect& r, SDL_GPUFilter filter,
+                 SDL_GPULoadOp load) {
+    if (!gamma_tex_) {
+      SDL_GPUTextureCreateInfo ti{};
+      ti.type = SDL_GPU_TEXTURETYPE_2D;
+      ti.format = SDL_GPU_TEXTUREFORMAT_R16G16B16A16_UNORM;
+      ti.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER;
+      ti.width = 256;
+      ti.height = 1;
+      ti.layer_count_or_depth = 1;
+      ti.num_levels = 1;
+      gamma_tex_ = SDL_CreateGPUTexture(dev_, &ti);
+      SDL_GPUTransferBufferCreateInfo bi{};
+      bi.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
+      bi.size = sizeof gamma_lut_;
+      gamma_tb_ = SDL_CreateGPUTransferBuffer(dev_, &bi);
+      if (!gamma_tex_ || !gamma_tb_) FatalF("gfx: the gamma ramp: %s", SDL_GetError());
+    }
+    const SDL_GPUTextureFormat fmt = SDL_GetGPUSwapchainTextureFormat(dev_, window_);
+    if (!gamma_pipeline_ || gamma_format_ != fmt) CreateGammaPipeline(fmt);
+    if (gamma_dirty_) {
+      std::memcpy(SDL_MapGPUTransferBuffer(dev_, gamma_tb_, true), gamma_lut_, sizeof gamma_lut_);
+      SDL_UnmapGPUTransferBuffer(dev_, gamma_tb_);
+      SDL_GPUCopyPass* cp = SDL_BeginGPUCopyPass(cmd);
+      SDL_GPUTextureTransferInfo src{gamma_tb_, 0, 256, 1};
+      SDL_GPUTextureRegion dst{};
+      dst.texture = gamma_tex_;
+      dst.w = 256;
+      dst.h = 1;
+      dst.d = 1;
+      SDL_UploadToGPUTexture(cp, &src, &dst, true);
+      SDL_EndGPUCopyPass(cp);
+      gamma_dirty_ = false;
+    }
+    SDL_GPUColorTargetInfo t{};
+    t.texture = sc;
+    t.load_op = load == SDL_GPU_LOADOP_LOAD ? SDL_GPU_LOADOP_LOAD : SDL_GPU_LOADOP_DONT_CARE;
+    t.store_op = SDL_GPU_STOREOP_STORE;
+    SDL_GPURenderPass* rp = SDL_BeginGPURenderPass(cmd, &t, 1, nullptr);
+    SDL_BindGPUGraphicsPipeline(rp, gamma_pipeline_);
+    SamplerKey fk{};
+    if (filter == SDL_GPU_FILTER_LINEAR) fk.mag = fk.min = SDL_GPU_FILTER_LINEAR;
+    SamplerKey lk{};
+    lk.mag = lk.min = SDL_GPU_FILTER_LINEAR;
+    SDL_GPUTextureSamplerBinding tb[2] = {{front_, Sampler(fk)}, {gamma_tex_, Sampler(lk)}};
+    SDL_BindGPUFragmentSamplers(rp, 0, tb, 2);
+    SDL_GPUViewport vp{float(r.left), float(r.top), float(r.right - r.left), float(r.bottom - r.top), 0, 1};
+    SDL_SetGPUViewport(rp, &vp);
+    SDL_DrawGPUPrimitives(rp, 3, 1, 0, 0);
+    SDL_EndGPURenderPass(rp);
+  }
+
+  void CreateGammaPipeline(SDL_GPUTextureFormat fmt) {
+    if (gamma_pipeline_) SDL_ReleaseGPUGraphicsPipeline(dev_, gamma_pipeline_);
+    static const char* kVs =
+        "#version 450\n"
+        "layout(location = 0) out vec2 uv;\n"
+        "void main() {\n"
+        "  vec2 p = vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2);\n"
+        "  uv = p;\n"
+        "  gl_Position = vec4(p * vec2(2, -2) + vec2(-1, 1), 0, 1);\n"
+        "}\n";
+    static const char* kFs =
+        "#version 450\n"
+        "layout(set = 2, binding = 0) uniform sampler2D img;\n"
+        "layout(set = 2, binding = 1) uniform sampler2D ramp;\n"
+        "layout(location = 0) in vec2 uv;\n"
+        "layout(location = 0) out vec4 o;\n"
+        "void main() {\n"
+        "  vec4 c = texture(img, uv);\n"
+        "  vec3 at = (clamp(c.rgb, 0.0, 1.0) * 255.0 + 0.5) / 256.0;\n"
+        "  o = vec4(texture(ramp, vec2(at.r, 0.5)).r, texture(ramp, vec2(at.g, 0.5)).g,\n"
+        "           texture(ramp, vec2(at.b, 0.5)).b, c.a);\n"
+        "}\n";
+    SDL_GPUShader* sh[2];
+    for (int i = 0; i < 2; i++) {
+      std::vector<uint32_t> spirv;
+      std::string log;
+      if (!GlslToSpirv(i ? kFs : kVs, i ? ShaderStage::Fragment : ShaderStage::Vertex, &spirv, &log))
+        FatalF("gfx: the gamma shader: %s", log.c_str());
+      SDL_GPUShaderCreateInfo si{};
+#if defined(__APPLE__)
+      std::string msl;
+      if (!SpirvToMsl(spirv, &msl, &log)) FatalF("gfx: the gamma shader: %s", log.c_str());
+      si.code = reinterpret_cast<const Uint8*>(msl.c_str());
+      si.code_size = msl.size();
+      si.entrypoint = "main0";
+      si.format = SDL_GPU_SHADERFORMAT_MSL;
+#else
+      si.code = reinterpret_cast<const Uint8*>(spirv.data());
+      si.code_size = spirv.size() * 4;
+      si.entrypoint = "main";
+      si.format = SDL_GPU_SHADERFORMAT_SPIRV;
+#endif
+      si.stage = i ? SDL_GPU_SHADERSTAGE_FRAGMENT : SDL_GPU_SHADERSTAGE_VERTEX;
+      si.num_samplers = i ? 2 : 0;
+      sh[i] = SDL_CreateGPUShader(dev_, &si);
+      if (!sh[i]) FatalF("gfx: the gamma shader: %s", SDL_GetError());
+    }
+    SDL_GPUGraphicsPipelineCreateInfo pi{};
+    pi.vertex_shader = sh[0];
+    pi.fragment_shader = sh[1];
+    pi.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
+    pi.multisample_state.sample_count = SDL_GPU_SAMPLECOUNT_1;
+    SDL_GPUColorTargetDescription cd{};
+    cd.format = fmt;
+    pi.target_info.color_target_descriptions = &cd;
+    pi.target_info.num_color_targets = 1;
+    gamma_pipeline_ = SDL_CreateGPUGraphicsPipeline(dev_, &pi);
+    if (!gamma_pipeline_) FatalF("gfx: the gamma pipeline: %s", SDL_GetError());
+    gamma_format_ = fmt;
+    SDL_ReleaseGPUShader(dev_, sh[0]);
+    SDL_ReleaseGPUShader(dev_, sh[1]);
   }
 
   void ReadTexture(SDL_GPUTexture* tex, SDL_GPUTextureFormat tex_fmt, int tw, int th, const Rect& r,
@@ -3500,6 +3981,11 @@ void r_color0(inout vec4 c) {
     if (k.mip == 0xFF) si.mipmap_mode = SDL_GPU_SAMPLERMIPMAPMODE_NEAREST;
     si.enable_anisotropy = k.aniso > 1;
     si.max_anisotropy = float(k.aniso);
+    if (k.pad & 1) {  // a shadow map's: lit where the coordinate's depth is not nearer
+      si.enable_compare = true;
+      si.compare_op = SDL_GPU_COMPAREOP_LESS_OR_EQUAL;
+      si.enable_anisotropy = false;
+    }
     SDL_GPUSampler* s = SDL_CreateGPUSampler(dev_, &si);
     if (!s) FatalF("gfx: SDL_CreateGPUSampler: %s", SDL_GetError());
     samplers_[k] = s;
@@ -4075,7 +4561,7 @@ void r_color0(inout vec4 c) {
     if (it != shader_pipelines_.end()) return it->second;
     const uint8_t alpha[3] = {k.src_a, k.dst_a, k.op_a};
     SDL_GPUGraphicsPipeline* p =
-        CreatePipeline(k.k, shaders_.at(k.vs).sh, shaders_.at(k.ps).sh, alpha);
+        CreatePipeline(k.k, Gpu(shaders_.at(k.vs)), Gpu(shaders_.at(k.ps)), alpha);
     shader_pipelines_[k] = p;
     return p;
   }
@@ -4107,7 +4593,7 @@ void r_color0(inout vec4 c) {
       const char* name;
     };
     static const Check kChecks[] = {
-        {185, "TWOSIDEDSTENCILMODE"}, {194, "SRGBWRITEENABLE"},
+        {185, "TWOSIDEDSTENCILMODE"},
     };
     for (const Check& ch : kChecks) {
       if (!st.rs[ch.rs] || (warned_rs_ & (1ull << (&ch - kChecks)))) continue;
@@ -4148,17 +4634,51 @@ void r_color0(inout vec4 c) {
     if (p.cp) SDL_ReleaseGPUComputePipeline(dev_, p.cp);
   }
 
+  // A program stage's code as SDL_GPU takes it: its SPIR-V, or on Metal
+  // the MSL SPIRV-Cross makes of it.
+  struct ProgramCode {
+    explicit ProgramCode(std::vector<uint32_t> s) : spirv(std::move(s)) {
+#if defined(__APPLE__)
+      std::string log;
+      if (!SpirvToMsl(spirv, &msl, &log)) FatalF("gfx: a program's SPIR-V to MSL: %s", log.c_str());
+      code = reinterpret_cast<const Uint8*>(msl.c_str());
+      size = msl.size();
+      entry = "main0";
+      format = SDL_GPU_SHADERFORMAT_MSL;
+#else
+      code = reinterpret_cast<const Uint8*>(spirv.data());
+      size = spirv.size() * 4;
+#endif
+    }
+    std::vector<uint32_t> spirv;
+    std::string msl;
+    const Uint8* code = nullptr;
+    size_t size = 0;
+    const char* entry = "main";
+    SDL_GPUShaderFormat format = SDL_GPU_SHADERFORMAT_SPIRV;
+  };
+
   static uint32_t ProgramUniformBlocks(const ProgramStage& st) {
     return (st.buffers || st.rw_buffers ? 1 : 0) + (st.uniform_bytes ? 1 : 0);
   }
 
   // The stage's prelude (ProgramDesc) in SDL_GPU's SPIR-V sets, and its
-  // SPIR-V.
+  // SPIR-V. On Metal the binding numbers are the MSL indices SDL_GPU
+  // expects (SpirvToMsl keeps them; sets do not matter): textures from 0
+  // and storage images after them; uniform buffers from 0, then the
+  // read-only storage buffers, then the read-write one.
   static std::vector<uint32_t> CompileProgramStage(const ProgramStage& st, ShaderStage stage,
                                                    const uint32_t* local_size) {
     if (st.textures > 16) FatalF("gfx: a program stage with %u textures", st.textures);
-    const int res = stage == ShaderStage::Fragment ? 2 : 0;
-    const int uni = stage == ShaderStage::Vertex ? 1 : stage == ShaderStage::Fragment ? 3 : 2;
+#if defined(__APPLE__)
+    const bool metal = true;
+#else
+    const bool metal = false;
+#endif
+    const int res = metal ? 0 : stage == ShaderStage::Fragment ? 2 : 0;
+    const int uni = metal ? 0 : stage == ShaderStage::Vertex ? 1 : stage == ShaderStage::Fragment ? 3 : 2;
+    const uint32_t nuni = ProgramUniformBlocks(st);
+    const uint32_t mem = metal ? nuni : st.textures;
     char b[256];
     std::string pre = "#version 450\n";
     std::snprintf(b, sizeof b, "#define R_TEXTURE(n) set = %d, binding = (n)\n", res);
@@ -4167,14 +4687,18 @@ void r_color0(inout vec4 c) {
       std::snprintf(b, sizeof b,
                     "layout(std430, set = %d, binding = %u) readonly buffer RMem { uint r_mem[]; };\n"
                     "layout(std430, set = %d, binding = %u) readonly buffer RHeap { uint r_heap[]; };\n",
-                    res, st.textures, res, st.textures + 1);
+                    res, mem, res, mem + 1);
       pre += b;
     }
     if (stage == ShaderStage::Compute) {
-      pre += "#define R_IMAGE(n) set = 1, binding = (n)\n";
+      if (metal)
+        std::snprintf(b, sizeof b, "#define R_IMAGE(n) set = 0, binding = (%u + (n))\n", st.textures);
+      else
+        std::snprintf(b, sizeof b, "#define R_IMAGE(n) set = 1, binding = (n)\n");
+      pre += b;
       if (st.rw_buffers) {
-        std::snprintf(b, sizeof b, "layout(std430, set = 1, binding = %u) buffer RRw { uint r_rw[]; };\n",
-                      st.rw_images);
+        std::snprintf(b, sizeof b, "layout(std430, set = %d, binding = %u) buffer RRw { uint r_rw[]; };\n",
+                      metal ? 0 : 1, metal ? nuni + (st.buffers ? 2 : 0) : st.rw_images);
         pre += b;
       }
       std::snprintf(b, sizeof b, "layout(local_size_x = %u, local_size_y = %u, local_size_z = %u) in;\n",
@@ -4583,10 +5107,20 @@ void r_color0(inout vec4 c) {
       if (!GlslToSpirv(i ? kFs : kVs, i ? ShaderStage::Fragment : ShaderStage::Vertex, &spirv, &log))
         FatalF("gfx: the present shader: %s", log.c_str());
       SDL_GPUShaderCreateInfo si{};
+#if defined(__APPLE__)
+      // Metal takes MSL (binding numbers kept: texture 0, uniform buffer 0).
+      std::string msl;
+      if (!SpirvToMsl(spirv, &msl, &log)) FatalF("gfx: the present shader: %s", log.c_str());
+      si.code = reinterpret_cast<const Uint8*>(msl.c_str());
+      si.code_size = msl.size();
+      si.entrypoint = "main0";
+      si.format = SDL_GPU_SHADERFORMAT_MSL;
+#else
       si.code = reinterpret_cast<const Uint8*>(spirv.data());
       si.code_size = spirv.size() * 4;
       si.entrypoint = "main";
       si.format = SDL_GPU_SHADERFORMAT_SPIRV;
+#endif
       si.stage = i ? SDL_GPU_SHADERSTAGE_FRAGMENT : SDL_GPU_SHADERSTAGE_VERTEX;
       si.num_samplers = i ? 1 : 0;
       si.num_uniform_buffers = i ? 1 : 0;
@@ -4624,6 +5158,12 @@ void r_color0(inout vec4 c) {
   std::deque<VariantJob> variant_jobs_;
   bool variant_quit_ = false;
   std::thread variant_worker_;
+  // The translated shaders' compile pool (CompileAsync).
+  std::mutex compile_mu_;
+  std::condition_variable compile_cv_;
+  std::deque<std::shared_ptr<CompileJob>> compile_jobs_;
+  std::vector<std::thread> compile_threads_;
+  bool compile_quit_ = false;
   enum class VariantMode { Async, Sync, Off } variant_mode_ = VariantMode::Async;
   int variant_fs_ = -1;  // FfPipeline's last lookup: fs_list_ index, ...
   bool variant_discard_ = false;
@@ -4743,6 +5283,30 @@ void r_color0(inout vec4 c) {
     bool later = false;  // land_later
     std::vector<Out> out;
   };
+  // ---- occlusion queries: a counter per query in occl_buf_ (a ring of
+  // kOcclSlots), zeroed by the flush after its BeginOcclusion, added to by
+  // the counting variants of the pixel shaders drawn while it is open, and
+  // read back by every flush that zeroed or counted (occl_reads_).
+  static constexpr uint32_t kOcclSlots = 4096;
+  struct OcclQuery {
+    uint32_t slot = 0;
+    uint64_t end_flush = 0;  // the flush its last draw is in (0: still open)
+  };
+  struct OcclRead {
+    uint64_t flush = 0;       // the flush whose counters it holds
+    uint64_t submission = 0;  // the submission that copies them
+    SDL_GPUTransferBuffer* tb = nullptr;
+  };
+  SDL_GPUBuffer* occl_buf_ = nullptr;
+  SDL_GPUTransferBuffer* occl_zeros_ = nullptr;
+  std::unordered_map<uint32_t, OcclQuery> occl_;
+  std::vector<uint32_t> occl_zero_;  // slots to zero before the next flush's draws
+  std::deque<OcclRead> occl_reads_;
+  std::vector<SDL_GPUTransferBuffer*> occl_free_;
+  uint32_t occl_open_ = 0, occl_next_id_ = 1, occl_next_slot_ = 0;
+  bool occl_draws_ = false;  // this flush has counting draws
+  uint64_t flushes_ = 0;
+
   std::deque<Landing> landings_;
   std::vector<Landing> download_pool_;  // their transfer buffers, free
   uint64_t writes_queued_ = 0, writes_landed_ = 0;
@@ -4800,6 +5364,13 @@ void r_color0(inout vec4 c) {
   SDL_GPUBuffer* crw_ = nullptr;
   uint32_t pbuf_cap_ = 0, cro_cap_ = 0, crw_cap_ = 0;
   SDL_GPUGraphicsPipeline* present_pipeline_ = nullptr;
+  // SetGammaRamp: the ramp as a texture, the pass Show draws through it.
+  bool gamma_on_ = false, gamma_dirty_ = false;
+  uint16_t gamma_lut_[256 * 4] = {};
+  SDL_GPUTexture* gamma_tex_ = nullptr;
+  SDL_GPUTransferBuffer* gamma_tb_ = nullptr;
+  SDL_GPUGraphicsPipeline* gamma_pipeline_ = nullptr;
+  SDL_GPUTextureFormat gamma_format_ = SDL_GPU_TEXTUREFORMAT_INVALID;
   SDL_GPUTexture* dummy_array_ = nullptr;
 
   // The state the current uniforms were built from.

@@ -124,7 +124,9 @@ bool HandleFault(gaddr addr) {
 bool Reopened(const GuestMemory& mem, gaddr addr) {
   if (t_held) return false;
   Guard g;  // a disarm in progress has reopened its pages once this holds
-  if (R().Watched(addr)) return false;
+  // A watch armed on it since HandleFault looked (which skips the lock
+  // while none is armed): this fault is its write.
+  if (R().DisarmOverlapping(addr, addr + 1)) return true;
   return mem.IsCommitted(addr) && (uint8_t(mem.QueryProt(addr)) & uint8_t(Prot::W));
 }
 

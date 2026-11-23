@@ -32,6 +32,21 @@ std::vector<uint32_t> g_probe_pixels;
 
 using ReadFn = std::function<void(const Rect&, uint8_t*, uint32_t)>;
 
+// NoteShownGamma's ramp as 8-bit tables per channel (blue, green, red, the
+// order of XRGB8888's bytes); g_gamma_on false for none.
+bool g_gamma_on = false;
+uint8_t g_gamma[3][256];
+
+// Applies the shown gamma ramp to XRGB8888 rows.
+void ShownGamma(uint8_t* px, int w, int h, uint32_t pitch) {
+  if (!g_gamma_on) return;
+  for (int y = 0; y < h; y++)
+    for (int x = 0; x < w; x++) {
+      uint8_t* p = px + size_t(y) * pitch + size_t(x) * 4;
+      for (int c = 0; c < 3; c++) p[c] = g_gamma[c][p[c]];
+    }
+}
+
 void SaveBmp(int w, int h, const std::vector<uint8_t>& px, const char* name) {
   SDL_Surface* surf =
       SDL_CreateSurfaceFrom(w, h, SDL_PIXELFORMAT_XRGB8888, const_cast<uint8_t*>(px.data()), w * 4);
@@ -63,6 +78,7 @@ void ShotsAndProbes(int w, int h, const ReadFn& read_rect) {
       if (x >= 0 && y >= 0 && x < w && y < h) {
         uint8_t px[4] = {};
         read_rect({x, y, x + 1, y + 1}, px, 4);
+        ShownGamma(px, 1, 1, 4);
         v = uint32_t(px[2]) << 16 | uint32_t(px[1]) << 8 | px[0];
       }
       got.push_back(v);
@@ -75,6 +91,7 @@ void ShotsAndProbes(int w, int h, const ReadFn& read_rect) {
   if (!named.empty()) {
     std::vector<uint8_t> px(size_t(w) * h * 4);
     read_rect({0, 0, w, h}, px.data(), uint32_t(w * 4));
+    ShownGamma(px.data(), w, h, uint32_t(w * 4));
     SaveBmp(w, h, px, named.c_str());
   }
 }
@@ -93,6 +110,7 @@ void MaybeShoot(int w, int h, const ReadFn& read_rect) {
   if (every > 0 && frame >= from && frame % every == 0) {
     std::vector<uint8_t> px(size_t(w) * h * 4);
     read(px.data(), uint32_t(w * 4));
+    ShownGamma(px.data(), w, h, uint32_t(w * 4));
     SDL_Surface* surf = SDL_CreateSurfaceFrom(w, h, SDL_PIXELFORMAT_XRGB8888,
                                               px.data(), w * 4);
     const char* dir = Env("SHOT_DIR");
@@ -108,6 +126,15 @@ void MaybeShoot(int w, int h, const ReadFn& read_rect) {
 }  // namespace
 
 int FramesPresented() { return frame; }
+
+void NoteShownGamma(const uint16_t* ramp) {
+  bool on = false;
+  for (int i = 0; ramp && i < 3 * 256; i++) on = on || ramp[i] / 257 != i % 256;
+  if (on)
+    for (int c = 0; c < 3; c++)
+      for (int i = 0; i < 256; i++) g_gamma[2 - c][i] = uint8_t((uint32_t(ramp[c * 256 + i]) + 128) / 257);
+  g_gamma_on = on;
+}
 
 void TestAidsForFrame(int w, int h, const std::function<void(const Rect&, uint8_t*, uint32_t)>& read) {
   ShotsAndProbes(w, h, read);

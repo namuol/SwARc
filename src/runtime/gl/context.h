@@ -8,18 +8,25 @@
 //
 // Coverage is what the supported games use: GL 1.1 plus ARB_multitexture,
 // EXT_texture_env_add, ARB_texture_env_combine, EXT_compiled_vertex_array,
-// S3TC compressed textures and anisotropic filtering. Anything else
-// records GL_INVALID_ENUM and warns once, so a gap is visible rather than
-// silently drawn wrong.
+// S3TC compressed textures and anisotropic filtering; and for games of the
+// GL 2.x-3.x era the ARB extensions of its programmable pipeline: buffer
+// objects (ARB_vertex_buffer_object), GLSL programs (ARB_shader_objects,
+// ARB_vertex_shader, ARB_fragment_shader: their GLSL translated by
+// gl/glsl.h and drawn as device programs), generic vertex attributes,
+// framebuffer objects (EXT_framebuffer_object) and separate blending.
+// Anything else records GL_INVALID_ENUM and warns once, so a gap is visible
+// rather than silently drawn wrong.
 
 #include <array>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <set>
 #include <string>
 #include <vector>
 
 #include "runtime/gfx/device.h"
+#include "runtime/gl/glsl.h"
 
 namespace recomp::gl {
 
@@ -116,12 +123,59 @@ enum : Enum {
   MAX_TEXTURE_SIZE = 0x0D33, MAX_TEXTURE_UNITS = 0x84E2, VIEWPORT = 0x0BA2,
   DEPTH_BITS = 0x0D56, STENCIL_BITS = 0x0D57, RED_BITS = 0x0D52,
   ALPHA_BITS = 0x0D55,
+  TEXTURE_BINDING_2D = 0x8069, ACTIVE_TEXTURE = 0x84E0, CLIENT_ACTIVE_TEXTURE = 0x84E1,
+  SHADING_LANGUAGE_VERSION = 0x8B8C,
+  // buffer objects
+  ARRAY_BUFFER = 0x8892, ELEMENT_ARRAY_BUFFER = 0x8893, ARRAY_BUFFER_BINDING = 0x8894,
+  ELEMENT_ARRAY_BUFFER_BINDING = 0x8895, BUFFER_SIZE = 0x8764, BUFFER_USAGE = 0x8765,
+  // shader objects
+  PROGRAM_OBJECT = 0x8B40, SHADER_OBJECT = 0x8B48, FRAGMENT_SHADER = 0x8B30,
+  VERTEX_SHADER = 0x8B31, OBJECT_TYPE = 0x8B4E, OBJECT_SUBTYPE = 0x8B4F,
+  OBJECT_DELETE_STATUS = 0x8B80, OBJECT_COMPILE_STATUS = 0x8B81, OBJECT_LINK_STATUS = 0x8B82,
+  OBJECT_VALIDATE_STATUS = 0x8B83, OBJECT_INFO_LOG_LENGTH = 0x8B84,
+  OBJECT_ATTACHED_OBJECTS = 0x8B85, OBJECT_ACTIVE_UNIFORMS = 0x8B86,
+  OBJECT_ACTIVE_UNIFORM_MAX_LENGTH = 0x8B87, OBJECT_SHADER_SOURCE_LENGTH = 0x8B88,
+  OBJECT_ACTIVE_ATTRIBUTES = 0x8B89, OBJECT_ACTIVE_ATTRIBUTE_MAX_LENGTH = 0x8B8A,
+  MAX_VERTEX_ATTRIBS = 0x8869, MAX_TEXTURE_COORDS = 0x8871, MAX_TEXTURE_IMAGE_UNITS = 0x8872,
+  MAX_COMBINED_TEXTURE_IMAGE_UNITS = 0x8B4D,
+  // framebuffer objects
+  FRAMEBUFFER = 0x8D40, RENDERBUFFER = 0x8D41, FRAMEBUFFER_BINDING = 0x8CA6,
+  READ_FRAMEBUFFER = 0x8CA8, DRAW_FRAMEBUFFER = 0x8CA9, READ_FRAMEBUFFER_BINDING = 0x8CAA,
+  RENDERBUFFER_BINDING = 0x8CA7, COLOR_ATTACHMENT0 = 0x8CE0, DEPTH_ATTACHMENT = 0x8D00,
+  STENCIL_ATTACHMENT = 0x8D20, DEPTH_STENCIL_ATTACHMENT = 0x821A,
+  FRAMEBUFFER_COMPLETE = 0x8CD5, FRAMEBUFFER_INCOMPLETE_ATTACHMENT = 0x8CD6,
+  FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT = 0x8CD7, MAX_RENDERBUFFER_SIZE = 0x84E8,
+  // blending
+  FUNC_ADD = 0x8006, MIN = 0x8007, MAX = 0x8008, FUNC_SUBTRACT = 0x800A,
+  FUNC_REVERSE_SUBTRACT = 0x800B, CONSTANT_COLOR = 0x8001, ONE_MINUS_CONSTANT_COLOR = 0x8002,
+  CONSTANT_ALPHA = 0x8003, ONE_MINUS_CONSTANT_ALPHA = 0x8004,
 };
 
 class Context {
  public:
+  // The objects a share group of contexts has in common (wglShareLists):
+  // texture objects, on one device. Contexts of one group may be current
+  // on different threads one at a time each, but calls into the group are
+  // not synchronised: like the GL contexts of the drivers games target,
+  // they assume the game does not use two of them at once.
+  struct Shared;
+  static std::shared_ptr<Shared> NewShared(gfx::Device* dev);
+
+  // A context with objects of its own.
   Context(gfx::Device* dev, int fb_w, int fb_h);
+  // A context of a share group, drawing on its device.
+  Context(std::shared_ptr<Shared> shared, int fb_w, int fb_h);
   ~Context();
+
+  // This context becomes the current one on its device again after
+  // another context of its share group drew: the device state it set is
+  // set again at the next draw.
+  void MakeCurrent();
+
+  // Whether GL_EXTENSIONS lists the programmable pipeline's extensions
+  // (they work either way): games of the GL 1.x era see the list they
+  // were made against, so their paths stay as tested.
+  void SetProgrammable(bool on) { programmable_ = on; }
 
   // The window (default framebuffer) changed size.
   void Resize(int fb_w, int fb_h);
@@ -223,6 +277,86 @@ class Context {
 
   // ---- framebuffer readback (rows bottom-up, as GL returns them)
   void ReadPixels(int x, int y, int w, int h, Enum format, Enum type, void* out);
+  // A level of the bound texture, its rows as they were uploaded.
+  void GetTexImage(Enum target, int level, Enum format, Enum type, void* out);
+  // Copies a rectangle of the framebuffer into the bound texture.
+  void CopyTexSubImage2D(Enum target, int level, int xoff, int yoff, int x, int y, int w, int h);
+
+  // ---- separate blending (EXT_blend_func_separate, EXT_blend_minmax,
+  // EXT_blend_subtract, EXT_blend_equation_separate)
+  void BlendFuncSeparate(Enum src_rgb, Enum dst_rgb, Enum src_a, Enum dst_a);
+  void BlendEquationSeparate(Enum rgb, Enum alpha);
+
+  // ---- buffer objects. While an ARRAY_BUFFER is bound, the array
+  // pointers given to *Pointer are offsets into it (pass them as the
+  // pointer's value), as are DrawElements' indices with an
+  // ELEMENT_ARRAY_BUFFER.
+  void GenBuffers(int n, uint32_t* names);
+  void DeleteBuffers(int n, const uint32_t* names);
+  void BindBuffer(Enum target, uint32_t name);
+  uint32_t BoundBuffer(Enum target) const;
+  bool IsBuffer(uint32_t name) const;
+  void BufferData(Enum target, int64_t size, const void* data, Enum usage);
+  void BufferSubData(Enum target, int64_t offset, int64_t size, const void* data);
+  void GetBufferSubData(Enum target, int64_t offset, int64_t size, void* out);
+  bool GetBufferParameteriv(Enum target, Enum pname, int32_t* out);
+
+  // ---- generic vertex attributes (ARB_vertex_program's, as
+  // ARB_vertex_shader takes them)
+  void VertexAttribPointer(uint32_t index, int size, Enum type, bool normalized, int stride,
+                           const void* p);
+  void SetAttribArray(uint32_t index, bool on);
+  void VertexAttrib(uint32_t index, float x, float y, float z, float w);
+
+  // ---- shader and program objects (ARB_shader_objects: one namespace of
+  // handles for both, shared by the share group)
+  uint32_t CreateShaderObject(Enum type);
+  uint32_t CreateProgramObject();
+  void ShaderSource(uint32_t shader, const std::string& source);
+  void CompileShader(uint32_t shader);
+  void AttachObject(uint32_t program, uint32_t shader);
+  void DetachObject(uint32_t program, uint32_t shader);
+  void LinkProgram(uint32_t program);
+  void UseProgramObject(uint32_t program);
+  uint32_t CurrentProgram() const { return program_; }
+  void DeleteObject(uint32_t obj);
+  bool GetObjectParameteriv(uint32_t obj, Enum pname, int32_t* out);
+  std::string InfoLog(uint32_t obj) const;
+  std::string ShaderSourceOf(uint32_t shader) const;
+  std::vector<uint32_t> AttachedObjects(uint32_t program) const;
+  int32_t GetUniformLocation(uint32_t program, const std::string& name);
+  int32_t GetAttribLocation(uint32_t program, const std::string& name);
+  void BindAttribLocation(uint32_t program, uint32_t index, const std::string& name);
+  // glUniform{1,2,3,4}{f,i}v (count elements of `comps` values) and
+  // glUniformMatrix{2,3,4}fv, on the current program.
+  void Uniformf(int32_t location, int comps, int count, const float* v);
+  void Uniformi(int32_t location, int comps, int count, const int32_t* v);
+  void UniformMatrix(int32_t location, int n, int count, bool transpose, const float* v);
+  bool GetUniformfv(uint32_t program, int32_t location, float* out);
+
+  // ---- framebuffer objects (EXT_framebuffer_object)
+  void GenFramebuffers(int n, uint32_t* names);
+  void DeleteFramebuffers(int n, const uint32_t* names);
+  void BindFramebuffer(Enum target, uint32_t name);
+  bool IsFramebuffer(uint32_t name) const;
+  void FramebufferTexture2D(Enum target, Enum attachment, Enum textarget, uint32_t texture,
+                            int level);
+  void FramebufferRenderbuffer(Enum target, Enum attachment, Enum rbtarget, uint32_t rb);
+  Enum CheckFramebufferStatus(Enum target);
+  void GenRenderbuffers(int n, uint32_t* names);
+  void DeleteRenderbuffers(int n, const uint32_t* names);
+  void BindRenderbuffer(Enum target, uint32_t name);
+  bool IsRenderbuffer(uint32_t name) const;
+  void RenderbufferStorage(Enum target, Enum internal, int w, int h);
+  void GenerateMipmap(Enum target);
+  // EXT_framebuffer_blit: colour from the read framebuffer to the draw
+  // framebuffer (depth and stencil are not copied).
+  void BlitFramebuffer(int sx0, int sy0, int sx1, int sy1, int dx0, int dy0, int dx1, int dy1,
+                       uint32_t mask, Enum filter);
+
+  // SwapBuffers of a context whose default framebuffer is an image (see
+  // fb_image_): it goes to the device's back buffer, to be presented.
+  void ShowFramebuffer();
 
   void SetVsync(bool on);
 
@@ -244,6 +378,12 @@ class Context {
                  const gfx::FfState** state);
 
   static constexpr int kUnits = 4;  // texture units advertised
+  // Texture image units: what programs' samplers can read (the fixed-
+  // function stages use the first kUnits).
+  static constexpr int kImageUnits = 16;
+  // The largest texture side: what SDL_GPU's backends (Metal on Apple
+  // silicon, Vulkan on desktop GPUs) and Direct3D 9-class hardware take.
+  static constexpr int kMaxTextureSize = 16384;
 
  private:
   struct Texture;
@@ -254,6 +394,10 @@ class Context {
     Enum type = FLOAT;
     int stride = 0;
     const uint8_t* ptr = nullptr;
+    uint32_t buffer = 0;  // an ARRAY_BUFFER: ptr is null, offset into it
+    uintptr_t offset = 0;
+    bool normalized = false;  // generic attributes
+    int Stride() const;
   };
   struct Vtx {  // one assembled vertex
     float pos[4];
@@ -276,6 +420,28 @@ class Context {
   void RS(uint32_t state, uint32_t value);
   void TSS(uint32_t stage, uint32_t type, uint32_t value);
   void FetchVertex(int i, Vtx* v) const;
+  struct Buffer;
+  struct Shader;
+  struct ProgramObj;
+  struct Framebuffer;
+  struct Renderbuffer;
+  // An array's pointer: its buffer's contents at its offset, or the client
+  // memory it points at.
+  const uint8_t* ArrayPtr(const Array& a) const;
+  Array Resolved(const Array& a) const;
+  // The current colour and depth targets (the default framebuffer, or the
+  // bound framebuffer object) and their size; `flip`: GL's rows bottom-up
+  // in the target (a framebuffer object's texture).
+  void Targets(gfx::ColorTarget* color, gfx::DepthId* depth, int* w, int* h, bool* flip);
+  // The same for framebuffer `fbo` (0: the default one).
+  void TargetsOf(uint32_t fbo, gfx::ColorTarget* color, gfx::DepthId* depth, int* w, int* h,
+                 bool* flip);
+  void ApplyTarget();
+  void UseImageFramebuffer();
+  // A draw with the current program: GL vertices (indices into the arrays)
+  // of primitive `mode`.
+  void DrawWithProgram(Enum mode, const std::vector<uint32_t>& verts);
+  ProgramObj* Program(uint32_t h) const;
   // What a draw reads for each attribute; an array that is not enabled
   // (or has no pointer) stands for the current value.
   struct Sources {
@@ -287,6 +453,7 @@ class Context {
   // primitive `mode` over draw_seq_ (the device vertex of each GL vertex).
   void DrawVertices(Enum mode, const Sources& src);
 
+  std::shared_ptr<Shared> shared_;
   gfx::Device* dev_;
   int fb_w_, fb_h_;
   gfx::DepthId depth_ = 0;
@@ -296,6 +463,7 @@ class Context {
   // fixed-function state
   std::set<Enum> enabled_;
   Enum blend_src_ = ONE, blend_dst_ = ZERO;
+  Enum blend_src_a_ = ONE, blend_dst_a_ = ZERO, blend_eq_ = FUNC_ADD, blend_eq_a_ = FUNC_ADD;
   Enum alpha_func_ = ALWAYS;
   float alpha_ref_ = 0;
   Enum depth_func_ = LESS;
@@ -337,12 +505,36 @@ class Context {
 
   // matrices: stacks for modelview, projection, and one per texture unit
   Enum matrix_mode_ = MODELVIEW;
-  std::vector<std::array<float, 16>> stacks_[2 + kUnits];
+  std::vector<std::array<float, 16>> stacks_[2 + kImageUnits];
   bool matrices_dirty_ = true;
 
-  // textures
-  std::map<uint32_t, Texture*> textures_;
-  uint32_t next_name_ = 1;
+  // textures: the share group's (shared_)
+  std::map<uint32_t, Texture*>& textures_;
+  uint32_t& next_name_;
+
+  // buffer objects bound; generic attributes; the program in use
+  uint32_t array_buffer_ = 0, element_buffer_ = 0;
+  Array attribs_[glsl::kMaxAttribs];
+  float attrib_current_[glsl::kMaxAttribs][4] = {};
+  uint32_t program_ = 0;
+  // framebuffer objects: this context's (EXT_framebuffer_object shares
+  // them; GL 3 does not, and games create them per context)
+  std::map<uint32_t, Framebuffer*> framebuffers_;
+  uint32_t next_framebuffer_ = 1, framebuffer_ = 0, renderbuffer_ = 0;
+  uint32_t read_framebuffer_ = 0;  // EXT_framebuffer_blit's read binding
+  // The default framebuffer as an image (colour target) instead of the
+  // device's back buffer, from the first program draw or framebuffer
+  // object on: device programs draw only into images.
+  gfx::TextureId fb_image_ = 0;
+  bool programmable_ = false;
+  // The current target as ApplyTarget left it: its size and whether GL's
+  // rows run bottom-up in it (a framebuffer object's texture), which
+  // flips window coordinates, the projection and the winding.
+  int tgt_w_ = 1, tgt_h_ = 1;
+  bool tgt_flip_ = false;
+  gfx::DepthId tgt_depth_ = 0;
+  // A program's per-draw uniform block (scratch).
+  std::vector<uint8_t> uniform_scratch_;
   int active_unit_ = 0, client_unit_ = 0;
   Unit* units_;
 

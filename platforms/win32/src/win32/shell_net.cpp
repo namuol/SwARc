@@ -21,7 +21,25 @@
 namespace recomp::hle {
 namespace {
 
+// The CSIDL folders: Windows XP's layout for 32-bit guests, Windows 10's
+// (as SHGetKnownFolderPath gives it) for x64 ones.
 std::string FolderFor(uint32_t csidl) {
+  if (g_proc->x64) {
+    const std::string user = "C:\\Users\\Player";
+    switch (csidl & 0xFF) {
+      case 0x05: return user + "\\Documents";             // CSIDL_PERSONAL
+      case 0x1A: return user + "\\AppData\\Roaming";      // CSIDL_APPDATA
+      case 0x1C: return user + "\\AppData\\Local";        // CSIDL_LOCAL_APPDATA
+      case 0x23: return "C:\\ProgramData";               // CSIDL_COMMON_APPDATA
+      case 0x2E: return "C:\\Users\\Public\\Documents";  // CSIDL_COMMON_DOCUMENTS
+      case 0x26: return "C:\\Program Files";
+      case 0x2A: return "C:\\Program Files (x86)";       // CSIDL_PROGRAM_FILESX86
+      case 0x24: return "C:\\WINDOWS";
+      case 0x25: return "C:\\WINDOWS\\system32";
+      case 0x10: return user + "\\Desktop";
+      default: return {};
+    }
+  }
   const std::string user = "C:\\Documents and Settings\\Player";
   switch (csidl & 0xFF) {
     case 0x05: return user + "\\My Documents";               // CSIDL_PERSONAL
@@ -61,17 +79,21 @@ HLE_NAMED("shell32.dll", "SHGetFolderPathA", Shell32GetFolderPathA, 5) {
 
 // SHGetSpecialFolderPathA(hwnd, path, csidl, create): TRUE with the
 // folder's path (created, as SHGetFolderPath does).
-HLE("shell32.dll", SHGetSpecialFolderPathA, 4) {
-  uint32_t out = Arg(c, 1), csidl = Arg(c, 2);
+uint64_t GetSpecialFolderPath(Ctx& c, bool wide) {
+  gaddr out = Arg(c, 1);
+  uint32_t csidl = uint32_t(Arg(c, 2));
   std::string p = FolderFor(csidl);
   if (p.empty()) {
-    WarnF("SHGetSpecialFolderPathA(CSIDL %X): unknown folder\n", csidl);
+    WarnF("SHGetSpecialFolderPath%c(CSIDL %X): unknown folder\n", wide ? 'W' : 'A', csidl);
     return 0;
   }
   MakeDirs(HostPath(p));
-  PutStr(out, p);
+  if (wide) PutWStr(out, p);
+  else PutStr(out, p);
   return 1;
 }
+HLE64("shell32.dll", SHGetSpecialFolderPathA, 4) { return GetSpecialFolderPath(c, false); }
+HLE64("shell32.dll", SHGetSpecialFolderPathW, 4) { return GetSpecialFolderPath(c, true); }
 
 HLE("shfolder.dll", SHGetFolderPathW, 5) {
   uint32_t csidl = Arg(c, 1), out = Arg(c, 4);
@@ -186,7 +208,10 @@ HLE_NAMED("wsock32.dll", "#52", gethostbyname, 1) {
   return hostent;
 }
 
-HLE_NAMED("wsock32.dll", "#14", htonl, 1) { return __builtin_bswap32(Arg(c, 0)); }  // htonl
+// wsock32's ordinals are Winsock 1.1's (8 htonl, 9 htons, 10 inet_addr,
+// 11 inet_ntoa, 12 ioctlsocket, 14 ntohl, 15 ntohs, ...): ws2_32's own
+// numbering differs from 10 on. The socket calls are in win9x_misc.cpp.
+HLE_NAMED("wsock32.dll", "#14", ntohl, 1) { return __builtin_bswap32(Arg(c, 0)); }  // ntohl
 
 }  // namespace
 // CommandLineToArgvW(line, &argc): one LocalAlloc block holding the

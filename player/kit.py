@@ -57,6 +57,10 @@ def load_config(root):
         sys.exit("kit: %s: x-swarc.steam needs depot and manifest, or depots" % path)
     if not x["lift"].get("images"):
         sys.exit("kit: %s: x-swarc.lift.images is empty" % path)
+    for img in x["lift"]["images"]:
+        if "redist" in img and img["redist"] not in x["hashes"]:
+            sys.exit("kit: %s: %s comes from %s, which needs a hash in x-swarc.hashes"
+                     % (path, img["file"], img["redist"]))
     c = dict(x)
     c["name"] = doc["name"]
     c["find"] = doc["game"]["check"]["file"]
@@ -124,6 +128,7 @@ def game_env(c):
     arr("LIFT_FILES", [i["file"] for i in images])
     arr("LIFT_MANIFESTS", [os.path.basename(i.get("manifest", "empty.manifest")) for i in images])
     arr("LIFT_BASES", [i.get("base", "") for i in images])
+    arr("LIFT_REDISTS", [i.get("redist", "") for i in images])
     var("DISK_GB", c.get("disk_gb", 5))
     var("BUILD_TIME", c.get("build_time", "a few minutes"))
     return "\n".join(lines) + "\n"
@@ -237,6 +242,8 @@ def assemble(root, c, build, kit):
     shutil.copy2(os.path.join(SWARC, "tools", "pe_symbols.py"), os.path.join(kit, "bin"))
     # ... and the app's icon, from the player's copy of the game.
     shutil.copy2(os.path.join(SWARC, "tools", "pe_icon.py"), os.path.join(kit, "bin"))
+    # ... and runtime DLLs lifted from the redistributable in the player's copy.
+    shutil.copy2(os.path.join(SWARC, "tools", "vcredist.py"), os.path.join(kit, "bin"))
     open(os.path.join(kit, "data", "empty.manifest"), "w").close()
     for img in c["lift"]["images"]:
         if "manifest" in img:  # into data/ by its name alone (game.env names it so)

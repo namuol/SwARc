@@ -38,7 +38,7 @@ SwARc commit the game pins, and changing them here reaches every game at its nex
 | `./recomp install [ARGS]` | `kit` if needed, then the game's `install.sh` with that kit, as a player would install (`ARGS` go to `build.sh`: `--no-launch`, `--game-dir DIR`) |
 | `./recomp test [ARGS]` | `kit` if needed, then `vm-test.sh` on this repo (`--keep-base`, `--keep`, `--update`, `--steam`) |
 | `./recomp uninstall` | `install.sh --uninstall` |
-| `./recomp pin [REF]` | Checks out SwARc's `REF` (default `origin/main`; it must be on the fork), pins it in `tools/swarc.sh`, then `sync`. Commit `tools/swarc.sh` and the generated files together |
+| `./recomp pin [REF]` | Checks out SwARc's `REF` (default `origin/main`; it must be on the fork), pins it in `tools/swarc.sh`, then `sync`. Commit `tools/swarc.sh` and the generated files together. For several game repos at once (pin, lift, build, smoke, commit, push), SwARc's `tools/repin.py` |
 
 `kit`, `install` and `test` stop when `external/SwARc` isn't the pinned commit or has uncommitted changes, since
 the kit would then be built from something the game doesn't pin; `--allow-unpinned` goes ahead anyway, for trying
@@ -111,7 +111,9 @@ A [RecompLauncher](https://github.com/elripalda/RecompLauncher) profile; SwARc r
     "supplied": [{ "file": "Game.unpacked.exe", "sha256": "<sha-256>", "about": "<what it is, for the player>" }],
     "lift": { "args": ["--sweep-gaps"],
               "images": [{ "file": "Soldiers.exe", "manifest": "soldiers.manifest" },
-                         { "file": "some.dll", "base": "61000000" }] },   // first is --exe, the rest --module
+                         { "file": "some.dll", "base": "61000000" },   // first is --exe, the rest --module
+                         { "file": "msvcp140.dll", "base": "185000000",
+                           "redist": "_CommonRedist/vcredist/2022/VC_redist.x64.exe" }] },
     "disk_gb": 5,
     "build_time": "a few minutes",
     "kit": { "brew": ["cmake", "ninja", "..."], "cmake_args": [], "require_libs": [], "runner": "macos-15" }
@@ -121,7 +123,9 @@ A [RecompLauncher](https://github.com/elripalda/RecompLauncher) profile; SwARc r
 
 `supplied` files (for executables whose Steam copy has encrypted code) are looked for in `--supply` paths,
 `$<ID>_EXE` and the game folder, then asked for; they're copied into the game folder, where the game loads them.
-Images without a `manifest` get an empty one.
+Images without a `manifest` get an empty one. An image with `redist` is a runtime DLL taken from the Visual C++
+redistributable at that path in the game copy (which `hashes` must pin), with `tools/vcredist.py`; the app
+carries the extracted DLL in `Contents/Resources`, where the game's `LiftedDll::host_path` should find it.
 
 ## Testing
 

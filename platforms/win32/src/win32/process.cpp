@@ -36,23 +36,8 @@ gaddr g_next_teb = 0;  // the next new TEB is below it (kTebTop, kTebTop64)
 std::vector<gaddr> g_free_tebs;
 std::set<gaddr> g_live_tebs;
 
-// The image's code, where its lifted functions are: from the first
-// executable section to the end of the last, as the lifter takes it
-// (platforms/win32/lifter/pe_reader.cpp); .text by name when no section is
-// marked executable.
-std::pair<gaddr, uint64_t> TextOf(const PeImage& img) {
-  constexpr uint32_t kCntCode = 0x20, kMemExecute = 0x20000000;
-  gaddr lo = 0, hi = 0;
-  for (const auto& s : img.sections) {
-    if (!(s.characteristics & (kCntCode | kMemExecute))) continue;
-    if (!hi || s.va < lo) lo = s.va;
-    hi = std::max<gaddr>(hi, s.va + s.vsize);
-  }
-  if (hi) return {lo, hi - lo};
-  for (const auto& s : img.sections)
-    if (s.name == ".text") return {s.va, s.vsize};
-  return {0, 0};
-}
+// The image's .text, where its lifted functions are.
+std::pair<gaddr, uint64_t> TextOf(const PeImage& img) { return img.CodeRange(); }
 
 // Process::thread_init: the thread's TEB and TLS array, in the layout of
 // the process's mode, found through fs (32-bit) or gs (x64).
@@ -113,8 +98,8 @@ void InitTeb(Thread* t) {
     WrPtr(tls_array + ptr * uint32_t(index), b);
   };
   if (w.img.has_tls) block(w.img, 0);
-  // Lifted DLLs with static TLS (x64 guests, as on Vista and later): every
-  // thread has their blocks, loaded or not, since all are mapped at start.
+  // Lifted DLLs with static TLS (as on Vista and later): every thread has
+  // their blocks, loaded or not, since all are mapped at start.
   for (const Module& m : w.modules)
     if (m.tls_index >= 0) block(m.img, m.tls_index);
 }
@@ -199,12 +184,12 @@ void MapModule(Module& m) {
   };
   if (!m.img.Load(m.host_path, p.mem, &err, m.base, bind))
     FatalF("lifted DLL %s: %s", m.name.c_str(), err.c_str());
-  // A DLL with static TLS gets a slot of its own after the EXE's (slot 0),
-  // kept across remaps, as Vista and later set up for LoadLibrary'd DLLs.
-  // (Windows XP did not, so most 32-bit DLLs have none; those of games that
-  // also targeted Vista can.)
+  // Static TLS of a LoadLibrary'd DLL, as Windows has had it since Vista
+  // (XP set it up only for DLLs loaded with the EXE, so 32-bit DLLs of
+  // that era have none; later 32-bit ones, such as Source's of 2024, and
+  // x64 ones do): a slot of its own after the EXE's (slot 0), kept across
+  // remaps.
   if (m.img.has_tls) {
-    CheckNoTlsCallbacks(m.img, m.name);
     if (m.tls_index < 0) {
       int next = 1;
       for (const Module& o : g_win32->modules) next = std::max(next, o.tls_index + 1);
@@ -213,6 +198,20 @@ void MapModule(Module& m) {
     Wr32(m.img.tls.index_va, uint32_t(m.tls_index));
   }
   m.stale = false;
+}
+
+// A lifted DLL's TLS callbacks (MinGW's, which set up and tear down its
+// TLS), with `reason` as DllMain gets it. Like DllMain they see process
+// attach and detach only: thread attach and detach are never sent (the
+// per-thread TLS blocks start as copies of the template, kernel32.cpp
+// DisableThreadLibraryCalls).
+void RunTlsCallbacks(Ctx& c, const Module& m, uint32_t reason) {
+  if (!m.img.has_tls || !m.img.tls.callbacks) return;
+  const uint32_t ptr = g_proc->x64 ? 8 : 4;
+  for (gaddr p = m.img.tls.callbacks; gaddr cb = RdPtr(p); p += ptr) {
+    RECOMP_TRACE("  %s: TLS callback %08llX(%u)\n", m.name.c_str(), (unsigned long long)cb, reason);
+    CallGuest(c, cb, {m.img.image_base, reason, 0});
+  }
 }
 
 bool AttachModule(Ctx& c, Module& m) {
@@ -224,6 +223,10 @@ bool AttachModule(Ctx& c, Module& m) {
       m.refs = 0;
       return false;
     }
+  if (m.img.has_tls && m.img.tls.callbacks && RdPtr(m.img.tls.callbacks)) {
+    m.stale = true;
+    RunTlsCallbacks(c, m, 1 /* PROCESS_ATTACH */);
+  }
   if (!m.img.entry) return true;
   m.stale = true;
   RECOMP_TRACE("  %s: DllMain(PROCESS_ATTACH)\n", m.name.c_str());
@@ -240,6 +243,7 @@ void DetachModule(Ctx& c, Module& m) {
     RECOMP_TRACE("  %s: DllMain(PROCESS_DETACH)\n", m.name.c_str());
     CallGuest(c, m.img.entry, {m.img.image_base, 0 /* PROCESS_DETACH */, 0});
   }
+  RunTlsCallbacks(c, m, 0 /* PROCESS_DETACH */);
   for (auto it = m.deps.rbegin(); it != m.deps.rend(); ++it) DetachModule(c, **it);
 }
 
@@ -282,7 +286,7 @@ int RunProcess(const win32::GameConfig& game, const std::string& exe_path,
   for (const auto& d : game.lifted_dlls) {
     Module& m = w.modules.emplace_back();
     m.name = hle::NormaliseDll(d.name);
-    m.host_path = HostPath(GuestGameDir() + "\\" + d.name);
+    m.host_path = d.host_path.empty() ? HostPath(GuestGameDir() + "\\" + d.name) : d.host_path;
     m.base = d.base;
   }
   // Twice: the first pass maps every DLL (so all export tables are known),

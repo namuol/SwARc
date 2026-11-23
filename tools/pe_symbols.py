@@ -32,6 +32,7 @@ import sys
 
 def u16(d, o): return struct.unpack_from("<H", d, o)[0]
 def u32(d, o): return struct.unpack_from("<I", d, o)[0]
+def u64(d, o): return struct.unpack_from("<Q", d, o)[0]
 
 
 class PE:
@@ -45,13 +46,20 @@ class PE:
         self.timestamp = u32(data, fh + 4)
         opt_size = u16(data, fh + 16)
         oh = fh + 20
-        assert u16(data, oh) == 0x10B, "expected PE32"
+        magic = u16(data, oh)
+        assert magic in (0x10B, 0x20B), "expected PE32 or PE32+"
+        # PE32+ (x64): an 8-byte ImageBase and no BaseOfData, so the data
+        # directories start 16 bytes later; pointer-sized fields (import
+        # thunks, TLS) are 8 bytes.
+        self.x64 = magic == 0x20B
+        self.ptr = 8 if self.x64 else 4
         self.entry_rva = u32(data, oh + 16)
-        self.image_base = u32(data, oh + 28)
+        self.image_base = u64(data, oh + 24) if self.x64 else u32(data, oh + 28)
         self.image_size = u32(data, oh + 56)
         self.headers_size = u32(data, oh + 60)
-        ndirs = u32(data, oh + 92)
-        self.dirs = [(u32(data, oh + 96 + i * 8), u32(data, oh + 100 + i * 8))
+        dd = oh + (112 if self.x64 else 96)
+        ndirs = u32(data, dd - 4)
+        self.dirs = [(u32(data, dd + i * 8), u32(data, dd + 4 + i * 8))
                      for i in range(ndirs)]
         self.sections = []
         sh = oh + opt_size
@@ -73,6 +81,14 @@ class PE:
     def cstr(self, rva):
         o = self.off(rva)
         return self.d[o:self.d.index(b"\0", o)].decode("latin1")
+
+    def uptr(self, o):
+        return u64(self.d, o) if self.x64 else u32(self.d, o)
+
+    def tls(self):
+        """(raw_start, raw_end, index_va, callbacks_va) of the TLS directory."""
+        o = self.off(self.dirs[9][0])
+        return tuple(self.uptr(o + i * self.ptr) for i in range(4))
 
     def section_of(self, rva):
         for name, va, vsize, *_ in self.sections:
@@ -111,14 +127,17 @@ class PE:
             dll = self.cstr(name_rva)
             t = self.off(ilt or iat)
             slot = iat
+            by_ordinal = 1 << (self.ptr * 8 - 1)
             while True:
-                v = u32(self.d, t)
+                v = self.uptr(t)
                 if not v:
                     break
-                sym = f"#{v & 0xFFFF}" if v & 0x80000000 else self.cstr(v + 2)
+                # Hint/name entry: a 2-byte hint, then the name.
+                sym = (f"#{v & 0xFFFF}" if v & by_ordinal
+                       else self.cstr((v & 0x7FFFFFFF) + 2))
                 out.append((self.image_base + slot, dll, sym))
-                t += 4
-                slot += 4
+                t += self.ptr
+                slot += self.ptr
             o += 20
         return out
 
@@ -136,7 +155,10 @@ class PE:
 
 
 def demangle(names):
-    tool = shutil.which("llvm-undname") or "/usr/lib/llvm/22/bin/llvm-undname"
+    tool = (shutil.which("llvm-undname") or
+            next((t for t in ("/opt/homebrew/opt/llvm@22/bin/llvm-undname",
+                              "/usr/lib/llvm/22/bin/llvm-undname")
+                  if os.path.exists(t)), ""))
     if not os.path.exists(tool):
         return {n: "" for n in names}
     res = subprocess.run([tool], input="\n".join(names) + "\n",
@@ -200,8 +222,7 @@ def main():
         p(f"relocations: {'yes' if pe.dirs[5][1] else 'NONE (fixed base)'}")
         tls_rva, tls_size = pe.dirs[9]
         if tls_size:
-            o = pe.off(tls_rva)
-            s, e, idx, cb = struct.unpack_from("<IIII", pe.d, o)
+            s, e, idx, cb = pe.tls()
             p(f"tls: raw {s:#010x}-{e:#010x} index_va {idx:#010x}"
               f" callbacks_va {cb:#010x}")
         p("sections:")
@@ -226,13 +247,13 @@ def main():
             seeds[pe.image_base + pe.entry_rva] = "entry_point"
         tls_rva, tls_size = pe.dirs[9]
         if tls_size:
-            cb = struct.unpack_from("<I", pe.d, pe.off(tls_rva) + 12)[0]
+            cb = pe.tls()[3]
             while cb:
-                fn = u32(pe.d, pe.off(cb - pe.image_base))
+                fn = pe.uptr(pe.off(cb - pe.image_base))
                 if not fn:
                     break
                 seeds.setdefault(fn, f"tls_callback_{len(seeds)}")
-                cb += 4
+                cb += pe.ptr
         with open(os.path.join(args.out, "functions.tsv"), "w") as f:
             f.write("entry\tmin\tmax\tchunks\tthunk\tnoreturn\tcallconv\tname\n")
             for va, name in sorted(seeds.items()):

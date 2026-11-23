@@ -1,4 +1,5 @@
 #include <cctype>
+#include <cstdio>
 #include "program.h"
 
 #include <filesystem>
@@ -91,6 +92,20 @@ bool Program::Load(const std::string& path, const std::string& symdir,
     *err = "no .text section";
     return false;
   }
+  // Two modules with one file name (a game's client.dll in several game
+  // folders) would write the same gen_<name>_NNN.cpp files: the later one
+  // gets its base in its name, e.g. client_13000000.
+  auto lower = [](std::string s) {
+    for (char& ch : s) ch = char(std::tolower(uint8_t(ch)));
+    return s;
+  };
+  for (size_t i = 0; i + 1 < modules.size(); ++i)
+    if (lower(modules[i].name) == lower(m.name)) {
+      char b[24];
+      std::snprintf(b, sizeof b, "_%llX", (unsigned long long)m.base);
+      m.name += b;
+      break;
+    }
   if (symdir.empty()) return true;
   // Symbol files hold VAs at the preferred base; a moved module's are
   // shifted by the same delta as its relocations.

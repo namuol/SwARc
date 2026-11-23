@@ -1076,5 +1076,25 @@ HLE_NAMED("d3d9.dll", "IDirect3DDevice9::ColorFill", D3DDev9_ColorFill, 4) {
   return D3D_OK;
 }
 
+// GetRenderTargetData(render target, system-memory surface): the target's
+// pixels (the back buffer, a render target or a render-target texture's
+// level) copied into the surface, which has its size and format. The GPU
+// work so far is waited for (the copy is of what it drew).
+HLE_NAMED("d3d9.dll", "IDirect3DDevice9::GetRenderTargetData", D3DDev9_GetRenderTargetData, 3) {
+  Device* d = Dev(c);
+  auto* src = com::As<Surface>(Arg(c, 1));
+  auto* dst = com::As<Surface>(Arg(c, 2));
+  if (!src || !dst || dst->kind != Surface::Kind::Offscreen ||
+      src->desc.Width != dst->desc.Width || src->desc.Height != dst->desc.Height)
+    return D3DERR_INVALIDCALL;
+  gfx::ColorTarget t = StretchTarget(src, "source");
+  gfx::ColorTarget color[4] = {t};
+  d->gfx->SetRenderTargets(color, 0);
+  gfx::Rect r{0, 0, int32_t(dst->desc.Width), int32_t(dst->desc.Height)};
+  d->gfx->ReadBack(r, GPtr(dst->mem), dst->pitch, FormatFromD3D(dst->desc.Format));
+  BindTargets(*d);
+  return D3D_OK;
+}
+
 }  // namespace
 }  // namespace recomp::hle

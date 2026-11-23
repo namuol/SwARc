@@ -42,13 +42,20 @@ struct StdIoObject : KObject {
   int fd;
 };
 
+void RemoveOnClose(const std::string& guest, bool dir);
+
 struct FileObject : KObject {
   FileObject() : KObject(Type::File) {}
   ~FileObject() override {
     if (fd >= 0) close(fd);
+    if (delete_on_close) RemoveOnClose(guest, dir);
   }
   int fd = -1;
   std::string guest;  // the absolute guest path it was opened by
+  // SetFileInformationByHandle's disposition: deleted when the last handle
+  // to it closes (this object is shared by the handles DuplicateHandle makes).
+  bool delete_on_close = false;
+  bool dir = false;
 };
 
 struct FindObject : KObject {
@@ -84,8 +91,16 @@ std::vector<std::string> Components(const std::string& p) {
 // Absolute, normalised guest path: "C:\x\y".
 std::string AbsGuest(std::string p) {
   std::replace(p.begin(), p.end(), '/', '\\');
-  if (p.size() >= 2 && p[1] == ':') {
-    if (p.size() == 2) p += '\\';
+  if (p.size() >= 2 && p[1] == ':' && (p.size() == 2 || p[2] != '\\')) {
+    // Drive-relative ("C:", "C:.\x", "C:x"): against the current directory
+    // when it is on that drive, else the drive's root (C: is the only one).
+    std::string cwd = GuestCurrentDir();
+    std::string rest = p.substr(2);
+    if (std::toupper(uint8_t(p[0])) == std::toupper(uint8_t(cwd[0])))
+      p = cwd + (rest.empty() ? "" : "\\" + rest);
+    else
+      p = p.substr(0, 2) + "\\" + rest;
+  } else if (p.size() >= 2 && p[1] == ':') {
   } else if (!p.empty() && p[0] == '\\') {
     p = "C:" + p;
   } else {
@@ -128,6 +143,8 @@ std::string Resolve(const std::string& root, const std::vector<std::string>& com
 }
 
 }  // namespace
+
+std::string GuestFullPath(const std::string& p) { return AbsGuest(p); }
 
 const std::string& GuestGameDir() { return Game().guest_dir; }
 
@@ -282,6 +299,7 @@ uint32_t ErrnoToWin(int e) {
     case EACCES:
     case EPERM: return kErrorAccessDenied;
     case EEXIST: return kErrorFileExists;
+    case ENOTEMPTY: return 145;  // ERROR_DIR_NOT_EMPTY
     default: return kErrorAccessDenied;
   }
 }
@@ -297,7 +315,7 @@ HLE64("kernel32.dll", GetStdHandle, 1) {
   return HandleRet(g_std_handles[idx]);
 }
 
-HLE("kernel32.dll", SetStdHandle, 2) { return 1; }
+HLE64("kernel32.dll", SetStdHandle, 2) { return 1; }
 
 // LockFileEx(h, flags, reserved, len lo, len hi, overlapped) and
 // UnlockFileEx(h, reserved, len lo, len hi, overlapped): byte-range locks
@@ -307,14 +325,30 @@ bool IsFileHandle(gaddr h) {
   auto o = GetHandle(h);
   return o && o->type == KObject::Type::File;
 }
-HLE("kernel32.dll", LockFileEx, 6) {
+// LockFile(file, offset lo, hi, length lo, hi): byte-range locks are
+// accepted and not enforced (one process uses the files), as LockFileEx.
+HLE64("kernel32.dll", LockFile, 5) {
   if (!IsFileHandle(Arg(c, 0))) {
     SetLastError(kErrorInvalidHandle);
     return 0;
   }
   return 1;
 }
-HLE("kernel32.dll", UnlockFileEx, 5) {
+HLE64("kernel32.dll", UnlockFile, 5) {
+  if (!IsFileHandle(Arg(c, 0))) {
+    SetLastError(kErrorInvalidHandle);
+    return 0;
+  }
+  return 1;
+}
+HLE64("kernel32.dll", LockFileEx, 6) {
+  if (!IsFileHandle(Arg(c, 0))) {
+    SetLastError(kErrorInvalidHandle);
+    return 0;
+  }
+  return 1;
+}
+HLE64("kernel32.dll", UnlockFileEx, 5) {
   if (!IsFileHandle(Arg(c, 0))) {
     SetLastError(kErrorInvalidHandle);
     return 0;
@@ -322,7 +356,7 @@ HLE("kernel32.dll", UnlockFileEx, 5) {
   return 1;
 }
 
-HLE("kernel32.dll", GetFileType, 1) {
+HLE64("kernel32.dll", GetFileType, 1) {
   auto o = GetHandle(Arg(c, 0));
   if (!o || (o->type != KObject::Type::File && o->type != KObject::Type::StdIo)) {
     SetLastError(kErrorInvalidHandle);
@@ -492,22 +526,53 @@ int FdOf(uint64_t h) {
   return o ? FileFd(o.get()) : -1;
 }
 
+// Overlapped I/O (an OVERLAPPED given to ReadFile/WriteFile): done at once,
+// at the OVERLAPPED's offset (Offset, OffsetHigh), as Windows does for a
+// request it can complete without waiting. The OVERLAPPED gets the outcome
+// (Internal: an NTSTATUS, InternalHigh: the bytes moved) and its event, if
+// any, is signalled; GetOverlappedResult reads them back. The layout is
+// {ULONG_PTR Internal, ULONG_PTR InternalHigh, DWORD Offset, DWORD
+// OffsetHigh, HANDLE hEvent}, pointer-sized fields 8 bytes on x64.
+constexpr uint32_t kStatusEndOfFile = 0xC0000011;
+constexpr uint32_t kErrorHandleEof = 38;
+
+uint64_t OverlappedOffset(gaddr ov) {
+  const uint32_t o = g_proc->x64 ? 16 : 8;
+  return uint64_t(Rd32(ov + o)) | uint64_t(Rd32(ov + o + 4)) << 32;
+}
+
+void CompleteOverlapped(gaddr ov, uint32_t status, uint32_t bytes) {
+  const uint32_t ptr = g_proc->x64 ? 8 : 4;
+  WrPtr(ov, status);
+  WrPtr(ov + ptr, bytes);
+  if (gaddr ev = RdPtr(ov + (g_proc->x64 ? 24 : 16))) SignalEventHandle(uint32_t(ev), false);
+}
+
 HLE64("kernel32.dll", ReadFile, 5) {
   int fd = FdOf(Arg(c, 0));
-  gaddr buf = Arg(c, 1), out = Arg(c, 3);
+  gaddr buf = Arg(c, 1), out = Arg(c, 3), ov = Arg(c, 4);
   uint32_t n = uint32_t(Arg(c, 2));
   if (fd < 0) {
     SetLastError(kErrorInvalidHandle);
     return 0;
   }
-  if (Arg(c, 4)) FatalF("ReadFile with OVERLAPPED is not supported");
   lazy::Touch(buf, n);  // the kernel does not fault on lazy pages
-  ssize_t r = n ? read(fd, GPtr(buf), n) : 0;
+  ssize_t r = !n ? 0 : ov ? pread(fd, GPtr(buf), n, off_t(OverlappedOffset(ov)))
+                          : read(fd, GPtr(buf), n);
   if (r < 0) {
     SetLastError(ErrnoToWin(errno));
     return 0;
   }
   if (out) Wr32(out, uint32_t(r));
+  if (ov) {
+    // A read that starts at or past the end fails with ERROR_HANDLE_EOF.
+    bool eof = n && r == 0;
+    CompleteOverlapped(ov, eof ? kStatusEndOfFile : 0, uint32_t(r));
+    if (eof) {
+      SetLastError(kErrorHandleEof);
+      return 0;
+    }
+  }
   return 1;
 }
 
@@ -540,16 +605,39 @@ HLE("kernel32.dll", ReadFileEx, 5) {
   return 1;
 }
 
+// GetOverlappedResult(file, OVERLAPPED*, DWORD* bytes, wait): every
+// request has completed already (ReadFile above).
+HLE64("kernel32.dll", GetOverlappedResult, 4) {
+  gaddr ov = Arg(c, 1);
+  const uint32_t ptr = g_proc->x64 ? 8 : 4;
+  uint32_t status = uint32_t(RdPtr(ov)), bytes = uint32_t(RdPtr(ov + ptr));
+  if (Arg(c, 2)) Wr32(Arg(c, 2), bytes);
+  if (status == kStatusEndOfFile) {
+    SetLastError(kErrorHandleEof);
+    return 0;
+  }
+  return 1;
+}
+
+// Nothing is ever pending to cancel.
+HLE64("kernel32.dll", CancelIo, 1) { return 1; }
+HLE64("kernel32.dll", CancelIoEx, 2) {
+  SetLastError(1168);  // ERROR_NOT_FOUND
+  return 0;
+}
+
 HLE64("kernel32.dll", WriteFile, 5) {
   int fd = FdOf(Arg(c, 0));
-  gaddr buf = Arg(c, 1), out = Arg(c, 3);
+  gaddr buf = Arg(c, 1), out = Arg(c, 3), ov = Arg(c, 4);
   uint32_t n = uint32_t(Arg(c, 2));
   if (fd < 0) {
     SetLastError(kErrorInvalidHandle);
     return 0;
   }
   lazy::Touch(buf, n);
-  ssize_t r = n ? write(fd, GPtr(buf), n) : 0;
+  ssize_t r = !n ? 0 : ov ? pwrite(fd, GPtr(buf), n, off_t(OverlappedOffset(ov)))
+                          : write(fd, GPtr(buf), n);
+  if (r >= 0 && ov) CompleteOverlapped(ov, 0, uint32_t(r));
   if (r < 0) {
     SetLastError(ErrnoToWin(errno));
     return 0;
@@ -604,7 +692,7 @@ HLE64("kernel32.dll", SetFilePointerEx, 5) {
   return 1;
 }
 
-HLE("kernel32.dll", SetEndOfFile, 1) {
+HLE64("kernel32.dll", SetEndOfFile, 1) {
   int fd = FdOf(Arg(c, 0));
   off_t pos = fd < 0 ? -1 : lseek(fd, 0, SEEK_CUR);
   if (pos < 0 || ftruncate(fd, pos) != 0) {
@@ -614,7 +702,7 @@ HLE("kernel32.dll", SetEndOfFile, 1) {
   return 1;
 }
 
-HLE("kernel32.dll", GetFileSize, 2) {
+HLE64("kernel32.dll", GetFileSize, 2) {
   int fd = FdOf(Arg(c, 0));
   struct stat st;
   if (fd < 0 || fstat(fd, &st) != 0) {
@@ -643,21 +731,21 @@ HLE("kernel32.dll", GetFileSizeEx, 2) {
 // from a file, and it fails for those with ERROR_INVALID_HANDLE, so the
 // console paths (WriteConsoleW, ReadConsoleW) are never taken; they fail
 // the same way if called.
-HLE("kernel32.dll", GetConsoleMode, 2) {
+HLE64("kernel32.dll", GetConsoleMode, 2) {
   SetLastError(kErrorInvalidHandle);
   return 0;
 }
-HLE("kernel32.dll", WriteConsoleW, 5) {
+HLE64("kernel32.dll", WriteConsoleW, 5) {
   SetLastError(kErrorInvalidHandle);
   return 0;
 }
-HLE("kernel32.dll", ReadConsoleW, 5) {
+HLE64("kernel32.dll", ReadConsoleW, 5) {
   SetLastError(kErrorInvalidHandle);
   return 0;
 }
 // Without a console the code pages are the system's OEM one.
 HLE("kernel32.dll", GetConsoleOutputCP, 0) { return 437; }
-HLE("kernel32.dll", GetConsoleCP, 0) { return 437; }
+HLE64("kernel32.dll", GetConsoleCP, 0) { return 437; }
 
 HLE("kernel32.dll", GetFileTime, 4) {
   int fd = FdOf(Arg(c, 0));
@@ -709,12 +797,13 @@ HLE("kernel32.dll", GetShortPathNameA, 3) {
 }
 HLE64("kernel32.dll", GetFileAttributesW, 1) { return GetFileAttributes(WidePath(Arg(c, 0))); }
 
-// GetFileAttributesExW(path, GetFileExInfoStandard, WIN32_FILE_ATTRIBUTE_DATA*).
-HLE64("kernel32.dll", GetFileAttributesExW, 3) {
-  if (Arg(c, 1) != 0) FatalF("GetFileAttributesExW: info level %llu", (unsigned long long)Arg(c, 1));
+// GetFileAttributesEx{A,W}(path, GetFileExInfoStandard,
+// WIN32_FILE_ATTRIBUTE_DATA*).
+uint32_t GetFileAttributesEx(Ctx& c, const std::string& path) {
+  if (Arg(c, 1) != 0) FatalF("GetFileAttributesEx: info level %llu", (unsigned long long)Arg(c, 1));
   struct stat st;
   uint32_t a;
-  if (!StatGuest(WidePath(Arg(c, 0)), &st, &a)) return 0;
+  if (!StatGuest(path, &st, &a)) return 0;
   gaddr d = Arg(c, 2);
   Wr32(d + 0, a);
   PutFileTime(d + 4, platform::StatModifyTime(st));   // creation
@@ -724,13 +813,111 @@ HLE64("kernel32.dll", GetFileAttributesExW, 3) {
   Wr32(d + 32, uint32_t(st.st_size));
   return 1;
 }
+HLE64("kernel32.dll", GetFileAttributesExA, 3) { return GetFileAttributesEx(c, GStr(Arg(c, 0))); }
+HLE64("kernel32.dll", GetFileAttributesExW, 3) { return GetFileAttributesEx(c, WidePath(Arg(c, 0))); }
 
 // GetFileInformationByHandle(h, BY_HANDLE_FILE_INFORMATION*). The volume
 // serial is GetVolumeInformation's; the file index the host inode.
 // GetFileInformationByHandleEx(h, class, buf, size): the classes the C++
 // library's <filesystem> asks for.
-HLE("kernel32.dll", GetFileInformationByHandleEx, 4) {
-  auto o = GetHandle(Arg(c, 0));
+uint32_t RemoveGuest(const std::string& g, bool dir);
+
+// SetFileInformationByHandle(file, class, info, size): the end of file
+// (FileEndOfFileInfo, 6) and allocation size (FileAllocationInfo, 5) set
+// the file's length; times (FileBasicInfo, 0) are accepted and not kept.
+// Deletion: FileDispositionInfo (4, {BOOLEAN DeleteFile}) and
+// FileDispositionInfoEx (21, {ULONG Flags}: DELETE 1, POSIX_SEMANTICS 2,
+// IGNORE_READONLY_ATTRIBUTE 0x10) mark the file or directory to be deleted
+// when its last handle closes, or clear the mark; with POSIX semantics its
+// name goes at once (the open handles keep working). As on Windows, a
+// read-only file is refused unless IGNORE_READONLY is given, and so is a
+// directory that isn't empty. The C++ library's std::filesystem::remove
+// deletes this way. Other classes (renames...) are refused with
+// ERROR_INVALID_PARAMETER.
+HLE64("kernel32.dll", SetFileInformationByHandle, 4) {
+  auto obj = GetHandle(Arg(c, 0));
+  int fd = obj ? FileFd(obj.get()) : -1;
+  uint32_t cls = uint32_t(Arg(c, 1)), size = uint32_t(Arg(c, 3));
+  gaddr d = Arg(c, 2);
+  if (fd < 0) {
+    SetLastError(kErrorInvalidHandle);
+    return 0;
+  }
+  switch (cls) {
+    case 0:  // FileBasicInfo
+      return size >= 40 ? 1 : (SetLastError(24), 0);
+    case 5:  // FileAllocationInfo: only grows the file
+    case 6: {  // FileEndOfFileInfo
+      if (size < 8) {
+        SetLastError(24);  // ERROR_BAD_LENGTH
+        return 0;
+      }
+      off_t want = off_t(Rd64(d));
+      struct stat st;
+      if (cls == 5 && fstat(fd, &st) == 0 && st.st_size >= want) return 1;
+      if (ftruncate(fd, want) != 0) {
+        SetLastError(ErrnoToWin(errno));
+        return 0;
+      }
+      return 1;
+    }
+    case 4:     // FileDispositionInfo
+    case 21: {  // FileDispositionInfoEx
+      if (size < (cls == 4 ? 1u : 4u) || obj->type != KObject::Type::File) {
+        SetLastError(cls == 4 ? 24 : kErrorInvalidParameter);
+        return 0;
+      }
+      auto* f = static_cast<FileObject*>(obj.get());
+      const uint32_t flags = cls == 4 ? (Rd8(d) ? 1u : 0u) : Rd32(d);
+      if (!(flags & 1)) {
+        f->delete_on_close = false;
+        return 1;
+      }
+      struct stat st;
+      if (fstat(fd, &st) != 0) {
+        SetLastError(ErrnoToWin(errno));
+        return 0;
+      }
+      f->dir = S_ISDIR(st.st_mode);
+      if (!f->dir && !(flags & 0x10) && !(st.st_mode & S_IWUSR)) {
+        SetLastError(kErrorAccessDenied);  // read-only
+        return 0;
+      }
+      if (f->dir) {  // Windows refuses a non-empty directory now, not at close
+        DIR* dd = fdopendir(dup(fd));
+        bool empty = true;
+        if (dd) {
+          while (dirent* e = readdir(dd))
+            if (std::strcmp(e->d_name, ".") && std::strcmp(e->d_name, "..")) {
+              empty = false;
+              break;
+            }
+          closedir(dd);
+        }
+        if (!empty) {
+          SetLastError(145);  // ERROR_DIR_NOT_EMPTY
+          return 0;
+        }
+      }
+      RECOMP_TRACE("  SetFileInformationByHandle(%s): delete%s\n", f->guest.c_str(),
+                   flags & 2 ? " now (POSIX semantics)" : " on close");
+      if (flags & 2) {
+        f->delete_on_close = false;
+        if (!RemoveGuest(f->guest, f->dir)) return 0;
+        return 1;
+      }
+      f->delete_on_close = true;
+      return 1;
+    }
+    default:
+      WarnF("SetFileInformationByHandle: class %u not supported\n", cls);
+      SetLastError(kErrorInvalidParameter);
+      return 0;
+  }
+}
+
+HLE64("kernel32.dll", GetFileInformationByHandleEx, 4) {
+  auto o = GetHandle(uint32_t(Arg(c, 0)));
   struct stat st;
   if (!o || o->type != KObject::Type::File || fstat(FileFd(o.get()), &st) != 0) {
     SetLastError(kErrorInvalidHandle);
@@ -738,7 +925,7 @@ HLE("kernel32.dll", GetFileInformationByHandleEx, 4) {
   }
   const std::string& g = static_cast<FileObject*>(o.get())->guest;
   std::string name = g.substr(g.find_last_of('\\') + 1);
-  uint32_t cls = Arg(c, 1), size = Arg(c, 3);
+  uint32_t cls = uint32_t(Arg(c, 1)), size = uint32_t(Arg(c, 3));
   gaddr d = Arg(c, 2);
   auto need = [&](uint32_t n) {
     if (size >= n) return true;
@@ -782,7 +969,7 @@ HLE("kernel32.dll", GetFileInformationByHandleEx, 4) {
   }
 }
 
-uint32_t CopyOutW(uint32_t buf, uint32_t size, const std::string& s);
+uint32_t CopyOutW(gaddr buf, uint32_t size, const std::string& s);
 
 // GetFinalPathNameByHandleW(h, buf, cch, flags): the path the handle was
 // opened by (there are no links to resolve in the guest's view). Only
@@ -830,6 +1017,21 @@ HLE64("kernel32.dll", SetFileAttributesW, 2) { return 1; }
 // or moved away.
 bool InstallOnly(const std::string& gpath) {
   return HostPath(gpath) != HostPath(gpath, PathAccess::kWrite);
+}
+
+// Deletes a guest file or (empty) directory: what DeleteFile and
+// RemoveDirectory do, for deletion through a handle.
+uint32_t RemoveGuest(const std::string& g, bool dir) {
+  if (InstallOnly(g) && Exists(HostPath(g))) {
+    SetLastError(kErrorAccessDenied);
+    return 0;
+  }
+  const std::string path = HostPath(g, PathAccess::kWrite);
+  if ((dir ? rmdir(path.c_str()) : unlink(path.c_str())) != 0) {
+    SetLastError(ErrnoToWin(errno));
+    return 0;
+  }
+  return 1;
 }
 
 uint32_t DeleteFile(const std::string& g) {
@@ -893,6 +1095,9 @@ uint32_t MoveFile(const std::string& gfrom, const std::string& gto, bool replace
 }
 
 HLE64("kernel32.dll", MoveFileA, 2) { return MoveFile(GStr(Arg(c, 0)), GStr(Arg(c, 1)), false); }
+HLE64("kernel32.dll", MoveFileW, 2) {
+  return MoveFile(WidePath(Arg(c, 0)), WidePath(Arg(c, 1)), false);
+}
 
 // MoveFileExW(from, to, flags): MOVEFILE_REPLACE_EXISTING, and
 // MOVEFILE_COPY_ALLOWED / MOVEFILE_WRITE_THROUGH, which change nothing
@@ -935,15 +1140,14 @@ HLE("kernel32.dll", GetCurrentDirectoryA, 2) {
   return CopyOut(buf, size, d);
 }
 
-HLE("kernel32.dll", GetFullPathNameA, 4) {
+HLE64("kernel32.dll", GetFullPathNameA, 4) {
   std::string full = AbsGuest(GStr(Arg(c, 0)));
-  uint32_t size = Arg(c, 1), buf = Arg(c, 2), filepart = Arg(c, 3);
+  uint32_t size = uint32_t(Arg(c, 1));
+  gaddr buf = Arg(c, 2), filepart = Arg(c, 3);
   uint32_t r = CopyOut(buf, size, full);
   if (r == full.size() && filepart) {
     size_t s = full.find_last_of('\\');
-    Wr32(filepart, s == std::string::npos || s + 1 == full.size()
-                       ? 0
-                       : buf + uint32_t(s + 1));
+    WrPtr(filepart, s == std::string::npos || s + 1 == full.size() ? 0 : buf + (s + 1));
   }
   return r;
 }
@@ -992,7 +1196,7 @@ HLE("kernel32.dll", GetLongPathNameA, 3) {
   return CopyOut(buf, size, full);
 }
 
-HLE("kernel32.dll", GetTempPathA, 2) {
+HLE64("kernel32.dll", GetTempPathA, 2) {
   std::string t = "C:\\TEMP\\";
   MakeDirs(UserDataRoot() + "/TEMP");
   return CopyOut(Arg(c, 1), Arg(c, 0), t);
@@ -1020,7 +1224,7 @@ HLE("kernel32.dll", GetTempFileNameA, 4) {
 
 // WIN32_FIND_DATAA (320 bytes) or WIN32_FIND_DATAW (592): the same
 // fields, then cFileName[260] and cAlternateFileName[14] in CHARs or WCHARs.
-void FillFindData(uint32_t fd, const std::string& host_dir, const std::string& name,
+void FillFindData(gaddr fd, const std::string& host_dir, const std::string& name,
                   bool wide = false) {
   struct stat st{};
   stat((host_dir + "/" + name).c_str(), &st);
@@ -1070,7 +1274,7 @@ bool HiddenForTest(const std::string& guest_path) {
 // Opens a search for `pattern` (a guest path whose last component may hold
 // wildcards) and fills the first entry; INVALID_HANDLE_VALUE and
 // ERROR_FILE_NOT_FOUND if nothing matches.
-uint32_t FindFirst(const std::string& guest_pattern, uint32_t fd, bool wide) {
+uint64_t FindFirst(const std::string& guest_pattern, gaddr fd, bool wide) {
   std::string pattern = AbsGuest(guest_pattern);
   size_t s = pattern.find_last_of('\\');
   std::string gdir = pattern.substr(0, s), mask = pattern.substr(s + 1);
@@ -1088,16 +1292,17 @@ uint32_t FindFirst(const std::string& guest_pattern, uint32_t fd, bool wide) {
     }
     closedir(d);
   }
+  RECOMP_TRACE("  FindFirst %s: %zu found\n", pattern.c_str(), f->entries.size());
   if (f->entries.empty()) {
     SetLastError(kErrorFileNotFound);
-    return kInvalidHandle;
+    return HandleRet(kInvalidHandle);
   }
   FillFindData(fd, f->entries[0].first, f->entries[0].second, wide);
   f->next = 1;
-  return NewHandle(f);
+  return HandleRet(NewHandle(f));
 }
 
-uint32_t FindNext(uint32_t h, uint32_t fd, bool wide) {
+uint32_t FindNext(uint32_t h, gaddr fd, bool wide) {
   auto o = GetHandle(h);
   if (!o || o->type != KObject::Type::Find) {
     SetLastError(kErrorInvalidHandle);
@@ -1114,7 +1319,7 @@ uint32_t FindNext(uint32_t h, uint32_t fd, bool wide) {
 }
 
 HLE("kernel32.dll", FindFirstFileA, 2) { return FindFirst(GStr(Arg(c, 0)), Arg(c, 1), false); }
-HLE("kernel32.dll", FindNextFileA, 2) { return FindNext(Arg(c, 0), Arg(c, 1), false); }
+HLE64("kernel32.dll", FindNextFileA, 2) { return FindNext(Arg(c, 0), Arg(c, 1), false); }
 
 // FindFirstFileExW(name, info level, data, search op, filter, flags). Both
 // info levels (FindExInfoStandard, FindExInfoBasic) fill the same fields
@@ -1122,24 +1327,28 @@ HLE("kernel32.dll", FindNextFileA, 2) { return FindNext(Arg(c, 0), Arg(c, 1), fa
 // narrow what a file system may return (FindExSearchLimitToDirectories is
 // advisory), and FIND_FIRST_EX_CASE_SENSITIVE does not apply to guest
 // paths, which are case-insensitive.
-HLE("kernel32.dll", FindFirstFileExW, 6) {
+HLE64("kernel32.dll", FindFirstFileExW, 6) {
   uint32_t level = Arg(c, 1);
   if (level > 1 || Arg(c, 3) > 1) {  // FindExSearchLimitToDevices: not supported
     SetLastError(kErrorInvalidParameter);
-    return kInvalidHandle;
+    return HandleRet(kInvalidHandle);
   }
   return FindFirst(WidePath(Arg(c, 0)), Arg(c, 2), true);
 }
-HLE("kernel32.dll", FindFirstFileW, 2) { return FindFirst(WidePath(Arg(c, 0)), Arg(c, 1), true); }
-HLE("kernel32.dll", FindNextFileW, 2) { return FindNext(Arg(c, 0), Arg(c, 1), true); }
+HLE64("kernel32.dll", FindFirstFileW, 2) { return FindFirst(WidePath(Arg(c, 0)), Arg(c, 1), true); }
+HLE64("kernel32.dll", FindNextFileW, 2) { return FindNext(Arg(c, 0), Arg(c, 1), true); }
 
-HLE("kernel32.dll", FindClose, 1) {
+HLE64("kernel32.dll", FindClose, 1) {
   return CloseHandleValue(Arg(c, 0)) ? 1 : 0;
 }
 
 // ---- volumes -----------------------------------------------------------------
 
-HLE("kernel32.dll", GetDriveTypeA, 1) { return 3; }  // DRIVE_FIXED
+HLE64("kernel32.dll", GetDriveTypeA, 1) { return 3; }  // DRIVE_FIXED
+HLE64("kernel32.dll", GetDriveTypeW, 1) { return 3; }
+HLE64("kernel32.dll", GetSystemDirectoryW, 2) {
+  return CopyOutW(Arg(c, 0), uint32_t(Arg(c, 1)), "C:\\WINDOWS\\system32");
+}
 
 HLE("kernel32.dll", GetLogicalDriveStringsA, 2) {
   const char s[] = "C:\\\0";  // double-NUL terminated list
@@ -1169,7 +1378,7 @@ HLE("kernel32.dll", GetDiskFreeSpaceExA, 4) {
 // ---- the W forms of the path queries --------------------------------------------
 
 // CopyOut for a WCHAR buffer of `size` characters.
-uint32_t CopyOutW(uint32_t buf, uint32_t size, const std::string& s) {
+uint32_t CopyOutW(gaddr buf, uint32_t size, const std::string& s) {
   if (size > s.size()) {
     PutWStr(buf, s);
     return uint32_t(s.size());
@@ -1177,7 +1386,7 @@ uint32_t CopyOutW(uint32_t buf, uint32_t size, const std::string& s) {
   return uint32_t(s.size() + 1);
 }
 
-HLE("kernel32.dll", GetCurrentDirectoryW, 2) { return CopyOutW(Arg(c, 1), Arg(c, 0), GuestCurrentDir()); }
+HLE64("kernel32.dll", GetCurrentDirectoryW, 2) { return CopyOutW(Arg(c, 1), Arg(c, 0), GuestCurrentDir()); }
 
 // SetCurrentDirectory: relative paths resolve against the new directory.
 uint32_t SetCurrentDirectory(const std::string& g) {
@@ -1195,18 +1404,19 @@ uint32_t SetCurrentDirectory(const std::string& g) {
 HLE("kernel32.dll", SetCurrentDirectoryA, 1) { return SetCurrentDirectory(GStr(Arg(c, 0))); }
 HLE("kernel32.dll", SetCurrentDirectoryW, 1) { return SetCurrentDirectory(WidePath(Arg(c, 0))); }
 
-HLE("kernel32.dll", GetFullPathNameW, 4) {
+HLE64("kernel32.dll", GetFullPathNameW, 4) {
   std::string full = AbsGuest(WidePath(Arg(c, 0)));
-  uint32_t size = Arg(c, 1), buf = Arg(c, 2), filepart = Arg(c, 3);
+  uint32_t size = uint32_t(Arg(c, 1));
+  gaddr buf = Arg(c, 2), filepart = Arg(c, 3);
   uint32_t r = CopyOutW(buf, size, full);
   if (r == full.size() && filepart) {
     size_t s = full.find_last_of('\\');
-    Wr32(filepart, s == std::string::npos || s + 1 == full.size() ? 0 : buf + uint32_t(2 * (s + 1)));
+    WrPtr(filepart, s == std::string::npos || s + 1 == full.size() ? 0 : buf + 2 * (s + 1));
   }
   return r;
 }
 
-HLE("kernel32.dll", GetTempPathW, 2) {
+HLE64("kernel32.dll", GetTempPathW, 2) {
   MakeDirs(UserDataRoot() + "/TEMP");
   return CopyOutW(Arg(c, 1), Arg(c, 0), "C:\\TEMP\\");
 }
@@ -1214,7 +1424,7 @@ HLE("kernel32.dll", GetTempPathW, 2) {
 HLE("kernel32.dll", GetWindowsDirectoryA, 2) { return CopyOut(Arg(c, 0), Arg(c, 1), "C:\\WINDOWS"); }
 HLE("kernel32.dll", GetWindowsDirectoryW, 2) { return CopyOutW(Arg(c, 0), Arg(c, 1), "C:\\WINDOWS"); }
 
-HLE("kernel32.dll", GetDiskFreeSpaceExW, 4) {
+HLE64("kernel32.dll", GetDiskFreeSpaceExW, 4) {
   if (Arg(c, 1)) Wr64(Arg(c, 1), 8ull << 30);
   if (Arg(c, 2)) Wr64(Arg(c, 2), 64ull << 30);
   if (Arg(c, 3)) Wr64(Arg(c, 3), 8ull << 30);
@@ -1225,16 +1435,16 @@ HLE("kernel32.dll", GetDiskFreeSpaceExW, 4) {
 // are not copied.
 HLE("kernel32.dll", CreateDirectoryExW, 3) { return CreateDirectory(WidePath(Arg(c, 1))); }
 
-HLE("kernel32.dll", FindFirstFileExA, 6) {
+HLE64("kernel32.dll", FindFirstFileExA, 6) {
   if (Arg(c, 1) > 1 || Arg(c, 3) > 1) {
     SetLastError(kErrorInvalidParameter);
-    return kInvalidHandle;
+    return HandleRet(kInvalidHandle);
   }
   return FindFirst(GStr(Arg(c, 0)), Arg(c, 2), false);
 }
 
 // CopyFileW(from, to, failIfExists)
-HLE("kernel32.dll", CopyFileW, 3) {
+HLE64("kernel32.dll", CopyFileW, 3) {
   std::string from = HostPath(WidePath(Arg(c, 0)));
   std::string to = HostPath(WidePath(Arg(c, 1)), PathAccess::kWrite);
   int in = open(from.c_str(), O_RDONLY | O_CLOEXEC);
@@ -1260,13 +1470,10 @@ HLE("kernel32.dll", CopyFileW, 3) {
 
 // SetFileTime(file, creation, access, write): file times are the host's;
 // the request succeeds without changing them.
-HLE("kernel32.dll", SetFileTime, 4) { return 1; }
+HLE64("kernel32.dll", SetFileTime, 4) { return 1; }
 
 // ---- more paths, volumes, moves and locks ----------------------------------
 
-HLE("kernel32.dll", GetSystemDirectoryW, 2) {
-  return CopyOutW(Arg(c, 0), Arg(c, 1), "C:\\WINDOWS\\system32");
-}
 HLE("kernel32.dll", GetSystemWindowsDirectoryW, 2) {
   return CopyOutW(Arg(c, 0), Arg(c, 1), "C:\\WINDOWS");
 }
@@ -1281,33 +1488,13 @@ HLE("kernel32.dll", GetLongPathNameW, 3) {
   return uint32_t(p.size());
 }
 
-HLE("kernel32.dll", GetDriveTypeW, 1) { return 3; }           // DRIVE_FIXED
 HLE("kernel32.dll", GetLogicalDrives, 0) { return 1u << 2; }  // C: only
 
-HLE("kernel32.dll", MoveFileW, 2) {
-  return MoveFile(WidePath(Arg(c, 0)), WidePath(Arg(c, 1)), false);
-}
 // MoveFileExA: as MoveFileExW.
 HLE("kernel32.dll", MoveFileExA, 3) {
   uint32_t flags = uint32_t(Arg(c, 2));
   if (flags & ~0xBu) FatalF("MoveFileExA: flags %X not supported", flags);
   return MoveFile(GStr(Arg(c, 0)), GStr(Arg(c, 1)), flags & 1);
-}
-
-// LockFile / UnlockFile(h, offset lo, hi, length lo, hi): as LockFileEx.
-HLE("kernel32.dll", LockFile, 5) {
-  if (!IsFileHandle(Arg(c, 0))) {
-    SetLastError(kErrorInvalidHandle);
-    return 0;
-  }
-  return 1;
-}
-HLE("kernel32.dll", UnlockFile, 5) {
-  if (!IsFileHandle(Arg(c, 0))) {
-    SetLastError(kErrorInvalidHandle);
-    return 0;
-  }
-  return 1;
 }
 
 // ---- INI files (GetPrivateProfileStringA) ----------------------------------
@@ -1424,4 +1611,12 @@ HLE("kernel32.dll", GetPrivateProfileStringA, 6) {
 
 }  // namespace
 }  // namespace hle
+
+namespace {
+// A handle's deletion on close (FileObject), when its last handle closes.
+void RemoveOnClose(const std::string& guest, bool dir) {
+  if (!hle::RemoveGuest(guest, dir))
+    RECOMP_TRACE("  delete on close of %s failed\n", guest.c_str());
+}
+}  // namespace
 }  // namespace recomp

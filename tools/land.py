@@ -41,6 +41,7 @@ RULES = [
     ("tools/ghidra/", []),
     ("tools/pe_symbols.py", []),
     ("tools/smoke.py", []),
+    ("tools/repin.py", []),
     ("player/", []),
     ("tools/x64_forms.py", []),
     (".github/", []),

@@ -10,10 +10,12 @@
 #include <cstring>
 #include <ctime>
 #include <string>
+#include <vector>
 
 #include "runtime/log.h"
 #include "win32/hle.h"
 #include "win32/kernel32_state.h"
+#include "win32/win32.h"
 #include "win32/ucrt.h"
 #include "x86/runtime.h"
 
@@ -115,6 +117,37 @@ HLE64("ucrtbase.dll", _localtime64, kCdecl) {
   return TmBuffer();
 }
 
+// _localtime64_s(tm*, const __time64_t*): 0 or EINVAL (the tm then all
+// -1), as _gmtime64_s.
+HLE64("ucrtbase.dll", _localtime64_s, kCdecl) {
+  gaddr out = Arg(c, 0), tp = Arg(c, 1);
+  if (!out) {
+    Fail(EINVAL);
+    return EINVAL;
+  }
+  int64_t t = tp ? int64_t(Rd64(tp)) : -1;
+  if (!tp || t < 0 || t > kMaxTime64) {
+    for (int i = 0; i < 9; i++) Wr32(out + 4 * i, 0xFFFFFFFF);
+    Fail(EINVAL);
+    return EINVAL;
+  }
+  PutTm(out, Local(t));
+  return 0;
+}
+
+// _ftime64(__timeb64*): {__time64_t time; unsigned short millitm; short
+// timezone (minutes west of UTC); short dstflag} (16 bytes).
+HLE64("ucrtbase.dll", _ftime64, kCdecl) {
+  gaddr p = Arg(c, 0);
+  struct timespec ts;
+  clock_gettime(CLOCK_REALTIME, &ts);
+  Wr64(p, uint64_t(ts.tv_sec));
+  Wr16(p + 8, uint16_t(ts.tv_nsec / 1000000));
+  Wr16(p + 10, uint16_t(int16_t(-LocalOffset() / 60)));
+  Wr16(p + 12, 0);
+  return 0;
+}
+
 // _gmtime64_s(tm*, const __time64_t*): 0 or EINVAL (the tm then all -1).
 HLE64("ucrtbase.dll", _gmtime64_s, kCdecl) {
   gaddr out = Arg(c, 0), tp = Arg(c, 1);
@@ -168,14 +201,10 @@ HLE64("ucrtbase.dll", asctime, kCdecl) {
   return TextBuffer();
 }
 
-// strftime(buf, max, format, tm): the conversions that do not depend on the
-// locale or the time zone, and the "C" locale's names; others are fatal.
-// 0 (and an empty buf, errno ERANGE) if the result does not fit.
-HLE64("ucrtbase.dll", strftime, kCdecl) {
-  gaddr buf = Arg(c, 0);
-  uint64_t max = Arg(c, 1);
-  std::string fmt = GStr(Arg(c, 2));
-  std::tm t = GetTm(Arg(c, 3));
+namespace {
+// strftime's text: the conversions that do not depend on the locale or the
+// time zone, and the "C" locale's names; others are fatal.
+std::string StrftimeC(const std::string& fmt, const std::tm& t) {
   std::string out;
   char num[16];
   for (size_t i = 0; i < fmt.size(); i++) {
@@ -208,13 +237,99 @@ HLE64("ucrtbase.dll", strftime, kCdecl) {
     }
     out += num;
   }
+  return out;
+}
+
+// The result in buf (max characters with the NUL), or 0 (and an empty buf,
+// errno ERANGE) if it does not fit.
+uint64_t PutStrftime(gaddr buf, uint64_t max, const std::string& out, bool wide) {
   if (out.size() + 1 > max) {
-    if (max) Wr8(buf, 0);
+    if (max) {
+      if (wide) Wr16(buf, 0);
+      else Wr8(buf, 0);
+    }
     Fail(ERANGE);
     return 0;
   }
-  PutStr(buf, out);
+  if (wide) PutWStr(buf, out);
+  else PutStr(buf, out);
   return out.size();
 }
+}  // namespace
+
+// strftime(buf, max, format, tm).
+HLE64("ucrtbase.dll", strftime, kCdecl) {
+  return PutStrftime(Arg(c, 0), Arg(c, 1), StrftimeC(GStr(Arg(c, 2)), GetTm(Arg(c, 3))), false);
+}
+// _Strftime(buf, max, format, tm, lc_time_data) and _Wcsftime: the C++
+// library's time_put calls these with the locale's time names, which are
+// always the "C" locale's here.
+HLE64("ucrtbase.dll", _Strftime, kCdecl) {
+  return PutStrftime(Arg(c, 0), Arg(c, 1), StrftimeC(GStr(Arg(c, 2)), GetTm(Arg(c, 3))), false);
+}
+HLE64("ucrtbase.dll", _Wcsftime, kCdecl) {
+  return PutStrftime(Arg(c, 0), Arg(c, 1),
+                     StrftimeC(win32::Narrow(GWStr(Arg(c, 2))), GetTm(Arg(c, 3))), true);
+}
+
+// _Getdays / _Getmonths: the "C" locale's names as one malloc'd string,
+// ":Sun:Sunday:Mon:Monday..." (the caller frees it); _W_ the wide forms.
+namespace {
+std::string NameList(bool days) {
+  std::string s;
+  for (int i = 0; i < (days ? 7 : 12); i++) {
+    std::string n = days ? kDays[i] : kMonths[i];
+    s += ":" + n.substr(0, 3) + ":" + n;
+  }
+  return s;
+}
+gaddr GuestCopy(const std::string& s, bool wide) {
+  gaddr p = HeapAllocProcess((s.size() + 1) * (wide ? 2 : 1), false);
+  if (wide) PutWStr(p, s);
+  else PutStr(p, s);
+  return p;
+}
+}  // namespace
+HLE64("ucrtbase.dll", _Getdays, kCdecl) { return GuestCopy(NameList(true), false); }
+HLE64("ucrtbase.dll", _Getmonths, kCdecl) { return GuestCopy(NameList(false), false); }
+HLE64("ucrtbase.dll", _W_Getdays, kCdecl) { return GuestCopy(NameList(true), true); }
+HLE64("ucrtbase.dll", _W_Getmonths, kCdecl) { return GuestCopy(NameList(false), true); }
+
+// _Gettnames / _W_Gettnames: a malloc'd copy of the locale's
+// __crt_lc_time_data (x64): char* wday_abbr[7], wday[7], month_abbr[12],
+// month[12], ampm[2], short date, long date and time formats (0x158), int
+// caltype, long refcount, then the same as wchar_t* (0x160) and the locale
+// name. The caller frees it with free(); the strings live in the same
+// block, as the UCRT allocates them.
+namespace {
+gaddr TimeNames() {
+  std::vector<std::string> s;
+  for (int i = 0; i < 7; i++) s.push_back(std::string(kDays[i]).substr(0, 3));
+  for (int i = 0; i < 7; i++) s.push_back(kDays[i]);
+  for (int i = 0; i < 12; i++) s.push_back(std::string(kMonths[i]).substr(0, 3));
+  for (int i = 0; i < 12; i++) s.push_back(kMonths[i]);
+  for (const char* x : {"AM", "PM", "MM/dd/yy", "dddd, MMMM dd, yyyy", "HH:mm:ss"}) s.push_back(x);
+  constexpr uint64_t kPtrs = 0x160, kWide = kPtrs + 8 * 46;
+  uint64_t size = kWide;
+  for (const std::string& x : s) size += 3 * (x.size() + 1);
+  gaddr p = HeapAllocProcess(size, true);
+  gaddr str = kWide + p;
+  for (size_t i = 0; i < s.size(); i++) {  // the narrow strings
+    Wr64(p + 8 * i, str);
+    PutStr(str, s[i]);
+    str += s[i].size() + 1;
+  }
+  Wr32(p + 0x158, 1);  // ww_caltype: Gregorian
+  Wr32(p + 0x15C, 1);  // refcount
+  for (size_t i = 0; i < s.size(); i++) {  // the wide ones
+    Wr64(p + kPtrs + 8 * i, str);
+    PutWStr(str, s[i]);
+    str += 2 * (s[i].size() + 1);
+  }
+  return p;
+}
+}  // namespace
+HLE64("ucrtbase.dll", _Gettnames, kCdecl) { return TimeNames(); }
+HLE64("ucrtbase.dll", _W_Gettnames, kCdecl) { return TimeNames(); }
 
 }  // namespace recomp::hle

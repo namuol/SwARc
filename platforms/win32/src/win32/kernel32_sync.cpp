@@ -279,7 +279,7 @@ HLE64("kernel32.dll", CreateEventW, 4) { return CreateEvent(c, true); }
 
 // CreateEventExW(attrs, name, flags, access): CREATE_EVENT_MANUAL_RESET (1),
 // CREATE_EVENT_INITIAL_SET (2).
-HLE("kernel32.dll", CreateEventExW, 4) {
+HLE64("kernel32.dll", CreateEventExW, 4) {
   uint32_t flags = uint32_t(Arg(c, 2));
   bool manual = flags & 1, initial = flags & 2;
   return HandleRet(CreateNamed(NameOf(Arg(c, 1), true), [&] {
@@ -310,22 +310,24 @@ HLE64("kernel32.dll", ResetEvent, 1) {
 
 // bInitialOwner applies only to a mutex this call creates: one that
 // exists already is opened as it is (ERROR_ALREADY_EXISTS), as on Windows.
-HLE("kernel32.dll", CreateMutexA, 3) {
+uint64_t CreateMutexImpl(Ctx& c, bool wide) {
   GuestSyncPoint sync;
   bool own = Arg(c, 1);
   uint32_t tid = CurrentThread()->tid;
-  return CreateNamed(NameOf(Arg(c, 2)), [&] {
+  return HandleRet(CreateNamed(NameOf(Arg(c, 2), wide), [&] {
     auto m = std::make_shared<MutexObject>();
     g_mutexes.push_back(m);
     if (own) m->Acquire(tid);
     return m;
-  });
+  }));
 }
+HLE64("kernel32.dll", CreateMutexA, 3) { return CreateMutexImpl(c, false); }
+HLE64("kernel32.dll", CreateMutexW, 3) { return CreateMutexImpl(c, true); }
 
 // OpenMutexA/OpenFileMappingA(access, inherit, name): a new handle to an
 // existing named object of that type.
-uint32_t OpenNamed(gaddr name_va, KObject::Type type) {
-  std::string name = NameOf(name_va);
+uint32_t OpenNamed(gaddr name_va, KObject::Type type, bool wide = false) {
+  std::string name = NameOf(name_va, wide);
   std::lock_guard<std::mutex> l(g_wait_mu);
   auto it = g_named.find(name);
   if (it == g_named.end() || it->second->type != type) {
@@ -337,6 +339,8 @@ uint32_t OpenNamed(gaddr name_va, KObject::Type type) {
 
 HLE("kernel32.dll", OpenMutexA, 3) { return OpenNamed(Arg(c, 2), KObject::Type::Mutex); }
 HLE("kernel32.dll", OpenEventA, 3) { return OpenNamed(Arg(c, 2), KObject::Type::Event); }
+HLE("kernel32.dll", OpenMutexW, 3) { return OpenNamed(Arg(c, 2), KObject::Type::Mutex, true); }
+HLE("kernel32.dll", OpenEventW, 3) { return OpenNamed(Arg(c, 2), KObject::Type::Event, true); }
 
 HLE("kernel32.dll", ReleaseMutex, 1) {
   GuestSyncPoint sync;
@@ -367,7 +371,7 @@ HLE64("kernel32.dll", CreateSemaphoreA, 4) { return CreateSemaphore(c, false); }
 HLE64("kernel32.dll", CreateSemaphoreW, 4) { return CreateSemaphore(c, true); }
 
 // CreateSemaphoreExW(attrs, initial, maximum, name, flags, access).
-HLE("kernel32.dll", CreateSemaphoreExW, 6) { return CreateSemaphore(c, true); }
+HLE64("kernel32.dll", CreateSemaphoreExW, 6) { return CreateSemaphore(c, true); }
 
 HLE64("kernel32.dll", ReleaseSemaphore, 3) {
   GuestSyncPoint sync;
@@ -669,7 +673,7 @@ HLE64("kernel32.dll", SleepConditionVariableCS, 3) {
 // SleepConditionVariableSRW(cv, lock, ms, flags): as the CS form, with the
 // SRW lock released and retaken in the mode the flags give
 // (CONDITION_VARIABLE_LOCKMODE_SHARED = 1, else exclusive).
-HLE("kernel32.dll", SleepConditionVariableSRW, 4) {
+HLE64("kernel32.dll", SleepConditionVariableSRW, 4) {
   GuestSyncPoint sync;
   CondVar& v = ObjectAt<CondVar>(Arg(c, 0));
   SrwLock& s = ObjectAt<SrwLock>(Arg(c, 1));
@@ -716,7 +720,7 @@ HLE("kernel32.dll", SleepConditionVariableSRW, 4) {
 // BOOL fn(once, param, context) once. The INIT_ONCE word is 0 before, 1
 // while a thread runs fn (others wait), 2 after success; a failed fn puts
 // it back to 0 so a later call retries, as on Windows.
-HLE("kernel32.dll", InitOnceExecuteOnce, 4) {
+HLE64("kernel32.dll", InitOnceExecuteOnce, 4) {
   GuestSyncPoint sync;
   gaddr once = Arg(c, 0);
   auto* word = reinterpret_cast<uint32_t*>(GPtr(once));
@@ -801,8 +805,9 @@ constexpr uint32_t kStillActive = 259;  // STILL_ACTIVE
 
 // The exit code once the thread has finished, STILL_ACTIVE before. The
 // main thread has no ThreadObject; its pseudo-handle is always running.
-HLE("kernel32.dll", GetExitCodeThread, 2) {
-  uint32_t h = Arg(c, 0), out = Arg(c, 1);
+HLE64("kernel32.dll", GetExitCodeThread, 2) {
+  uint32_t h = uint32_t(Arg(c, 0));
+  gaddr out = Arg(c, 1);
   auto to = std::dynamic_pointer_cast<ThreadObject>(GetHandle(h));
   if (!to) {
     if (h != 0xFFFFFFFE) {
@@ -827,11 +832,11 @@ HLE("kernel32.dll", GetExitCodeProcess, 2) {
   return 1;
 }
 
-HLE("kernel32.dll", CreateThread, 6) {
+HLE64("kernel32.dll", CreateThread, 6) {
   uint32_t tid;
   uint32_t h = NewThread(Arg(c, 1), Arg(c, 2), Arg(c, 3), Arg(c, 4) & 4, &tid);
   if (Arg(c, 5)) Wr32(Arg(c, 5), tid);
-  return h;
+  return HandleRet(h);
 }
 
 HLE("kernel32.dll", ResumeThread, 1) {
@@ -849,7 +854,7 @@ HLE("kernel32.dll", SuspendThread, 1) {
   return 0;
 }
 
-HLE("kernel32.dll", TerminateThread, 2) {
+HLE64("kernel32.dll", TerminateThread, 2) {
   WarnF("TerminateThread is not supported; ignored\n");
   return 0;
 }
@@ -862,8 +867,16 @@ HLE("kernel32.dll", ExitThread, 1) {
 // Thread priorities are not applied: host threads keep the default
 // scheduling, and every guest thread reports THREAD_PRIORITY_NORMAL.
 HLE("kernel32.dll", GetThreadPriority, 1) { return 0; }
-HLE("kernel32.dll", SetThreadPriority, 2) { return 1; }
+HLE64("kernel32.dll", SetThreadPriority, 2) { return 1; }
 HLE("kernel32.dll", GetPriorityClass, 1) { return 0x20; }  // NORMAL
+// Priority boosts (a waiting thread's temporary raise) are the host
+// scheduler's business: reported as enabled, changes accepted.
+HLE("kernel32.dll", SetThreadPriorityBoost, 2) { return 1; }
+HLE("kernel32.dll", GetThreadPriorityBoost, 2) {
+  Wr32(Arg(c, 1), 0);
+  return 1;
+}
+HLE("kernel32.dll", SetProcessPriorityBoost, 2) { return 1; }
 HLE("kernel32.dll", SetPriorityClass, 2) { return 1; }
 
 // Affinity is bookkeeping only: guest threads are never pinned on the host
@@ -911,6 +924,37 @@ HLE("kernel32.dll", GetThreadContext, 2) {
   return 0;
 }
 
+// SetThreadContext(thread, CONTEXT*): only debug registers that set no
+// hardware breakpoint (Dr7 0) are accepted, which leaves the thread as it
+// is: Source's tier0 clears data breakpoints on every thread it creates.
+// Anything else would change a running thread's state: not supported.
+HLE("kernel32.dll", SetThreadContext, 2) {
+  constexpr uint32_t kContextDebugRegisters = 0x00010010;  // CONTEXT_i386 | 0x10
+  gaddr ctx = Arg(c, 1);
+  uint32_t flags = Rd32(ctx);
+  if ((flags & ~kContextDebugRegisters) == 0 && Rd32(ctx + 0x18) == 0) return 1;  // Dr7
+  WarnF("SetThreadContext(flags %08X): not supported\n", flags);
+  SetLastError(kErrorAccessDenied);
+  return 0;
+}
+
+// OpenThread(access, inherit, tid): a new handle to a thread created with
+// CreateThread that has not finished. The main thread has no thread object
+// (it is reached by its pseudo-handle only), so it cannot be opened.
+HLE("kernel32.dll", OpenThread, 3) {
+  std::shared_ptr<ThreadObject> to;
+  {
+    std::lock_guard<std::mutex> l(g_wait_mu);
+    auto it = g_thread_objs.find(uint32_t(Arg(c, 2)));
+    if (it != g_thread_objs.end()) to = it->second;
+  }
+  if (!to) {
+    SetLastError(kErrorInvalidParameter);
+    return 0;
+  }
+  return NewHandle(to);
+}
+
 HLE("kernel32.dll", OpenProcess, 3) {
   SetLastError(kErrorAccessDenied);
   return 0;
@@ -932,18 +976,22 @@ struct MappingObject : KObject {
   int fd = -1;          // -1: pagefile-backed (anonymous, shared)
   uint64_t size = 0;
   bool writable = false;
-  uint32_t anon_base = 0;  // for pagefile-backed: one shared guest block
+  gaddr anon_base = 0;  // for pagefile-backed: one shared guest block
   ~MappingObject() override {
     if (fd >= 0) close(fd);
   }
 };
 
 std::mutex g_views_mu;
-std::set<uint32_t> g_views;  // guest bases of file views
+std::set<gaddr> g_views;  // guest bases of file views
 
-HLE("kernel32.dll", CreateFileMappingA, 6) {
-  uint32_t file = Arg(c, 0), prot = Arg(c, 2), size_hi = Arg(c, 3),
-           size_lo = Arg(c, 4), name = Arg(c, 5);
+uint64_t CreateFileMapping(Ctx& c, bool wide);
+HLE64("kernel32.dll", CreateFileMappingA, 6) { return CreateFileMapping(c, false); }
+HLE64("kernel32.dll", CreateFileMappingW, 6) { return CreateFileMapping(c, true); }
+uint64_t CreateFileMapping(Ctx& c, bool wide) {
+  uint32_t file = uint32_t(Arg(c, 0)), prot = uint32_t(Arg(c, 2)),
+           size_hi = uint32_t(Arg(c, 3)), size_lo = uint32_t(Arg(c, 4));
+  gaddr name = Arg(c, 5);
   auto m = std::make_shared<MappingObject>();
   m->writable = prot == kPageReadWrite || prot == kPageWriteCopy ||
                 prot == kPageExecuteReadWrite;
@@ -961,23 +1009,27 @@ HLE("kernel32.dll", CreateFileMappingA, 6) {
     if (!m->size) m->size = uint64_t(st.st_size);
   } else {
     // Pagefile-backed shared memory: one guest block shared by all views.
-    uint32_t base = g_proc->vm.Reserve(0, uint32_t(m->size));
+    gaddr base = g_proc->vm.Reserve(0, m->size);
     if (!base) {
       SetLastError(kErrorNotEnoughMemory);
       return 0;
     }
-    g_proc->vm.Commit(base, uint32_t(m->size), Prot::RW);
+    g_proc->vm.Commit(base, m->size, Prot::RW);
     m->anon_base = base;
   }
-  return CreateNamed(NameOf(name), [&] { return m; });
+  return HandleRet(CreateNamed(NameOf(name, wide), [&] { return m; }));
 }
 
 HLE("kernel32.dll", OpenFileMappingA, 3) {
   return OpenNamed(Arg(c, 2), KObject::Type::Mapping);
 }
+HLE("kernel32.dll", OpenFileMappingW, 3) {
+  return OpenNamed(Arg(c, 2), KObject::Type::Mapping, true);
+}
 
-uint32_t MapView(uint32_t h, uint32_t access, uint32_t off_hi, uint32_t off_lo,
-                 uint32_t size, uint32_t want_base) {
+// size: SIZE_T, so 64-bit for x64 guests.
+gaddr MapView(uint32_t h, uint32_t access, uint32_t off_hi, uint32_t off_lo, uint64_t size,
+              gaddr want_base) {
   auto m = std::dynamic_pointer_cast<MappingObject>(GetHandle(h));
   if (!m) {
     SetLastError(kErrorInvalidHandle);
@@ -986,10 +1038,10 @@ uint32_t MapView(uint32_t h, uint32_t access, uint32_t off_hi, uint32_t off_lo,
   uint64_t off = (uint64_t(off_hi) << 32) | off_lo;
   if (m->anon_base) {
     if (want_base) return 0;
-    return m->anon_base + uint32_t(off);
+    return m->anon_base + off;
   }
-  if (!size) size = uint32_t(m->size - off);
-  uint32_t base = g_proc->vm.Reserve(want_base, size);
+  if (!size) size = m->size - off;
+  gaddr base = g_proc->vm.Reserve(want_base, size);
   if (!base) {
     SetLastError(kErrorNotEnoughMemory);
     return 0;
@@ -1012,17 +1064,32 @@ uint32_t MapView(uint32_t h, uint32_t access, uint32_t off_hi, uint32_t off_lo,
   return base;
 }
 
-HLE("kernel32.dll", MapViewOfFile, 5) {
-  return MapView(Arg(c, 0), Arg(c, 1), Arg(c, 2), Arg(c, 3), Arg(c, 4), 0);
+HLE64("kernel32.dll", MapViewOfFile, 5) {
+  return MapView(uint32_t(Arg(c, 0)), uint32_t(Arg(c, 1)), uint32_t(Arg(c, 2)),
+                 uint32_t(Arg(c, 3)), Arg(c, 4), 0);
 }
 
-HLE("kernel32.dll", MapViewOfFileEx, 6) {
-  return MapView(Arg(c, 0), Arg(c, 1), Arg(c, 2), Arg(c, 3), Arg(c, 4),
-                 Arg(c, 5));
+HLE64("kernel32.dll", MapViewOfFileEx, 6) {
+  return MapView(uint32_t(Arg(c, 0)), uint32_t(Arg(c, 1)), uint32_t(Arg(c, 2)),
+                 uint32_t(Arg(c, 3)), Arg(c, 4), Arg(c, 5));
 }
 
-HLE("kernel32.dll", UnmapViewOfFile, 1) {
-  uint32_t base = Arg(c, 0);
+// FlushViewOfFile(base, size): write views are MAP_SHARED mappings of the
+// file, so their pages reach it through the host's page cache; msync makes
+// the write-back happen now.
+HLE64("kernel32.dll", FlushViewOfFile, 2) {
+  gaddr base = Arg(c, 0);
+  uint64_t size = Arg(c, 1);
+  if (!size) return 1;
+  const uint64_t page = uint64_t(getpagesize());
+  const uintptr_t lo = reinterpret_cast<uintptr_t>(GPtr(base)) & ~(page - 1);
+  const uintptr_t hi = reinterpret_cast<uintptr_t>(GPtr(base)) + size;
+  msync(reinterpret_cast<void*>(lo), hi - lo, MS_ASYNC);
+  return 1;
+}
+
+HLE64("kernel32.dll", UnmapViewOfFile, 1) {
+  gaddr base = Arg(c, 0);
   {
     std::lock_guard<std::mutex> l(g_views_mu);
     if (!g_views.erase(base)) return 1;  // pagefile views: nothing to do

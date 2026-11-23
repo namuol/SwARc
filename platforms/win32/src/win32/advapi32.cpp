@@ -468,27 +468,119 @@ HLE("advapi32.dll", AccessCheck, 8) {
 
 // ---- ole32 ------------------------------------------------------------------
 
-// SystemFunction036 is RtlGenRandom(buf, len): BOOLEAN, len random bytes
-// (the CRT's rand_s). From the host's random device.
-HLE("advapi32.dll", SystemFunction036, 2) {
+// n random bytes at buf, from the host's random device.
+void RandomBytes(gaddr buf, uint32_t n) {
   static std::mutex mu;
   static std::random_device rd;
   std::lock_guard<std::mutex> l(mu);
-  gaddr buf = Arg(c, 0);
-  for (uint32_t i = 0, n = Arg(c, 1); i < n; i += 4) {
+  for (uint32_t i = 0; i < n; i += 4) {
     uint32_t r = rd();
     for (uint32_t k = 0; k < 4 && i + k < n; k++) Wr8(buf + i + k, uint8_t(r >> (8 * k)));
   }
+}
+
+// SystemFunction036 is RtlGenRandom(buf, len): BOOLEAN, len random bytes
+// (the CRT's rand_s).
+HLE("advapi32.dll", SystemFunction036, 2) {
+  RandomBytes(Arg(c, 0), Arg(c, 1));
   return 1;
 }
 
-HLE("ole32.dll", CoInitialize, 1) { return 0; }  // S_OK
-HLE("ole32.dll", CoInitializeEx, 2) { return 0; }
+// CryptoAPI, for random numbers only: CryptAcquireContext(HCRYPTPROV*,
+// container, provider, type, flags) gives one provider handle whatever is
+// asked (a key container's keys are not available: no key is ever used),
+// CryptGenRandom(prov, len, buf) fills buf, CryptReleaseContext frees
+// nothing.
+constexpr uint32_t kCryptProv = 0xC0DE0001;
+HLE("advapi32.dll", CryptAcquireContextA, 5) {
+  Wr32(Arg(c, 0), kCryptProv);
+  return 1;
+}
+HLE("advapi32.dll", CryptAcquireContextW, 5) {
+  Wr32(Arg(c, 0), kCryptProv);
+  return 1;
+}
+HLE("advapi32.dll", CryptGenRandom, 3) {
+  if (Arg(c, 0) != kCryptProv) {
+    SetLastError(kErrorInvalidHandle);
+    return 0;
+  }
+  RandomBytes(Arg(c, 2), Arg(c, 1));
+  return 1;
+}
+HLE("advapi32.dll", CryptReleaseContext, 2) { return 1; }
+
+// ---- rpcrt4: UUIDs ------------------------------------------------------------
+// UuidCreate(UUID*): a random (version 4) UUID; RPC_S_OK. To and from the
+// "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" form, the string allocated from
+// the process heap and freed with RpcStringFree.
+HLE("rpcrt4.dll", UuidCreate, 1) {
+  gaddr u = Arg(c, 0);
+  RandomBytes(u, 16);
+  Wr8(u + 7, uint8_t((Rd8(u + 7) & 0x0F) | 0x40));  // Data3's high byte: version 4
+  Wr8(u + 8, uint8_t((Rd8(u + 8) & 0x3F) | 0x80));  // the variant
+  return 0;
+}
+HLE("rpcrt4.dll", UuidToStringA, 2) {
+  gaddr u = Arg(c, 0);
+  char buf[40];
+  std::snprintf(buf, sizeof buf, "%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x", Rd32(u),
+                Rd16(u + 4), Rd16(u + 6), Rd8(u + 8), Rd8(u + 9), Rd8(u + 10), Rd8(u + 11),
+                Rd8(u + 12), Rd8(u + 13), Rd8(u + 14), Rd8(u + 15));
+  gaddr s = HeapAllocProcess(37, false);
+  PutStr(s, buf);
+  Wr32(Arg(c, 1), uint32_t(s));
+  return 0;
+}
+HLE("rpcrt4.dll", UuidFromStringA, 2) {
+  constexpr uint32_t kRpcSInvalidStringUuid = 1705;
+  gaddr u = Arg(c, 1);
+  if (!Arg(c, 0)) {
+    std::memset(GPtr(u), 0, 16);
+    return 0;
+  }
+  std::string str = GStr(Arg(c, 0));
+  unsigned d1, d2, d3, b[8];
+  if (str.size() != 36 ||
+      std::sscanf(str.c_str(), "%8x-%4x-%4x-%2x%2x-%2x%2x%2x%2x%2x%2x", &d1, &d2, &d3, &b[0],
+                  &b[1], &b[2], &b[3], &b[4], &b[5], &b[6], &b[7]) != 11)
+    return kRpcSInvalidStringUuid;
+  Wr32(u, d1);
+  Wr16(u + 4, uint16_t(d2));
+  Wr16(u + 6, uint16_t(d3));
+  for (int i = 0; i < 8; i++) Wr8(u + 8 + i, uint8_t(b[i]));
+  return 0;
+}
+HLE("rpcrt4.dll", RpcStringFreeA, 1) {
+  gaddr p = Arg(c, 0);
+  if (Rd32(p)) HeapFreeProcess(Rd32(p));
+  Wr32(p, 0);
+  return 0;
+}
+
+HLE64("ole32.dll", CoInitialize, 1) { return 0; }  // S_OK
+HLE64("ole32.dll", CoInitializeEx, 2) { return 0; }
 // CoInitializeSecurity(desc, cAuth, auth, reserved, authn level, imp level,
 // auth list, caps, reserved): process-wide COM security for remote calls,
 // which never happen here.
 HLE("ole32.dll", CoInitializeSecurity, 9) { return 0; }  // S_OK
-HLE("ole32.dll", CoUninitialize, 0) { return 0; }
+HLE64("ole32.dll", CoUninitialize, 0) { return 0; }
+
+// PropVariantClear(PROPVARIANT*): frees what the variant owns (strings
+// are CoTaskMemAlloc'd, which is the process heap here) and empties it
+// (VT_EMPTY). 16 bytes, or 24 on x64.
+HLE64("ole32.dll", PropVariantClear, 1) {
+  const gaddr v = Arg(c, 0);
+  if (!v) return 0;
+  const uint16_t vt = Rd16(v);
+  if (vt == 30 || vt == 31) {  // VT_LPSTR, VT_LPWSTR
+    if (gaddr s = RdPtr(v + 8)) HeapFreeProcess(s);
+  } else if (vt > 21 && vt != 64) {  // beyond the plain scalars and FILETIME
+    WarnF("PropVariantClear: type %u left as it is\n", vt);
+  }
+  std::memset(GPtr(v), 0, g_proc->x64 ? 24 : 16);
+  return 0;
+}
 
 // The COM task allocator: the process heap (a NULL free is a no-op).
 HLE64("ole32.dll", CoTaskMemAlloc, 1) { return HeapAllocProcess(Arg(c, 0), false); }
@@ -600,7 +692,14 @@ bool InprocServer(Ctx& c, uint32_t clsid, uint32_t iid, uint32_t out, uint32_t* 
   return true;
 }
 
-HLE("ole32.dll", CoCreateInstance, 5) {
+// x64 guests get no COM classes yet (the class table and in-process servers
+// are 32-bit): every class is unregistered for them.
+HLE64("ole32.dll", CoCreateInstance, 5) {
+  if (g_proc->x64) {
+    WarnF("CoCreateInstance({%08X-...}): no COM classes for x64 guests yet\n", Rd32(Arg(c, 0)));
+    if (Arg(c, 4)) Wr64(Arg(c, 4), 0);
+    return 0x80040154;  // REGDB_E_CLASSNOTREG
+  }
   uint32_t clsid = Arg(c, 0), out = Arg(c, 4), hr_inproc = 0;
   if (com::CreateFn create = com::FindCoClass(clsid)) {
     uint32_t obj = 0;

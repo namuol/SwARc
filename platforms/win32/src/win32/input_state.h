@@ -44,5 +44,8 @@ using RawInputSink = void (*)(const RawInput&);
 // One sink (the DirectInput HLE); null to stop.
 void SetRawInputSink(RawInputSink sink);
 void EmitRawInput(RawInput::Kind kind, uint8_t code, int32_t value);
+// The same input as Windows' Raw Input (WM_INPUT) to a window that
+// registered for the mouse (RegisterRawInputDevices, user32_window.cpp).
+void RawInputMessage(const RawInput& in);
 
 }  // namespace recomp

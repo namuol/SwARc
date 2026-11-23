@@ -60,6 +60,55 @@ HLE64("vcruntime140.dll", strstr, kCdecl) {
   return r ? Arg(c, 0) + gaddr(r - p) : 0;
 }
 
+namespace {
+// Wide strings: wchar_t is 16 bits on Windows.
+uint64_t WcsLen(gaddr s) {
+  uint64_t n = 0;
+  while (Rd16(s + 2 * n)) n++;
+  return n;
+}
+}  // namespace
+
+HLE64("vcruntime140.dll", wcsrchr, kCdecl) {
+  const gaddr s = Arg(c, 0);
+  const uint16_t ch = uint16_t(Arg(c, 1));
+  const uint64_t n = WcsLen(s);
+  for (uint64_t i = n + 1; i-- > 0;)  // the terminator matches a 0 search
+    if (Rd16(s + 2 * i) == ch) return s + 2 * i;
+  return 0;
+}
+HLE64("vcruntime140.dll", wcsstr, kCdecl) {
+  const gaddr s = Arg(c, 0), sub = Arg(c, 1);
+  const uint64_t n = WcsLen(s), m = WcsLen(sub);
+  if (!m) return s;
+  for (uint64_t i = 0; i + m <= n; i++) {
+    uint64_t j = 0;
+    while (j < m && Rd16(s + 2 * (i + j)) == Rd16(sub + 2 * j)) j++;
+    if (j == m) return s + 2 * i;
+  }
+  return 0;
+}
+
+// ---- setjmp / longjmp -------------------------------------------------------
+// An imported setjmp returns 0, as a setjmp does when it is called. A
+// longjmp back to it is not supported: the lifter resumes only at the
+// returns of a setjmp it lifted itself (ARCHITECTURE.md). Libraries that
+// longjmp only on errors (FreeType's rasteriser, for one) then run as long
+// as nothing fails; a longjmp is fatal and names its target.
+// The jmp_buf (_JUMP_BUFFER) gets the caller's Rip (0x50) and Rsp (0x10),
+// so the fatal longjmp can say where it was going.
+HLE64("vcruntime140.dll", __intrinsic_setjmp, kCdecl) {
+  Wr64(Arg(c, 0) + 0x10, c.rsp + 8);
+  Wr64(Arg(c, 0) + 0x50, Rd64(c.rsp));
+  return 0;
+}
+HLE64("vcruntime140.dll", longjmp, kCdecl) {
+  FatalF("longjmp(jmp_buf %llX, %d) to an imported setjmp: not supported (its return "
+         "address is %llX)",
+         (unsigned long long)Arg(c, 0), int32_t(Arg(c, 1)),
+         (unsigned long long)Rd64(Arg(c, 0) + 0x50));
+}
+
 // ---- type_info ----------------------------------------------------------------
 // __std_type_info_data {const char* _UndecoratedName; char _DecoratedName[];}
 // (after type_info's vtable pointer). Types are equal when their decorated
