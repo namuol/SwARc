@@ -77,6 +77,9 @@ bool Load(Program& p, Module& m, const std::string& path, uint64_t base, std::st
   for (const auto& imp : img.imports)
     if (imp.name == "ExitProcess" || imp.name == "ExitThread")
       p.noreturn_iat.insert(imp.iat_va);
+    else if ((imp.name == "_setjmp3" || imp.name == "_setjmp") &&
+             (imp.dll == "msvcrt.dll" || imp.dll == "MSVCRT.dll" || imp.dll == "MSVCRT.DLL"))
+      p.setjmp_iat.insert(imp.iat_va);  // SwARc's msvcrt.cpp longjmps to their returns
   return true;
 }
 

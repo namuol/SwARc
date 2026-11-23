@@ -36,6 +36,7 @@
 #include "win32/win32.h"
 
 #include "runtime/log.h"
+#include "x86/lifted.h"
 #include "win32/hle.h"
 #include "win32/kernel32_state.h"
 #include "x86/runtime.h"
@@ -313,17 +314,42 @@ HLE(kDll, _unlock, kCdecl) {
   return 0;
 }
 
-// setjmp/longjmp through the DLL: _setjmp3 returns 0, as a setjmp does
-// when called; longjmp, which would return from it again, is not
-// supported for an imported setjmp (the lifter resumes only at the
-// returns of a setjmp it lifted, ARCHITECTURE.md): fatal, naming it.
-// FreeType's rasteriser calls setjmp for every glyph and longjmps only
-// when its cell pool overflows.
-HLE(kDll, _setjmp3, kCdecl) { return 0; }
+// setjmp/longjmp through the DLL (MinGW code: FreeType's rasteriser calls
+// setjmp for every glyph and longjmps when its cell pool overflows). The
+// jmp_buf has MSVC's layout: Ebp, Ebx, Edi, Esi, Esp (at the call, its
+// return address on top), Eip (that return address), the SEH registration
+// (fs:[0]), TryLevel, a cookie. The lifter makes each call's return through
+// these imports a setjmp return (pe_reader's setjmp_iat); longjmp restores
+// the registers and the SEH chain (without running its handlers, as MinGW
+// code has none) and resumes there in the setjmp caller's frame, as a
+// lifted longjmp's `resume` site does (ARCHITECTURE.md, non-local exits).
+uint32_t SaveJmpBuf(Ctx& c) {
+  const uint32_t b = Arg(c, 0);
+  Wr32(b + 0x00, c.ebp);
+  Wr32(b + 0x04, c.ebx);
+  Wr32(b + 0x08, c.edi);
+  Wr32(b + 0x0C, c.esi);
+  Wr32(b + 0x10, c.esp);
+  Wr32(b + 0x14, Rd32(c.esp));
+  Wr32(b + 0x18, Rd32(uint32_t(c.fs_base)));
+  Wr32(b + 0x1C, 0xFFFFFFFFu);
+  Wr32(b + 0x20, 0x56433230u);  // 'VC20'
+  return 0;
+}
+HLE(kDll, _setjmp3, kCdecl) { return SaveJmpBuf(c); }
+HLE(kDll, _setjmp, kCdecl) { return SaveJmpBuf(c); }
 HLE(kDll, longjmp, kCdecl) {
-  FatalF("msvcrt longjmp(jmp_buf %08X, %d) to an imported setjmp: not supported (return "
-         "address %08X)",
-         uint32_t(Arg(c, 0)), int32_t(Arg(c, 1)), Rd32(c.esp));
+  const uint32_t b = Arg(c, 0);
+  const int32_t v = int32_t(Arg(c, 1));
+  const uint32_t from = Rd32(c.esp);
+  Wr32(uint32_t(c.fs_base), Rd32(b + 0x18));
+  c.ebp = Rd32(b + 0x00);
+  c.ebx = Rd32(b + 0x04);
+  c.edi = Rd32(b + 0x08);
+  c.esi = Rd32(b + 0x0C);
+  c.esp = Rd32(b + 0x10) + 4;  // setjmp's return address popped
+  c.eax = v ? uint32_t(v) : 1u;
+  throw ::recomp::GuestResume{Rd32(b + 0x14), c.ebp, from};
 }
 
 // ---- strings and memory ----------------------------------------------------------
