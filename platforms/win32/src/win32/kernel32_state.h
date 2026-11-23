@@ -63,13 +63,22 @@ GuestHeap* FindHeap(gaddr handle);
 
 // Kernel object handles. Values are small multiples of 4, as on Windows.
 struct KObject {
-  enum class Type { File, Event, Mutex, Semaphore, Thread, Process, Mapping, Find, StdIo, Socket };
+  enum class Type {
+    File, Event, Mutex, Semaphore, Thread, Process, Mapping, Find, StdIo, Socket, Token
+  };
   explicit KObject(Type t) : type(t) {}
   virtual ~KObject() = default;
   Type type;
 };
 
 uint32_t NewHandle(std::shared_ptr<KObject> obj);
+// The data of resource `type`/`name` ("#n" for numeric ones) in the EXE's
+// image (any language): a guest pointer and size; false if there is none.
+bool ExeResource(const std::string& type, const std::string& name, uint32_t* data,
+                 uint32_t* size);
+// Queues fn(args...) (stdcall, up to three dwords) as an APC for thread
+// `tid`: it runs in that thread's next alertable wait (kernel32_sync.cpp).
+void QueueApc(uint32_t tid, gaddr fn, std::vector<uint32_t> args);
 int FileFd(KObject* o);  // host fd of a File/StdIo object, or -1
 // The object behind a handle; GetCurrentProcess()'s and
 // GetCurrentThread()'s pseudo handles (0xFFFFFFFF, 0xFFFFFFFE) stand for
