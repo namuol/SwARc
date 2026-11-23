@@ -1566,8 +1566,9 @@ void r_color0(inout vec4 c) {
                                                                    : dummy_2d_;
       sc.tex[r] = dummy;
       auto it = textures_.find(d.textures[r]);
+      // The bound texture when its kind is the sampler's (2D, cube or 3D).
       if (it != textures_.end() && it->second.cube == (want == hlsl::ParamType::SamplerCube) &&
-          want != hlsl::ParamType::Sampler3D)
+          (it->second.kind == TextureKind::Tex3D) == (want == hlsl::ParamType::Sampler3D))
         sc.tex[r] = it->second.tex;
       SamplerKey sk = D3D9Sampler(d.sampler_states ? d.sampler_states[r] : nullptr);
 #if defined(__APPLE__)
