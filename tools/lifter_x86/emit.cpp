@@ -3909,6 +3909,18 @@ void Emitter::EmitFunction(const Function& f, std::string* out,
     o += "void " + FnName(f.entry) + "(::recomp::Ctx& c) { " + host->second.symbol + "(c, " +
          Hex(host->second.module_base) + "); }\n";
   }
+  // `unlifted` (manifest): a stub that is fatal when reached, for the
+  // function and each secondary entry it owns; no body.
+  if (p_.unlifted.count(f.entry)) {
+    o += "void " + FnName(f.entry) + "(::recomp::Ctx& c) { ::recomp::UnliftedFunction(c, " +
+         Hex(f.entry) + "); }\n";
+    if (entries)
+      for (uint64_t e : *entries)
+        o += "void " + FnName(e) + "(::recomp::Ctx& c) { ::recomp::UnliftedFunction(c, " +
+             Hex(e) + "); }\n";
+    o += "\n";
+    return;
+  }
   const size_t body_at = o.size();
   o += "void " + FnName(f.entry) + (p_.replaced.count(f.entry) ? "_lifted" : "") +
        "(::recomp::Ctx& c) {\n  LIFT_ENTER\n";

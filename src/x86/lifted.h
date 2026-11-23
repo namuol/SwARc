@@ -69,6 +69,9 @@ void RaiseDivideError(Ctx& c, uint64_t va);
 void Probe(Ctx& c, uint64_t va, const char* name);
 void Xgetbv(Ctx& c);                           // ecx in, edx:eax out
 #endif
+// A function the manifest lists as `unlifted` (or a secondary entry of
+// one) was called; va is the address it was entered at.
+[[noreturn]] void UnliftedFunction(Ctx& c, uint64_t va);
 void Cpuid(Ctx& c);                            // eax/ecx in, eax..edx out
 uint64_t Rdtsc(Ctx& c);
 inline constexpr uint64_t kTscHz = 3000000000;  // the rate Rdtsc counts at
