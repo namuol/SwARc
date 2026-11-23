@@ -726,8 +726,14 @@ void Draw(Device& d, gfx::ShaderDraw& sd, const char* what) {
     if (at && want && dir && !done && ps && ps->program &&
         std::chrono::steady_clock::now() - start > std::chrono::seconds(std::atoi(at))) {
       const char* b = reinterpret_cast<const char*>(ps->tokens.data());
-      const bool has = std::search(b, b + ps->tokens.size() * 4, want, want + std::strlen(want)) !=
-                       b + ps->tokens.size() * 4;
+      bool has = std::search(b, b + ps->tokens.size() * 4, want, want + std::strlen(want)) !=
+                 b + ps->tokens.size() * 4;
+      if (want[0] == '#') {  // #hash: that pixel shader (FNV of its tokens)
+        uint64_t fnv = 1469598103934665603ull;
+        for (uint32_t t : ps->tokens)
+          for (int i = 0; i < 4; i++) fnv = (fnv ^ ((t >> (8 * i)) & 0xFF)) * 1099511628211ull;
+        has = std::strtoull(want + 1, nullptr, 16) == fnv;
+      }
       if (has) {
         done = true;
         for (const auto& smp : ps->program->samplers) {
@@ -885,6 +891,10 @@ void Draw(Device& d, gfx::ShaderDraw& sd, const char* what) {
         };
         ProbeLog("  TEMP probe %016llx prim %u n %u: %g %g %g %g\n", (unsigned long long)fnv,
                      sd.prim, sd.primitives, half(h[0]), half(h[1]), half(h[2]), half(h[3]));
+        for (int sm = 0; sm < 2; sm++)
+          if (auto* t = com::As<Texture>(d.textures[sm]))
+            ProbeLog("    TEMP probe s%d: %ux%u fmt %u (%.4s) levels %u usage %X\n", sm, t->width, t->height,
+                     t->format, reinterpret_cast<const char*>(&t->format), t->levels, t->usage);
       }
     }
     if (probe_on && rt && rt->desc.Width == 1024 && rt->desc.Height == 768 &&

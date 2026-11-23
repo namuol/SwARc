@@ -24,6 +24,7 @@ extern "C" {
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -453,6 +454,13 @@ HLE("d3dx9_35.dll", D3DXLoadSurfaceFromMemory, 10) {
   int dw = dr.right - dr.left, dh = dr.bottom - dr.top;
   if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return D3DERR_INVALIDCALL;
   const gfx::Format sf = FormatFromD3D(sfmt), df = FormatFromD3D(s->desc.Format);
+  {  // TEMP diagnostic: not for landing
+    static std::set<std::pair<uint32_t, uint32_t>> seen;
+    if (seen.insert({sfmt, s->desc.Format}).second)
+      WarnF("TEMP D3DXLoadSurfaceFromMemory %u (%.4s) -> %u (%.4s), %dx%d\n", sfmt,
+            reinterpret_cast<const char*>(&sfmt), s->desc.Format,
+            reinterpret_cast<const char*>(&s->desc.Format), sr.right - sr.left, sr.bottom - sr.top);
+  }
   const bool none = (filter & 0xFF) == 1;  // D3DX_FILTER_NONE
   if (none) {
     dw = std::min(dw, sw), dh = std::min(dh, sh);
