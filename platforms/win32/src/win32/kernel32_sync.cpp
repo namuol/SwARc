@@ -407,7 +407,53 @@ uint64_t WaitOne(const Ctx& c) {
   return WaitObjects({w}, false, uint32_t(Arg(c, 1)));
 }
 HLE64("kernel32.dll", WaitForSingleObject, 2) { return WaitOne(c); }
-HLE64("kernel32.dll", WaitForSingleObjectEx, 3) { return WaitOne(c); }
+bool RunApcs(Ctx& c, uint32_t ms);  // below
+
+// Alertable (x86): APCs already queued run first and end the wait
+// (WAIT_IO_COMPLETION); one queued later does not interrupt it.
+HLE64("kernel32.dll", WaitForSingleObjectEx, 3) {
+  if (!g_proc->x64 && Arg(c, 2) && RunApcs(c, 0)) return 0xC0;
+  return WaitOne(c);
+}
+
+// SignalObjectAndWait(to_signal, to_wait, ms, alertable): signals an event,
+// releases a mutex the caller owns, or releases one count of a semaphore,
+// then waits on the other object as WaitForSingleObject does. The signal is
+// published before the wait starts (under the wait lock), so no waiter can
+// miss it. A handle of another type, or a release that would fail, is
+// WAIT_FAILED with the matching error and no wait.
+HLE("kernel32.dll", SignalObjectAndWait, 4) {
+  GuestSyncPoint sync;
+  auto sig = GetHandle(Arg(c, 0));
+  auto w = AsWaitable(Arg(c, 1));
+  if (!sig || !w) {
+    SetLastError(kErrorInvalidHandle);
+    return kWaitFailed;
+  }
+  {
+    std::lock_guard<std::mutex> l(g_wait_mu);
+    if (auto e = std::dynamic_pointer_cast<EventObject>(sig)) {
+      e->signalled = true;
+    } else if (auto m = std::dynamic_pointer_cast<MutexObject>(sig)) {
+      if (m->owner != CurrentThread()->tid) {
+        SetLastError(288);  // ERROR_NOT_OWNER
+        return kWaitFailed;
+      }
+      if (--m->count == 0) m->owner = 0;
+    } else if (auto s = std::dynamic_pointer_cast<SemaphoreObject>(sig)) {
+      if (s->count >= s->max) {
+        SetLastError(kErrorTooManyPosts);
+        return kWaitFailed;
+      }
+      s->count++;
+    } else {
+      SetLastError(kErrorInvalidHandle);
+      return kWaitFailed;
+    }
+  }
+  SignalChanged();
+  return WaitObjects({w}, false, Arg(c, 2));
+}
 
 HLE64("kernel32.dll", WaitForMultipleObjects, 4) {
   GuestSyncPoint sync;
@@ -431,9 +477,50 @@ HLE64("kernel32.dll", WaitForMultipleObjects, 4) {
 // alertable wait (SleepEx with alertable set), which then returns
 // WAIT_IO_COMPLETION. Queues are per thread id, oldest first.
 
+}  // namespace
+}  // namespace hle
+
+namespace {
 std::mutex g_apc_mu;
 std::condition_variable g_apc_cv;
-std::map<uint32_t, std::deque<std::pair<gaddr, uint32_t>>> g_apcs;
+// fn and its stdcall arguments: QueueUserAPC's one (data), or an I/O
+// completion routine's three (error, bytes, OVERLAPPED*).
+struct Apc {
+  gaddr fn;
+  std::vector<uint32_t> args;
+};
+std::map<uint32_t, std::deque<Apc>> g_apcs;
+}  // namespace
+
+void QueueApc(uint32_t tid, gaddr fn, std::vector<uint32_t> args) {
+  {
+    std::lock_guard<std::mutex> l(g_apc_mu);
+    g_apcs[tid].push_back({fn, std::move(args)});
+  }
+  g_apc_cv.notify_all();
+}
+
+namespace hle {
+namespace {
+
+// Runs the calling thread's queued APCs, oldest first, waiting up to `ms`
+// for one to be queued if there are none; whether any ran.
+bool RunApcs(Ctx& c, uint32_t ms) {
+  const uint32_t tid = CurrentThread()->tid;
+  std::deque<Apc> run;
+  {
+    std::unique_lock<std::mutex> l(g_apc_mu);
+    auto pred = [&] { return !g_apcs[tid].empty(); };
+    if (ms == kInfinite) g_apc_cv.wait(l, pred);
+    else if (ms) g_apc_cv.wait_for(l, std::chrono::milliseconds(ms), pred);
+    run.swap(g_apcs[tid]);
+  }
+  for (const Apc& a : run) {
+    if (a.args.size() == 3) CallGuest(c, a.fn, {a.args[0], a.args[1], a.args[2]});
+    else CallGuest(c, a.fn, {a.args.empty() ? 0u : a.args[0]});
+  }
+  return !run.empty();
+}
 
 // QueueUserAPC(fn, thread, data)
 HLE("kernel32.dll", QueueUserAPC, 3) {
@@ -443,11 +530,7 @@ HLE("kernel32.dll", QueueUserAPC, 3) {
     SetLastError(kErrorInvalidHandle);
     return 0;
   }
-  {
-    std::lock_guard<std::mutex> l(g_apc_mu);
-    g_apcs[t->thread->tid].emplace_back(gaddr(Arg(c, 0)), uint32_t(Arg(c, 2)));
-  }
-  g_apc_cv.notify_all();
+  QueueApc(t->thread->tid, gaddr(Arg(c, 0)), {uint32_t(Arg(c, 2))});
   return 1;
 }
 
@@ -460,18 +543,7 @@ HLE("kernel32.dll", SleepEx, 2) {
     std::this_thread::sleep_for(std::chrono::milliseconds(ms));
     return 0;
   }
-  const uint32_t tid = CurrentThread()->tid;
-  std::deque<std::pair<gaddr, uint32_t>> run;
-  {
-    std::unique_lock<std::mutex> l(g_apc_mu);
-    auto pred = [&] { return !g_apcs[tid].empty(); };
-    if (ms == kInfinite) g_apc_cv.wait(l, pred);
-    else g_apc_cv.wait_for(l, std::chrono::milliseconds(ms), pred);
-    run.swap(g_apcs[tid]);
-  }
-  if (run.empty()) return 0;
-  for (auto& [fn, data] : run) CallGuest(c, fn, {data});
-  return 0xC0;  // WAIT_IO_COMPLETION
+  return RunApcs(c, ms) ? 0xC0 : 0;  // WAIT_IO_COMPLETION
 }
 
 // ---- slim reader/writer locks and condition variables ------------------------

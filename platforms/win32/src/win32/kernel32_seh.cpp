@@ -135,6 +135,10 @@ bool DispatchException(Ctx& c, uint32_t code, uint32_t flags, uint32_t nparams,
     if (reg < CurrentThread()->stack_lo || reg >= CurrentThread()->stack_hi)
       FatalF("corrupt SEH chain: record %08X outside the stack", reg);
     uint32_t handler = Rd32(reg + 4);
+    // The record's next two dwords are the MSVC frame's scope table and
+    // try level (meaningful for its _except_handler3/4 frames only).
+    RECOMP_TRACE("    record %08X: handler %08X, scope table %08X, try level %08X\n", reg,
+                 handler, Rd32(reg + 8), Rd32(reg + 12));
     uint32_t disp = CallGuest(c, handler, {rec, reg, ctx, 0});
     if (disp == kContinueExecution) return resume(handler);
     if (disp != kContinueSearch)

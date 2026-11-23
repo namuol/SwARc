@@ -576,6 +576,35 @@ HLE64("kernel32.dll", ReadFile, 5) {
   return 1;
 }
 
+// ReadFileEx(h, buf, n, OVERLAPPED*, completion): reads at the
+// OVERLAPPED's offset (Offset, OffsetHigh) at once, sets its Internal
+// (status) and InternalHigh (bytes), and queues completion(error, bytes,
+// overlapped) as an APC: it runs in the thread's next alertable wait, as
+// on Windows. Reading at or past the end completes with ERROR_HANDLE_EOF.
+HLE("kernel32.dll", ReadFileEx, 5) {
+  int fd = FdOf(Arg(c, 0));
+  gaddr buf = Arg(c, 1), ovl = Arg(c, 3), done = Arg(c, 4);
+  uint32_t n = Arg(c, 2);
+  if (fd < 0 || !ovl) {
+    SetLastError(fd < 0 ? kErrorInvalidHandle : kErrorInvalidParameter);
+    return 0;
+  }
+  const off_t at = off_t(uint64_t(Rd32(ovl + 8)) | uint64_t(Rd32(ovl + 12)) << 32);
+  lazy::Touch(buf, n);
+  ssize_t r = n ? pread(fd, GPtr(buf), n, at) : 0;
+  if (r < 0) {
+    SetLastError(ErrnoToWin(errno));
+    return 0;
+  }
+  constexpr uint32_t kErrorHandleEof = 38, kStatusEndOfFile = 0xC0000011;
+  const uint32_t err = (n && r == 0) ? kErrorHandleEof : 0;
+  Wr32(ovl + 0, err ? kStatusEndOfFile : 0);  // Internal
+  Wr32(ovl + 4, uint32_t(r));                  // InternalHigh
+  if (done) QueueApc(CurrentThread()->tid, done, {err, uint32_t(r), uint32_t(ovl)});
+  SetLastError(0);
+  return 1;
+}
+
 // GetOverlappedResult(file, OVERLAPPED*, DWORD* bytes, wait): every
 // request has completed already (ReadFile above).
 HLE64("kernel32.dll", GetOverlappedResult, 4) {
@@ -1442,6 +1471,143 @@ HLE64("kernel32.dll", CopyFileW, 3) {
 // SetFileTime(file, creation, access, write): file times are the host's;
 // the request succeeds without changing them.
 HLE64("kernel32.dll", SetFileTime, 4) { return 1; }
+
+// ---- more paths, volumes, moves and locks ----------------------------------
+
+HLE("kernel32.dll", GetSystemWindowsDirectoryW, 2) {
+  return CopyOutW(Arg(c, 0), Arg(c, 1), "C:\\WINDOWS");
+}
+
+// GetLongPathNameW(path, buf, size): the path as given (no short names
+// here), copied WCHAR for WCHAR; the size needed if it does not fit.
+HLE("kernel32.dll", GetLongPathNameW, 3) {
+  std::u16string p = GWStr(Arg(c, 0));
+  uint32_t buf = Arg(c, 1), size = Arg(c, 2);
+  if (size <= p.size()) return uint32_t(p.size() + 1);
+  std::memcpy(GPtr(buf), p.c_str(), 2 * (p.size() + 1));
+  return uint32_t(p.size());
+}
+
+HLE("kernel32.dll", GetLogicalDrives, 0) { return 1u << 2; }  // C: only
+
+// MoveFileExA: as MoveFileExW.
+HLE("kernel32.dll", MoveFileExA, 3) {
+  uint32_t flags = uint32_t(Arg(c, 2));
+  if (flags & ~0xBu) FatalF("MoveFileExA: flags %X not supported", flags);
+  return MoveFile(GStr(Arg(c, 0)), GStr(Arg(c, 1)), flags & 1);
+}
+
+// ---- INI files (GetPrivateProfileStringA) ----------------------------------
+// A file name without a folder is in the Windows folder, as on Windows.
+// Sections and keys match ignoring case; values lose surrounding blanks and
+// one pair of surrounding quotes. Read on each call (games read a handful
+// of values at startup).
+
+struct IniSection {
+  std::string name;
+  std::vector<std::pair<std::string, std::string>> keys;
+};
+
+std::string TrimIni(const std::string& s) {
+  size_t a = s.find_first_not_of(" \t\r\n"), b = s.find_last_not_of(" \t\r\n");
+  return a == std::string::npos ? "" : s.substr(a, b - a + 1);
+}
+
+std::vector<IniSection> ReadIni(std::string file) {
+  if (file.find_first_of("\\/:") == std::string::npos) file = "C:\\WINDOWS\\" + file;
+  std::vector<IniSection> out;
+  FILE* f = fopen(HostPath(file).c_str(), "rb");
+  if (!f) return out;
+  char line[4096];
+  while (fgets(line, sizeof line, f)) {
+    std::string l = TrimIni(line);
+    if (l.empty() || l[0] == ';') continue;
+    if (l[0] == '[') {
+      size_t e = l.find(']');
+      out.push_back({TrimIni(l.substr(1, e == std::string::npos ? std::string::npos : e - 1)), {}});
+    } else if (!out.empty()) {
+      size_t eq = l.find('=');
+      std::string k = TrimIni(l.substr(0, eq));
+      std::string v = eq == std::string::npos ? "" : TrimIni(l.substr(eq + 1));
+      if (v.size() >= 2 && (v[0] == '"' || v[0] == '\'') && v.back() == v[0])
+        v = v.substr(1, v.size() - 2);
+      out.back().keys.push_back({k, v});
+    }
+  }
+  fclose(f);
+  return out;
+}
+
+bool SameIniName(const std::string& a, const std::string& b) {
+  return win32::Lower(a) == win32::Lower(b);
+}
+
+// A list of NUL-terminated names ending in an extra NUL, cut the way
+// Windows cuts it when it does not fit: size - 2 characters and two NULs.
+uint32_t CopyOutList(uint32_t buf, uint32_t size, const std::vector<std::string>& names) {
+  std::string all;
+  for (const auto& n : names) all += n + '\0';
+  if (size < 2) {
+    if (size == 1) Wr8(buf, 0);
+    return 0;
+  }
+  if (all.size() + 1 <= size) {
+    std::memcpy(GPtr(buf), all.data(), all.size());
+    Wr8(buf + uint32_t(all.size()), 0);
+    if (all.empty()) Wr8(buf + 1, 0);
+    return uint32_t(all.size());
+  }
+  std::memcpy(GPtr(buf), all.data(), size - 2);
+  Wr8(buf + size - 2, 0);
+  Wr8(buf + size - 1, 0);
+  return size - 2;
+}
+
+// DWORD GetPrivateProfileStringA(section, key, default, buf, size, file):
+// a NULL section lists the sections, a NULL key a section's keys; a missing
+// value is the default (trailing blanks removed). The count copied, without
+// the NUL; size - 1 if it was cut.
+HLE("kernel32.dll", GetPrivateProfileStringA, 6) {
+  gaddr sec = Arg(c, 0), key = Arg(c, 1), def = Arg(c, 2);
+  uint32_t buf = Arg(c, 3), size = Arg(c, 4);
+  std::vector<IniSection> ini = ReadIni(GStr(Arg(c, 5)));
+  if (!sec || !key) {
+    std::vector<std::string> names;
+    if (!sec) {
+      for (const auto& s : ini) names.push_back(s.name);
+    } else {
+      std::string want = GStr(sec);
+      for (const auto& s : ini)
+        if (SameIniName(s.name, want))
+          for (const auto& kv : s.keys) names.push_back(kv.first);
+    }
+    return CopyOutList(buf, size, names);
+  }
+  std::string want_sec = GStr(sec), want_key = GStr(key), value;
+  bool found = false;
+  for (const auto& s : ini) {
+    if (!SameIniName(s.name, want_sec)) continue;
+    for (const auto& kv : s.keys)
+      if (SameIniName(kv.first, want_key)) {
+        value = kv.second;
+        found = true;
+        break;
+      }
+    if (found) break;
+  }
+  if (!found) {
+    value = def ? GStr(def) : "";
+    while (!value.empty() && value.back() == ' ') value.pop_back();
+  }
+  if (!size) return 0;
+  if (value.size() < size) {
+    PutStr(buf, value);
+    return uint32_t(value.size());
+  }
+  std::memcpy(GPtr(buf), value.data(), size - 1);
+  Wr8(buf + size - 1, 0);
+  return size - 1;
+}
 
 }  // namespace
 }  // namespace hle

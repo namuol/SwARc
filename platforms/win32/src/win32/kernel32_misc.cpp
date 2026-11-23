@@ -318,6 +318,15 @@ HLE64("kernel32.dll", FileTimeToLocalFileTime, 2) {
   Wr64(Arg(c, 1), uint64_t(int64_t(Rd64(Arg(c, 0))) + off));
   return 1;
 }
+// The inverse, with the same (current) offset.
+HLE("kernel32.dll", LocalFileTimeToFileTime, 2) {
+  time_t now = time(nullptr);
+  std::tm lt{};
+  localtime_r(&now, &lt);
+  int64_t off = int64_t(lt.tm_gmtoff) * 10000000;
+  Wr64(Arg(c, 1), uint64_t(int64_t(Rd64(Arg(c, 0))) - off));
+  return 1;
+}
 
 // FileTimeToDosDateTime(ft, &date, &time): the FILETIME's fields as
 // they are (no time zone conversion), DOS-packed; years 1980-2107 only.
@@ -808,3 +817,14 @@ HLE("kernel32.dll", DeviceIoControl, 8) {
 
 }  // namespace
 }  // namespace recomp::hle
+
+namespace recomp {
+bool ExeResource(const std::string& type, const std::string& name, uint32_t* data,
+                 uint32_t* size) {
+  uint32_t e = hle::FindResourceIn(g_win32->img, type, name, 0);
+  if (!e) return false;
+  *data = uint32_t(g_win32->img.image_base) + Rd32(e);
+  *size = Rd32(e + 4);
+  return true;
+}
+}  // namespace recomp

@@ -3,6 +3,9 @@
 // kernel32_file.cpp, kernel32_sync.cpp, kernel32_misc.cpp and
 // kernel32_seh.cpp.
 
+#include <sys/resource.h>
+
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -288,6 +291,7 @@ bool ModulePath(gaddr mod, std::string* path) {
     }
     *path = GuestGameDir() + "\\" +
             Game().lifted_dlls[size_t(m - g_win32->modules.data())].name;
+    std::replace(path->begin(), path->end(), '/', '\\');
   }
   return true;
 }
@@ -1304,6 +1308,22 @@ HLE("kernel32.dll", InterlockedExchange, 2) {
   return __atomic_exchange_n(reinterpret_cast<uint32_t*>(GPtr(Arg(c, 0))),
                              Arg(c, 1), __ATOMIC_SEQ_CST);
 }
+// LONG InterlockedCompareExchange(LONG* dest, LONG exchange, LONG comparand):
+// the initial value of *dest; it becomes exchange only if it was comparand.
+HLE("kernel32.dll", InterlockedCompareExchange, 3) {
+  GuestSyncPoint sync;
+  uint32_t expected = uint32_t(Arg(c, 2));
+  __atomic_compare_exchange_n(reinterpret_cast<uint32_t*>(GPtr(Arg(c, 0))), &expected,
+                              uint32_t(Arg(c, 1)), false, __ATOMIC_SEQ_CST,
+                              __ATOMIC_SEQ_CST);
+  return expected;
+}
+// LONG InterlockedExchangeAdd(LONG* addend, LONG value): the initial value.
+HLE("kernel32.dll", InterlockedExchangeAdd, 2) {
+  GuestSyncPoint sync;
+  return __atomic_fetch_add(reinterpret_cast<uint32_t*>(GPtr(Arg(c, 0))), uint32_t(Arg(c, 1)),
+                            __ATOMIC_SEQ_CST);
+}
 
 // ---- time ----------------------------------------------------------------
 
@@ -1475,6 +1495,10 @@ HLE64("kernel32.dll", MultiByteToWideChar, 6) {
   }
   if (!cap) return w.size();
   if (w.size() > size_t(cap)) {
+    // Fails, as on Windows, but with the part that fits written first:
+    // callers that size the buffer to the text without its terminator
+    // (and add their own) rely on it.
+    std::memcpy(GPtr(dst), w.data(), 2 * size_t(cap));
     SetLastError(kErrorInsufficientBuffer);
     return 0;
   }
@@ -1512,6 +1536,11 @@ HLE64("kernel32.dll", WideCharToMultiByte, 8) {
   }
   if (!cap) return s.size();
   if (s.size() > size_t(cap)) {
+    // As MultiByteToWideChar: the part that fits (whole UTF-8 sequences).
+    size_t fit = size_t(cap);
+    if (cp == kCpUtf8)
+      while (fit > 0 && fit < s.size() && (uint8_t(s[fit]) & 0xC0) == 0x80) fit--;
+    std::memcpy(GPtr(dst), s.data(), fit);
     SetLastError(kErrorInsufficientBuffer);
     return 0;
   }
@@ -1576,6 +1605,42 @@ HLE64("kernel32.dll", LCMapStringA, 6) {
 }
 
 HLE64("kernel32.dll", GetUserDefaultLCID, 0) { return 0x0409; }
+HLE("kernel32.dll", GetThreadLocale, 0) { return 0x0409; }
+
+// BOOL GetSystemPowerStatus(SYSTEM_POWER_STATUS*): on mains power, no
+// battery (a desktop): games use it to pick power-saving settings.
+HLE("kernel32.dll", GetSystemPowerStatus, 1) {
+  gaddr s = Arg(c, 0);
+  Wr8(s + 0, 1);            // ACLineStatus: online
+  Wr8(s + 1, 128);          // BatteryFlag: no system battery
+  Wr8(s + 2, 255);          // BatteryLifePercent: unknown
+  Wr8(s + 3, 0);            // SystemStatusFlag
+  Wr32(s + 4, 0xFFFFFFFF);  // BatteryLifeTime: unknown
+  Wr32(s + 8, 0xFFFFFFFF);  // BatteryFullLifeTime: unknown
+  return 1;
+}
+
+// BOOL GetProcessMemoryInfo(h, PROCESS_MEMORY_COUNTERS*, cb) (psapi): the
+// host process's resident size for both working set and pagefile usage.
+HLE("psapi.dll", GetProcessMemoryInfo, 3) {
+  gaddr pc = Arg(c, 1);
+  uint32_t cb = Arg(c, 2);
+  if (cb < 40) {
+    SetLastError(kErrorInsufficientBuffer);
+    return 0;
+  }
+  rusage ru{};
+  getrusage(RUSAGE_SELF, &ru);
+  const uint32_t peak = uint32_t(std::min<uint64_t>(uint64_t(ru.ru_maxrss), 0xFFFFFFFFu));
+  std::memset(GPtr(pc), 0, 40);
+  Wr32(pc + 0, 40);                     // cb
+  Wr32(pc + 4, uint32_t(ru.ru_minflt + ru.ru_majflt));  // PageFaultCount
+  Wr32(pc + 8, peak);                   // PeakWorkingSetSize
+  Wr32(pc + 12, peak);                  // WorkingSetSize
+  Wr32(pc + 32, peak);                  // PagefileUsage
+  Wr32(pc + 36, peak);                  // PeakPagefileUsage
+  return 1;
+}
 HLE("kernel32.dll", GetUserDefaultLangID, 0) { return 0x0409; }
 HLE("kernel32.dll", IsValidLocale, 2) { return Arg(c, 0) == 0x0409 ? 1 : 0; }
 
