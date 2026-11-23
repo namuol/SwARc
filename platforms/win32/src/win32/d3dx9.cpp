@@ -376,6 +376,204 @@ HLE("d3dx9_35.dll", D3DXCreateCubeTextureFromFileInMemory, 4) {
                           0, Arg(c, 3));
 }
 
+// ---- empty textures --------------------------------------------------------------------
+// D3DXCreateTexture / D3DXCreateCubeTexture: CreateTexture with D3DX's
+// defaults (D3DXCheckTextureRequirements): a size of 0 or D3DX_DEFAULT is
+// 256, levels 0 or D3DX_DEFAULT the full chain, an unknown format
+// A8R8G8B8. Sizes are kept as given (every device here takes any size).
+
+uint32_t CreateEmpty(Ctx& c, bool cube, uint32_t device, uint32_t w, uint32_t h, uint32_t levels,
+                     uint32_t usage, uint32_t fmt, uint32_t pool, uint32_t out) {
+  (void)c;
+  Wr32(out, 0);
+  auto size = [](uint32_t v) { return v == 0 || v == D3DX_DEFAULT || v == D3DX_DEFAULT_NONPOW2 ? 256u : v; };
+  w = size(w);
+  h = cube ? w : size(h);
+  uint32_t full = 1;
+  for (uint32_t s = std::max(w, h); s > 1; s >>= 1) full++;
+  levels = levels == 0 || levels == D3DX_DEFAULT ? full : std::min(levels, full);
+  if (fmt == D3DFMT_UNKNOWN || fmt == D3DX_DEFAULT) fmt = D3DFMT_A8R8G8B8;
+  uint32_t tex;
+  uint32_t hr = NewTexture(*DeviceOf(device), device, cube, w, h, levels, usage, fmt, pool, &tex);
+  if (hr == D3D_OK) Wr32(out, tex);
+  return hr;
+}
+
+// (pDevice, Width, Height, MipLevels, Usage, Format, Pool, ppTexture)
+HLE("d3dx9_35.dll", D3DXCreateTexture, 8) {
+  return CreateEmpty(c, false, Arg(c, 0), Arg(c, 1), Arg(c, 2), Arg(c, 3), Arg(c, 4), Arg(c, 5),
+                     Arg(c, 6), Arg(c, 7));
+}
+
+// (pDevice, Size, MipLevels, Usage, Format, Pool, ppCubeTexture)
+HLE("d3dx9_35.dll", D3DXCreateCubeTexture, 7) {
+  return CreateEmpty(c, true, Arg(c, 0), Arg(c, 1), Arg(c, 1), Arg(c, 2), Arg(c, 3), Arg(c, 4),
+                     Arg(c, 5), Arg(c, 6));
+}
+
+// (pDevice, Width, Height, Depth, MipLevels, Usage, Format, Pool,
+// ppVolumeTexture): CreateVolumeTexture with D3DX's defaults (as
+// CreateEmpty: sizes 0 / D3DX_DEFAULT 256, an unknown format A8R8G8B8).
+HLE("d3dx9_35.dll", D3DXCreateVolumeTexture, 9) {
+  uint32_t device = Arg(c, 0), out = Arg(c, 8);
+  Wr32(out, 0);
+  auto size = [](uint32_t v) { return v == 0 || v == D3DX_DEFAULT || v == D3DX_DEFAULT_NONPOW2 ? 256u : v; };
+  uint32_t levels = Arg(c, 4), fmt = Arg(c, 6);
+  if (levels == D3DX_DEFAULT) levels = 0;  // the full chain
+  if (fmt == D3DFMT_UNKNOWN || fmt == D3DX_DEFAULT) fmt = D3DFMT_A8R8G8B8;
+  uint32_t tex;
+  uint32_t hr = NewVolumeTexture(*DeviceOf(device), device, size(Arg(c, 1)), size(Arg(c, 2)),
+                                 size(Arg(c, 3)), levels, Arg(c, 5), fmt, Arg(c, 7), &tex);
+  if (hr == D3D_OK) Wr32(out, tex);
+  return hr;
+}
+
+// ---- surfaces from memory --------------------------------------------------------------
+// D3DXLoadSurfaceFromMemory(pDestSurface, pDestPalette, pDestRect, pSrcMemory,
+// SrcFormat, SrcPitch, pSrcPalette, pSrcRect, Filter, ColorKey): copies the
+// source rectangle into the destination one, converting through A8R8G8B8
+// unless the formats are the same. D3DX_FILTER_NONE copies the overlap
+// unscaled (as D3DX); other filters point-sample when the sizes differ.
+// Compressed formats only as a same-format block copy; palettes and colour
+// keys are fatal and named, to be added when needed.
+HLE("d3dx9_35.dll", D3DXLoadSurfaceFromMemory, 10) {
+  auto* s = com::As<Surface>(Arg(c, 0));
+  uint32_t src = Arg(c, 3), sfmt = Arg(c, 4), spitch = Arg(c, 5), srect = Arg(c, 7);
+  uint32_t filter = Arg(c, 8);
+  if (!s || !src || !srect) return D3DERR_INVALIDCALL;
+  if (Arg(c, 1) || Arg(c, 6)) FatalF("d3dx9: D3DXLoadSurfaceFromMemory with a palette: not supported yet");
+  if (Arg(c, 9)) FatalF("d3dx9: D3DXLoadSurfaceFromMemory with a colour key: not supported yet");
+  const guest::RECT sr = *G<guest::RECT>(srect);
+  gfx::Rect dr{0, 0, int32_t(s->desc.Width), int32_t(s->desc.Height)};
+  if (Arg(c, 2)) {
+    const auto* r = G<guest::RECT>(Arg(c, 2));
+    dr = {r->left, r->top, r->right, r->bottom};
+  }
+  const int sw = sr.right - sr.left, sh = sr.bottom - sr.top;
+  int dw = dr.right - dr.left, dh = dr.bottom - dr.top;
+  if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return D3DERR_INVALIDCALL;
+  const gfx::Format sf = FormatFromD3D(sfmt), df = FormatFromD3D(s->desc.Format);
+  const bool none = (filter & 0xFF) == 1;  // D3DX_FILTER_NONE
+  if (none) {
+    dw = std::min(dw, sw), dh = std::min(dh, sh);
+    dr.right = dr.left + dw, dr.bottom = dr.top + dh;
+  }
+  std::vector<uint8_t> out;
+  uint32_t opitch;
+  const uint8_t* in = reinterpret_cast<const uint8_t*>(GPtr(src));
+  if (gfx::IsCompressed(sf) || gfx::IsCompressed(df)) {
+    if (sf != df || dw != sw || dh != sh)
+      FatalF("d3dx9: D3DXLoadSurfaceFromMemory converting or scaling compressed format %X to %X: "
+             "not supported yet", sfmt, s->desc.Format);
+    opitch = gfx::RowPitch(df, uint32_t(dw));
+    const uint32_t rows = gfx::RowCount(df, uint32_t(dh));
+    out.resize(size_t(opitch) * rows);
+    const uint8_t* q = in + size_t(sr.top / 4) * spitch + size_t(sr.left / 4) * gfx::RowPitch(sf, 4);
+    for (uint32_t y = 0; y < rows; y++) std::memcpy(out.data() + size_t(y) * opitch, q + size_t(y) * spitch, opitch);
+  } else {
+    const uint32_t sb = gfx::BitsPerPixel(sf) / 8, db = gfx::BitsPerPixel(df) / 8;
+    opitch = uint32_t(dw) * db;
+    out.resize(size_t(opitch) * dh);
+    for (int y = 0; y < dh; y++)
+      for (int x = 0; x < dw; x++) {
+        const int sx = sr.left + (none ? x : x * sw / dw), sy = sr.top + (none ? y : y * sh / dh);
+        const uint8_t* sp = in + size_t(sy) * spitch + size_t(sx) * sb;
+        uint8_t* dp = out.data() + size_t(y) * opitch + size_t(x) * db;
+        if (sf == df) std::memcpy(dp, sp, db);
+        else gfx::EncodePixel(dp, df, gfx::DecodePixel(sp, sf));
+      }
+  }
+  switch (s->kind) {
+    case Surface::Kind::TextureLevel:
+      WriteLevelRect(*s->texture, uint32_t(s->face), uint32_t(s->level), dr, out.data(), opitch);
+      break;
+    case Surface::Kind::Offscreen: {
+      const bool bc = gfx::IsCompressed(df);
+      const uint32_t x0 = uint32_t(bc ? dr.left / 4 : dr.left), y0 = uint32_t(bc ? dr.top / 4 : dr.top);
+      const uint32_t unit = bc ? gfx::RowPitch(df, 4) : gfx::BitsPerPixel(df) / 8;
+      const uint32_t rows = gfx::RowCount(df, uint32_t(dh));
+      for (uint32_t y = 0; y < rows; y++)
+        std::memcpy(GPtr(s->mem + (y0 + y) * s->pitch + x0 * unit), out.data() + size_t(y) * opitch, opitch);
+      break;
+    }
+    case Surface::Kind::RenderTarget:
+      DeviceOf(s->device)->gfx->UpdateTexture(s->tex, 0, dr, out.data(), opitch);
+      break;
+    default:
+      FatalF("d3dx9: D3DXLoadSurfaceFromMemory into a surface of kind %d: not supported yet", int(s->kind));
+  }
+  return D3D_OK;
+}
+
+// ---- half floats -----------------------------------------------------------------------
+// IEEE binary16, rounding to nearest even; subnormals, infinities and NaN
+// (quiet, payload's top bits kept) as IEEE defines them.
+uint16_t FloatToHalf(float f) {
+  uint32_t x;
+  std::memcpy(&x, &f, 4);
+  const uint32_t sign = (x >> 16) & 0x8000u;
+  const uint32_t exp = (x >> 23) & 0xFF, man = x & 0x7FFFFFu;
+  if (exp == 0xFF) return uint16_t(sign | 0x7C00u | (man ? 0x200u | (man >> 13) : 0));
+  int e = int(exp) - 127 + 15;
+  if (e >= 31) return uint16_t(sign | 0x7C00u);  // overflow: infinity
+  if (e <= 0) {                                   // subnormal or zero
+    if (e < -10) return uint16_t(sign);
+    uint32_t m = man | 0x800000u;
+    const int shift = 14 - e;
+    uint32_t h = m >> shift, rem = m & ((1u << shift) - 1), half = 1u << (shift - 1);
+    if (rem > half || (rem == half && (h & 1))) h++;
+    return uint16_t(sign | h);
+  }
+  uint32_t h = (uint32_t(e) << 10) | (man >> 13), rem = man & 0x1FFFu;
+  if (rem > 0x1000u || (rem == 0x1000u && (h & 1))) h++;  // may carry into the exponent
+  return uint16_t(sign | h);
+}
+
+float HalfToFloat(uint16_t h) {
+  const uint32_t sign = uint32_t(h & 0x8000u) << 16;
+  uint32_t exp = (h >> 10) & 0x1F, man = h & 0x3FFu, x;
+  if (exp == 0x1F) {
+    x = sign | 0x7F800000u | (man << 13);
+  } else if (exp == 0) {
+    if (!man) {
+      x = sign;
+    } else {  // subnormal: normalise
+      int e = -1;
+      do { e++; man <<= 1; } while (!(man & 0x400u));
+      x = sign | (uint32_t(127 - 15 - e) << 23) | ((man & 0x3FFu) << 13);
+    }
+  } else {
+    x = sign | ((exp + 127 - 15) << 23) | (man << 13);
+  }
+  float f;
+  std::memcpy(&f, &x, 4);
+  return f;
+}
+
+// (pOut D3DXFLOAT16*, pIn const FLOAT*, n): pOut.
+HLE("d3dx9_35.dll", D3DXFloat32To16Array, 3) {
+  uint32_t out = Arg(c, 0), in = Arg(c, 1), n = Arg(c, 2);
+  for (uint32_t i = 0; i < n; i++) {
+    float f;
+    uint32_t bits = Rd32(in + 4 * i);
+    std::memcpy(&f, &bits, 4);
+    Wr16(out + 2 * i, FloatToHalf(f));
+  }
+  return out;
+}
+
+// (pOut FLOAT*, pIn const D3DXFLOAT16*, n): pOut.
+HLE("d3dx9_35.dll", D3DXFloat16To32Array, 3) {
+  uint32_t out = Arg(c, 0), in = Arg(c, 1), n = Arg(c, 2);
+  for (uint32_t i = 0; i < n; i++) {
+    float f = HalfToFloat(Rd16(in + 2 * i));
+    uint32_t bits;
+    std::memcpy(&bits, &f, 4);
+    Wr32(out + 4 * i, bits);
+  }
+  return out;
+}
+
 // ---- maths -----------------------------------------------------------------------------
 // In single precision, operations in the order D3DX evaluates them (built
 // without FMA contraction, see CMakeLists.txt): the game's own maths uses
@@ -586,6 +784,156 @@ uint32_t NewConstantTable(const hlsl::Program& p, uint32_t version) {
   for (const auto& k : p.constants) t->names.push_back(GuestString(k.name));
   t->creator = GuestString("SwARc HLSL translator");
   return com::Publish(t, ConstantTableVtable());
+}
+
+// The constant table compiled shader bytecode carries: the comment token
+// (0xFFFE, length in DWORDs in bits 16-30) whose data starts 'CTAB'. Its
+// offsets are from the start of that data. D3DXSHADER_CONSTANTTABLE: Size,
+// Creator, Version, Constants, ConstantInfo, Flags, Target;
+// D3DXSHADER_CONSTANTINFO (20 bytes): Name, RegisterSet, RegisterIndex,
+// RegisterCount, Reserved (WORDs), TypeInfo, DefaultValue;
+// D3DXSHADER_TYPEINFO: Class, Type, Rows, Columns, Elements, StructMembers
+// (WORDs), StructMemberInfo. Top-level constants only, as above.
+bool ParseCtab(uint32_t fn, std::vector<hlsl::Constant>* out, std::string* creator) {
+  constexpr uint32_t kCtab = 0x42415443;  // 'CTAB'
+  uint32_t p = fn + 4;                    // past the version token
+  for (int guard = 0; guard < 4096; guard++) {
+    uint32_t tok = Rd32(p);
+    if (tok == 0x0000FFFF) return false;  // END: no table
+    if ((tok & 0xFFFF) != 0xFFFE) return false;  // past the comments
+    uint32_t len = (tok >> 16) & 0x7FFF;
+    if (len >= 1 && Rd32(p + 4) == kCtab) {
+      uint32_t base = p + 8, bytes = 4 * (len - 1);
+      auto in = [&](uint32_t off, uint32_t n) { return off <= bytes && n <= bytes - off; };
+      auto str = [&](uint32_t off) { return in(off, 1) ? GStr(base + off) : std::string(); };
+      if (!in(0, 28)) return false;
+      *creator = str(Rd32(base + 4));
+      uint32_t n = Rd32(base + 12), info = Rd32(base + 16);
+      if (!in(info, 20 * n)) return false;
+      for (uint32_t i = 0; i < n; i++) {
+        uint32_t ci = base + info + 20 * i;
+        hlsl::Constant k;
+        k.name = str(Rd32(ci));
+        k.set = hlsl::RegisterSet(Rd16(ci + 4));
+        k.index = Rd16(ci + 6);
+        k.count = Rd16(ci + 8);
+        uint32_t ti = Rd32(ci + 12);
+        if (in(ti, 16)) {
+          k.cls = hlsl::ParamClass(Rd16(base + ti));
+          k.type = hlsl::ParamType(Rd16(base + ti + 2));
+          k.rows = Rd16(base + ti + 4);
+          k.columns = Rd16(base + ti + 6);
+          k.elements = std::max<uint32_t>(1, Rd16(base + ti + 8));
+          k.struct_members = Rd16(base + ti + 10);
+        }
+        k.bytes = k.cls == hlsl::ParamClass::Object ? 4 * k.elements
+                                                     : 4 * k.rows * k.columns * k.elements;
+        out->push_back(std::move(k));
+      }
+      return true;
+    }
+    p += 4 * (len + 1);
+  }
+  return false;
+}
+
+// (pShader, EnableColorCode, pComments, ppDisassembly): a listing with the
+// shader model line and D3DX's closing "approximately N instruction slots
+// used" comment, which is what callers read from it (to log instruction
+// counts); the instructions themselves are not listed. N counts real
+// bytecode's instructions (not dcl/def); a D3DXCompileShader translation has
+// none to count.
+HLE("d3dx9_35.dll", D3DXDisassembleShader, 4) {
+  uint32_t fn = Arg(c, 0), out = Arg(c, 3);
+  if (!fn || !out) return D3DERR_INVALIDCALL;
+  Wr32(out, 0);
+  const uint32_t version = Rd32(fn);
+  const bool pixel = (version >> 16) == 0xFFFF;
+  if (!pixel && (version >> 16) != 0xFFFE) return D3DXERR_INVALIDDATA;
+  uint32_t count = 0;
+  uint32_t p = fn + 4;
+  for (int guard = 0; guard < 65536; guard++) {
+    uint32_t tok = Rd32(p);
+    uint32_t op = tok & 0xFFFF;
+    if (op == 0xFFFF) break;                         // END
+    if (op == 0xFFFE) {                              // comment
+      p += 4 * (((tok >> 16) & 0x7FFF) + 1);
+      continue;
+    }
+    if (op != 0x1F && op != 0x51 && op != 0x30 && op != 0x2F) count++;  // not dcl/def/defi/defb
+    p += 4 * (((tok >> 24) & 0xF) + 1);
+  }
+  char text[128];
+  std::snprintf(text, sizeof text, "    %s_%u_%u\n\n// approximately %u instruction slots used\n",
+                pixel ? "ps" : "vs", (version >> 8) & 0xFF, version & 0xFF, count);
+  Wr32(out, NewXBuffer(text, uint32_t(std::strlen(text) + 1)));
+  return D3D_OK;
+}
+
+// (pFunction, pSemantics, pCount): the shader's input registers as
+// D3DXSEMANTIC {Usage, UsageIndex}, in declaration order: its dcl
+// instructions whose register is an input (v#, and ps_2's t#); samplers and
+// outputs are left out. pSemantics may be null (the count only).
+HLE("d3dx9_35.dll", D3DXGetShaderInputSemantics, 3) {
+  uint32_t fn = Arg(c, 0), out = Arg(c, 1), pcount = Arg(c, 2);
+  if (!fn) return D3DERR_INVALIDCALL;
+  const uint32_t version = Rd32(fn);
+  if ((version >> 16) != 0xFFFF && (version >> 16) != 0xFFFE) return D3DXERR_INVALIDDATA;
+  uint32_t n = 0, p = fn + 4;
+  for (int guard = 0; guard < 65536; guard++) {
+    uint32_t tok = Rd32(p), op = tok & 0xFFFF;
+    if (op == 0xFFFF) break;
+    if (op == 0xFFFE) {
+      p += 4 * (((tok >> 16) & 0x7FFF) + 1);
+      continue;
+    }
+    uint32_t len = (tok >> 24) & 0xF;
+    if (op == 0x1F && len >= 2) {  // dcl: usage token, then the register
+      uint32_t usage = Rd32(p + 4), reg = Rd32(p + 8);
+      uint32_t type = ((reg >> 28) & 7) | ((reg >> 8) & 0x18);
+      if (type == 1 /* INPUT */ || type == 3 /* TEXTURE (ps_2) */) {
+        if (out) {
+          Wr32(out + 8 * n, usage & 0x1F);
+          Wr32(out + 8 * n + 4, (usage >> 16) & 0xF);
+        }
+        n++;
+      }
+    }
+    p += 4 * (len + 1);
+  }
+  if (pcount) Wr32(pcount, n);
+  return D3D_OK;
+}
+
+// (pFunction, ppConstantTable): the table compiled bytecode carries;
+// D3DXERR_INVALIDDATA without one (as for D3DXCompileShader's translated
+// functions, which come with their table from D3DXCompileShader itself).
+HLE("d3dx9_35.dll", D3DXGetShaderConstantTable, 2) {
+  uint32_t fn = Arg(c, 0), out = Arg(c, 1);
+  if (!fn || !out) return D3DERR_INVALIDCALL;
+  Wr32(out, 0);
+  std::vector<hlsl::Constant> ks;
+  std::string creator;
+  if (!ParseCtab(fn, &ks, &creator)) {
+    // A function D3DXCompileShader made (d3d9_resource.cpp's translated
+    // form) carries its Program, constants included, instead of a CTAB.
+    const uint32_t head = Rd32(fn + 4);
+    if ((head & 0xFFFF) != 0xFFFE || Rd32(fn + 8) != kTranslatedTag) return D3DXERR_INVALIDDATA;
+    std::vector<uint32_t> tokens(2 + ((head >> 16) & 0x7FFF) + 1);
+    for (size_t i = 0; i < tokens.size(); i++) tokens[i] = Rd32(fn + 4 * uint32_t(i));
+    auto prog = ReadTranslated(tokens);
+    if (!prog) return D3DXERR_INVALIDDATA;
+    ks = prog->constants;
+    creator = "Microsoft (R) HLSL Shader Compiler";
+  }
+  auto t = std::make_shared<ConstantTable>();
+  t->version = Rd32(fn);
+  t->constants = std::move(ks);
+  t->handles = HeapAllocProcess(std::max<uint32_t>(uint32_t(t->constants.size()), 1), true);
+  for (const auto& k : t->constants) t->names.push_back(GuestString(k.name));
+  t->creator = GuestString(creator);
+  Wr32(out, com::Publish(t, ConstantTableVtable()));
+  return D3D_OK;
 }
 
 ConstantTable* Table(Ctx& c) {
