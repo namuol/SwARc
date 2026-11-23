@@ -235,6 +235,12 @@ std::atomic<int32_t> g_real_x{0}, g_real_y{0};
 // it steers its own pointer by relative motion).
 std::atomic<int64_t> g_last_recentre_ms{-100000};
 std::atomic<int32_t> g_recentre_x{0}, g_recentre_y{0};  // screen coordinates
+// Mouse look's re-centring of the host pointer (SDL_WarpMouseInWindow):
+// where it went, and whether its motion event is still to come.
+bool g_warp_echo = false;
+float g_warp_x = 0, g_warp_y = 0;
+// Mouse-look motion past the screen's edge, for after the next re-centre.
+std::atomic<int32_t> g_look_carry_x{0}, g_look_carry_y{0};
 bool g_sdl_up = false;
 std::thread::id g_main_thread_id = std::this_thread::get_id();
 
@@ -665,7 +671,11 @@ void StartMouseLook() {
     std::lock_guard<std::recursive_mutex> l(g_mu);
     if ((g_look && Win(g_look)) || !g_active) return;  // a destroyed one ended it
     Window* w = Win(g_active);
-    if (!w || !w->sdl || w->mode_w) return;  // exclusive mode has its own
+    // Exclusive (fullscreen) mode too: its virtual cursor already follows
+    // relative motion while the game re-centres it, but an ungrabbed host
+    // pointer stops at the edge of the screen and with it the motion, so
+    // mouse look could only turn so far.
+    if (!w || !w->sdl) return;
     g_look = g_active;
     grab = w->sdl;
   }
@@ -812,7 +822,29 @@ void HandleSdlEvent(const SDL_Event& e) {
       // onto its screen, so its own cursor stays under the real one.
       bool relative = e.motion.which == kTestRelative ||
                       int64_t(TickCount()) - g_last_recentre_ms <= 250;
+      // The echo of our own re-centring warp (below) is no motion.
+      if (g_warp_echo && std::fabs(e.motion.x - g_warp_x) < 1 && std::fabs(e.motion.y - g_warp_y) < 1) {
+        g_warp_echo = false;
+        break;
+      }
       if (clipped || (relative && (ExclusiveSize(h, &mw, &mh) || LookSize(h, &mw, &mh)))) {
+        // The host pointer should be held still by the grab (SDL's relative
+        // mode), but on macOS it can still drift, and at the edge of the
+        // screen its motion stops: mouse look could only turn so far. Near
+        // an edge it goes back to the window's centre.
+        if (!Background() && e.motion.which != kTestRelative)
+          if (SDL_Window* sw = SDL_GetWindowFromID(e.motion.windowID)) {
+            int pw = 0, ph = 0;
+            SDL_GetWindowSize(sw, &pw, &ph);
+            if (pw > 8 && ph > 8 &&
+                (e.motion.x < pw / 4.0f || e.motion.x > pw * 3 / 4.0f ||
+                 e.motion.y < ph / 4.0f || e.motion.y > ph * 3 / 4.0f)) {
+              g_warp_x = pw / 2.0f;
+              g_warp_y = ph / 2.0f;
+              g_warp_echo = true;
+              SDL_WarpMouseInWindow(sw, g_warp_x, g_warp_y);
+            }
+          }
         // Virtual cursor: the game recentres it with SetCursorPos every
         // frame and steers its own pointer by the difference, as on a
         // fullscreen Windows desktop. Real motion moves the virtual
@@ -827,13 +859,20 @@ void HandleSdlEvent(const SDL_Event& e) {
         int dx = int(fx), dy = int(fy);
         fx -= dx;
         fy -= dy;
+        int l = ox, t = oy, r = ox + mw - 1, b = oy + mh - 1;
         if (clipped) {
-          g_mouse_x = std::clamp(g_mouse_x + dx, g_clip.l, std::max(g_clip.l, g_clip.r - 1));
-          g_mouse_y = std::clamp(g_mouse_y + dy, g_clip.t, std::max(g_clip.t, g_clip.b - 1));
-        } else {
-          g_mouse_x = std::clamp(g_mouse_x + dx, ox, ox + mw - 1);
-          g_mouse_y = std::clamp(g_mouse_y + dy, oy, oy + mh - 1);
+          l = g_clip.l, t = g_clip.t;
+          r = std::max(g_clip.l, g_clip.r - 1), b = std::max(g_clip.t, g_clip.b - 1);
         }
+        // Motion past the edge is kept for the game's next reads
+        // (GetCursorPos, after it re-centres): a fast swipe can cover more than the distance from
+        // the centre to the edge in one frame, and Windows' higher frame
+        // rates rarely let it. Dropped, it would cap how fast mouse look turns.
+        int nx = g_mouse_x + dx, ny = g_mouse_y + dy;
+        g_mouse_x = std::clamp(nx, l, r);
+        g_mouse_y = std::clamp(ny, t, b);
+        g_look_carry_x += nx - g_mouse_x;
+        g_look_carry_y += ny - g_mouse_y;
       } else {
         int x = int((e.motion.x - cm.x0) * cm.kx), y = int((e.motion.y - cm.y0) * cm.ky);
         if (e.motion.which == kTestPointer) {  // already client pixels
@@ -1219,6 +1258,11 @@ void EnsureSdlVideo() {
   // Leave SIGINT/SIGTERM alone: SDL would turn them into quit events the
   // game may ignore, making the process hard to stop.
   SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
+  // While the pointer is grabbed (mouse look, a clip, DirectInput) its
+  // motion keeps the system's pointer acceleration, as the ungrabbed
+  // pointer has: otherwise the same mouse turns more slowly the moment it
+  // is grabbed.
+  SDL_SetHint(SDL_HINT_MOUSE_RELATIVE_SYSTEM_SCALE, "1");
   if (!SDL_Init(SDL_INIT_VIDEO)) FatalF("SDL_Init: %s", SDL_GetError());
   g_sdl_up = true;
   platform::AddPlayerMenu();  // an installed app's Check for Updates, Uninstall...
@@ -4406,6 +4450,20 @@ bool SyncedCursorPos(int32_t* sx, int32_t* sy) {
 }
 
 HLE64("user32.dll", GetCursorPos, 1) {
+  // Mouse-look motion that ran past the edge (a fast swipe), as far as
+  // this read has room for; the rest waits for the next re-centre and
+  // read. Only while the game keeps re-centring: a stale remainder goes.
+  if (int64_t(TickCount()) - g_last_recentre_ms <= 250) {
+    const int sw = g_display_w, sh = g_display_h;
+    int cx = std::clamp(int(g_look_carry_x), -int(g_mouse_x), std::max(0, sw - 1 - g_mouse_x));
+    int cy = std::clamp(int(g_look_carry_y), -int(g_mouse_y), std::max(0, sh - 1 - g_mouse_y));
+    g_mouse_x += cx;
+    g_mouse_y += cy;
+    g_look_carry_x -= cx;
+    g_look_carry_y -= cy;
+  } else {
+    g_look_carry_x = g_look_carry_y = 0;
+  }
   int32_t x = g_mouse_x, y = g_mouse_y;
   SyncedCursorPos(&x, &y);
   Wr32(Arg(c, 0), uint32_t(x));
