@@ -1579,6 +1579,11 @@ void r_color0(inout vec4 c) {
     if (k.cull != SDL_GPU_CULLMODE_NONE)
       k.cull = state.rs[22] == 2 ? SDL_GPU_CULLMODE_FRONT : SDL_GPU_CULLMODE_BACK;
     k.front = SDL_GPU_FRONTFACE_CLOCKWISE;
+    if (k.cull != SDL_GPU_CULLMODE_NONE && (((state.rs[168] & 0xF) == 0 && std::getenv("CRYSIS_FLIP_SHADOW_CULL")) || std::getenv("CRYSIS_FLIP_ALL_CULL"))) {  // TEMP experiment
+      static bool once = false;
+      if (!once) { once = true; WarnF("TEMP flipping cull in depth-only passes\n"); }
+      k.cull = k.cull == SDL_GPU_CULLMODE_FRONT ? SDL_GPU_CULLMODE_BACK : SDL_GPU_CULLMODE_FRONT;
+    }
     for (int i = 1; i < 4; i++) k.mask[i - 1] = i < pass_targets_ ? uint8_t(state.rs[189 + i] & 0xF) : 0;
     sc.key.vs = d.vs;
     sc.key.ps = d.ps;  // or its variant (below, after the samplers)
@@ -3686,6 +3691,8 @@ void r_color0(inout vec4 c) {
       k.cull = SDL_GPU_CULLMODE_BACK;
       k.front = SDL_GPU_FRONTFACE_CLOCKWISE;
     }
+    if (tri && !pass_color_ && (st.rs[22] == 2 || st.rs[22] == 3) && std::getenv("CRYSIS_FLIP_SHADOW_CULL"))  // TEMP experiment
+      k.front = k.front == SDL_GPU_FRONTFACE_CLOCKWISE ? SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE : SDL_GPU_FRONTFACE_CLOCKWISE;
     if (st.rs[27]) {
       k.blend = 1;
       uint32_t s = st.rs[19], d = st.rs[20];
@@ -3718,6 +3725,7 @@ void r_color0(inout vec4 c) {
       float bias = AsFloat(st.rs[195]) - float(st.rs[47]) * 0.000005f;
       k.bias_const = bias * pass_bias_scale_;
       k.bias_slope = AsFloat(st.rs[175]);
+      if (const char* e = std::getenv("CRYSIS_SLOPE_MUL")) k.bias_slope *= float(std::atof(e));  // TEMP experiment
     }
     return k;
   }

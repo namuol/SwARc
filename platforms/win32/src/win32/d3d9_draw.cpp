@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <cstring>
 #include <set>
+#include <tuple>
 #include <string>
 #include <vector>
 
@@ -805,6 +806,17 @@ void Draw(Device& d, gfx::ShaderDraw& sd, const char* what) {
   const gfx::FfState state = DrawState(d, false);
   sd.state = &state;
   BindTargets(d);
+  {  // TEMP diagnostic: not for landing. Depth-bias states of draws into depth textures (shadow maps).
+    auto* ds = com::As<Surface>(d.depth_stencil);
+    if (std::getenv("CRYSIS_PROBE") && ds && ds->kind == Surface::Kind::TextureLevel) {
+      static std::set<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>> seen;
+      if (seen.insert({ds->desc.Width, d.rs[195], d.rs[175], d.rs[22], d.rs[23]}).second)
+        ProbeLog("TEMP shadow-map draw: %ux%u fmt %u bias %g slope %g cull %u zf %u cw %X vp %u,%u %ux%u minz %g maxz %g\n",
+                 ds->desc.Width, ds->desc.Height, ds->desc.Format, *reinterpret_cast<const float*>(&d.rs[195]),
+                 *reinterpret_cast<const float*>(&d.rs[175]), d.rs[22], d.rs[23], d.rs[168], d.viewport.X,
+                 d.viewport.Y, d.viewport.Width, d.viewport.Height, d.viewport.MinZ, d.viewport.MaxZ);
+    }
+  }
   // TEMP diagnostic: not for landing. The probe pixel of an 8-bit target before the draw.
   static uint32_t probe_pre8 = 0;
   static bool probe_pre8_ok = false;
@@ -941,6 +953,10 @@ void Draw(Device& d, gfx::ShaderDraw& sd, const char* what) {
         ProbeLog("  TEMP probe8 kind %d fmt %u %016llx prim %u n %u: %08X\n", int(rt->kind),
                      rt->desc.Format, (unsigned long long)fnv, sd.prim, sd.primitives, px);
         ProbeLog("    TEMP probe8 rt texture %p\n", rt->kind == Surface::Kind::TextureLevel ? (void*)rt->texture : nullptr);
+        for (int sm = 0; sm < 4; sm++)
+          if (auto* t = com::As<Texture>(d.textures[sm]))
+            ProbeLog("    TEMP probe8 s%d: %ux%u fmt %u levels %u usage %X\n", sm, t->width, t->height, t->format,
+                     t->levels, t->usage);
         ProbeLog("    TEMP probe8 state: rt %p z %u zw %u zf %u cull %u st %u sf %u sref %u smask %X swmask %X "
                  "sfail %u szfail %u spass %u two %u ccwf %u ccwzf %u ccwp %u ccwfn %u cw %X ab %u sb %u db %u "
                  "sc %u\n", (void*)rt, d.rs[7], d.rs[14], d.rs[23], d.rs[22], d.rs[52], d.rs[56], d.rs[57], d.rs[58],
