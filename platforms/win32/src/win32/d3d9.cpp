@@ -57,6 +57,9 @@ gfx::Format FormatFromD3D(uint32_t f) {
     case D3DFMT_DXT3: return F::DXT3;
     case D3DFMT_DXT4: return F::DXT4;
     case D3DFMT_DXT5: return F::DXT5;
+    // ATI2 ('ATI2', 3Dc): BC5, its two channels in the other order (the
+    // uploads swap each block's halves, d3d9_resource.cpp).
+    case kD3DFmtAti2: return F::Bc5;
     case D3DFMT_R16F: return F::R16F;
     case D3DFMT_G16R16F: return F::G16R16F;
     case D3DFMT_A16B16G16R16F: return F::A16B16G16R16F;
@@ -833,7 +836,15 @@ HLE_NAMED("d3d9.dll", "IDirect3DDevice9::Present", D3DDev9_Present, 5) {
     BindTargets(*d);
   }
   DrawCursor(*d);
+  // The dev aids (screenshots, probes) read the bound target: the back
+  // buffer, which is what is presented, not whichever target the game left
+  // bound (an offscreen one at the end of many games' frames).
+  {
+    gfx::ColorTarget back[4] = {};
+    d->gfx->SetRenderTargets(back, 0);
+  }
   PresentFrame(*d->gfx, int(d->pp.BackBufferWidth), int(d->pp.BackBufferHeight));
+  BindTargets(*d);
   return D3D_OK;
 }
 

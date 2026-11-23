@@ -554,16 +554,100 @@ void Draw(Device& d, gfx::ShaderDraw& sd, const char* what) {
   sd.inputs = inputs.data();
   sd.input_count = uint32_t(inputs.size());
 
+  // Instancing (SetStreamSourceFreq): stream 0's D3DSTREAMSOURCE_INDEXEDDATA
+  // count of instances; INSTANCEDATA streams advance once per `n`
+  // instances instead of per vertex.
+  constexpr uint32_t kIndexedData = 0x40000000u, kInstanceData = 0x80000000u;
+  uint32_t instances = 1, per_instance[16] = {};
   for (int s = 0; s < 16; s++) {
     const Device::Stream& st = d.streams[s];
-    if (st.freq != 1 && st.buffer)
-      FatalF("d3d9: %s with stream %d frequency %08X (instancing is not supported yet)", what, s,
-             st.freq);
+    if (st.freq != 1 && st.buffer) {
+      if (s == 0 && (st.freq & kIndexedData) && (st.freq & 0x3FFFFFFFu)) {
+        instances = st.freq & 0x3FFFFFFFu;
+      } else if (s > 0 && (st.freq & kInstanceData) && (st.freq & 0x3FFFFFFFu)) {
+        per_instance[s] = st.freq & 0x3FFFFFFFu;
+      } else {
+        FatalF("d3d9: %s with stream %d frequency %08X: not supported", what, s, st.freq);
+      }
+    }
     if (sd.streams[s].data) continue;  // given by the caller (UP draws)
     auto* b = com::As<Buffer>(st.buffer);
     if (!b || st.offset >= b->length) continue;
     sd.streams[s] = {static_cast<const uint8_t*>(GPtr(b->mem)) + st.offset, b->length - st.offset,
                      st.stride};
+  }
+  // An instanced draw becomes one ordinary draw of every instance's copy:
+  // per-vertex streams' vertices repeated per instance, per-instance
+  // streams' element for that instance repeated over its copy's vertices,
+  // and the indices offset per copy (32-bit). Exact; the GPU backend need
+  // not know about instancing.
+  std::vector<std::vector<uint8_t>> expanded;
+  std::vector<uint32_t> expanded_indices, strip_indices;
+  if (instances > 1 || std::any_of(per_instance, per_instance + 16, [](uint32_t n) { return n; })) {
+    // A non-indexed strip or fan becomes an indexed triangle list (strips
+    // keep D3D's alternating winding), so each copy stays separate.
+    if (sd.prim == 3 || sd.prim == 5 || sd.prim == 6) {
+      const void* src = sd.indices;
+      const uint32_t isz = sd.index_size;
+      auto at = [&](uint32_t k) -> uint32_t {
+        if (!src) return k;
+        return isz == 4 ? static_cast<const uint32_t*>(src)[k] : static_cast<const uint16_t*>(src)[k];
+      };
+      strip_indices.reserve(size_t(sd.primitives) * 3);
+      for (uint32_t i = 0; i < sd.primitives; i++) {
+        if (sd.prim == 3) {  // line strip -> line list
+          strip_indices.insert(strip_indices.end(), {at(i), at(i + 1)});
+        } else if (sd.prim == 6) {
+          strip_indices.insert(strip_indices.end(), {at(0), at(i + 1), at(i + 2)});
+        } else if (i & 1) {
+          strip_indices.insert(strip_indices.end(), {at(i + 1), at(i), at(i + 2)});
+        } else {
+          strip_indices.insert(strip_indices.end(), {at(i), at(i + 1), at(i + 2)});
+        }
+      }
+      if (!src) sd.min_index = 0;
+      sd.indices = strip_indices.data();
+      sd.index_size = 4;
+      sd.prim = sd.prim == 3 ? 2 : 4;
+    }
+    // List types only: each instance's copy is a whole number of primitives
+    // (strips and fans would join one copy to the next).
+    const bool list = sd.prim == 1 || sd.prim == 2 || sd.prim == 4;  // point/line/triangle list
+    if (!list)
+      FatalF("d3d9: instanced %s of primitive type %u (%s): not supported yet", what, sd.prim,
+             sd.indices ? "indexed" : "not indexed");
+    const uint32_t vc = sd.vertex_count, first = uint32_t(sd.base_vertex) + sd.min_index;
+    const uint32_t ni = VerticesFor(sd.prim, sd.primitives);
+    for (int s = 0; s < 16; s++) {
+      gfx::VertexStream& vs_ = sd.streams[s];
+      if (!vs_.data || !vs_.stride) continue;
+      std::vector<uint8_t> out(size_t(instances) * vc * vs_.stride, 0);
+      for (uint32_t i = 0; i < instances; i++) {
+        for (uint32_t v = 0; v < vc; v++) {
+          uint64_t src = per_instance[s] ? uint64_t(i / per_instance[s]) * vs_.stride
+                                         : uint64_t(first + v) * vs_.stride;
+          uint8_t* dst = out.data() + (size_t(i) * vc + v) * vs_.stride;
+          if (src + vs_.stride <= vs_.size) std::memcpy(dst, vs_.data + src, vs_.stride);
+        }
+      }
+      expanded.push_back(std::move(out));
+      vs_ = {expanded.back().data(), uint32_t(expanded.back().size()), vs_.stride};
+    }
+    if (sd.indices) expanded_indices.resize(size_t(instances) * ni);
+    for (uint32_t k = 0; sd.indices && k < ni; k++) {
+      uint32_t idx = sd.index_size == 4 ? static_cast<const uint32_t*>(sd.indices)[k]
+                                        : static_cast<const uint16_t*>(sd.indices)[k];
+      uint32_t local = idx >= sd.min_index ? idx - sd.min_index : 0;
+      for (uint32_t i = 0; i < instances; i++) expanded_indices[size_t(i) * ni + k] = i * vc + local;
+    }
+    if (sd.indices) {
+      sd.indices = expanded_indices.data();
+      sd.index_size = 4;
+    }
+    sd.base_vertex = 0;
+    sd.min_index = 0;
+    sd.vertex_count = instances * vc;
+    sd.primitives *= instances;
   }
 
   // No pixel shader: the fixed-function pixel stage, generated (its own
@@ -711,6 +795,27 @@ HLE_NAMED("d3d9.dll", "IDirect3DDevice9::StretchRect", D3DDev9_StretchRect, 6) {
   // D3DTEXF_LINEAR (2) filters; NONE and POINT take the nearest texel.
   d->gfx->StretchRect(s, SurfaceRect(src, Arg(c, 2)), t, SurfaceRect(dst, Arg(c, 4)),
                       Arg(c, 5) >= 2);
+  return D3D_OK;
+}
+
+// (pSurface, pRect, Color): an A8R8G8B8 fill of a render target's rectangle
+// (all of it without one). Render-target surfaces and the top level of a 2D
+// render-target texture; other kinds are fatal and named.
+HLE_NAMED("d3d9.dll", "IDirect3DDevice9::ColorFill", D3DDev9_ColorFill, 4) {
+  Device* d = Dev(c);
+  auto* s = com::As<Surface>(Arg(c, 1));
+  if (!s) return D3DERR_INVALIDCALL;
+  gfx::TextureId t = 0;
+  if (s->kind == Surface::Kind::RenderTarget) {
+    t = s->tex;
+  } else if (s->kind == Surface::Kind::TextureLevel && s->level == 0 && !s->texture->cube &&
+             (s->texture->usage & D3DUSAGE_RENDERTARGET)) {
+    t = s->texture->tex;
+  } else {
+    FatalF("d3d9: ColorFill on a surface of kind %d, level %d: not supported yet", int(s->kind),
+           s->level);
+  }
+  d->gfx->FillTexture(t, SurfaceRect(s, Arg(c, 2)), Arg(c, 3));
   return D3D_OK;
 }
 

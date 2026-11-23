@@ -137,10 +137,29 @@ void UploadLevel(Texture& t, uint32_t face, uint32_t level, gfx::Rect r) {
     off = uint32_t(r.top) * l.pitch + uint32_t(r.left) * gfx::BitsPerPixel(t.fmt) / 8;
   }
   gfx::Device* g = DeviceOf(t.device)->gfx.get();
+  const void* src = GPtr(l.mem + off);
+  uint32_t pitch = l.pitch;
+  std::vector<uint8_t> swapped;
+  if (t.format == kD3DFmtAti2) {
+    // BC5 with the red and green blocks of each 16-byte block exchanged.
+    const uint32_t row = gfx::RowPitch(t.fmt, uint32_t(r.right - r.left));
+    const uint32_t rows = gfx::RowCount(t.fmt, uint32_t(r.bottom - r.top));
+    swapped.resize(size_t(row) * rows);
+    for (uint32_t y = 0; y < rows; y++) {
+      const uint8_t* s = static_cast<const uint8_t*>(src) + size_t(y) * l.pitch;
+      uint8_t* dst = swapped.data() + size_t(y) * row;
+      for (uint32_t b = 0; b + 16 <= row; b += 16) {
+        std::memcpy(dst + b, s + b + 8, 8);
+        std::memcpy(dst + b + 8, s + b, 8);
+      }
+    }
+    src = swapped.data();
+    pitch = row;
+  }
   if (t.cube)
-    g->UpdateCubeTexture(t.tex, int(face), int(level), r, GPtr(l.mem + off), l.pitch);
+    g->UpdateCubeTexture(t.tex, int(face), int(level), r, src, pitch);
   else
-    g->UpdateTexture(t.tex, int(level), r, GPtr(l.mem + off), l.pitch);
+    g->UpdateTexture(t.tex, int(level), r, src, pitch);
 }
 
 // A lock rectangle of a w x h image: inside it and not empty; compressed
@@ -176,6 +195,7 @@ uint32_t LockLevel(Texture& t, uint32_t face, uint32_t level, uint32_t out, uint
   l.locked_rect = r;
   l.lock_readonly = (flags & (D3DLOCK_READONLY | D3DLOCK_NO_DIRTY_UPDATE)) != 0;
   *G<D3DLOCKED_RECT>(out) = {INT(l.pitch), l.mem + off};
+  RECOMP_TRACE("  locked level %u: memory %08X, pitch %u, %ux%u\n", level, l.mem, l.pitch, l.w, l.h);
   return D3D_OK;
 }
 
@@ -371,6 +391,83 @@ uint32_t NewTexture(Device& d, uint32_t device, bool cube, uint32_t w, uint32_t 
   return D3D_OK;
 }
 
+// Volume textures: the formats whose memory layout is the GPU's
+// (UpdateImage uploads their slices as is: A8R8G8B8, the float ones and the
+// block-compressed ones), and those UnlockBox converts to A8R8G8B8 as 2D
+// textures are (gfx::DecodePixel's: X8R8G8B8 with its alpha opaque, A8, L8,
+// A8L8, the 16-bit RGB ones).
+bool VolumeConverted(gfx::Format f) {
+  switch (f) {
+    case gfx::Format::X8R8G8B8: case gfx::Format::A8: case gfx::Format::L8:
+    case gfx::Format::A8L8: case gfx::Format::R5G6B5: case gfx::Format::X1R5G5B5:
+    case gfx::Format::A1R5G5B5: case gfx::Format::A4R4G4B4: case gfx::Format::X4R4G4B4:
+      return true;
+    default:
+      return false;
+  }
+}
+bool VolumeFormat(uint32_t fmt, gfx::Format f) {
+  return fmt == D3DFMT_A8R8G8B8 || gfx::IsFloat(f) || gfx::IsCompressed(f) || VolumeConverted(f);
+}
+
+uint32_t NewVolumeTexture(Device& d, uint32_t device, uint32_t w, uint32_t h, uint32_t depth,
+                          uint32_t levels, uint32_t usage, uint32_t fmt, uint32_t pool,
+                          uint32_t* out) {
+  *out = 0;
+  gfx::Format f = FormatFromD3D(fmt);
+  if (!w || !h || !depth || f == gfx::Format::Unknown || !VolumeFormat(fmt, f) ||
+      (usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_AUTOGENMIPMAP))) {
+    WarnF("d3d9: CreateVolumeTexture %ux%ux%u fmt %X usage %X pool %u: not supported\n", w, h,
+          depth, fmt, usage, pool);
+    return D3DERR_INVALIDCALL;
+  }
+  uint32_t full = 1;
+  for (uint32_t s = std::max(std::max(w, h), depth); s > 1; s >>= 1) full++;
+  if (!levels || levels > full) levels = full;
+  auto t = std::make_shared<Texture>();
+  t->device = device;
+  t->volume = true;
+  t->width = w;
+  t->height = h;
+  t->depth = depth;
+  t->levels = levels;
+  t->usage = usage;
+  t->format = fmt;
+  t->pool = pool;
+  t->fmt = f;
+  for (uint32_t i = 0; i < levels; i++) {
+    Texture::Level l;
+    l.w = std::max(1u, w >> i);
+    l.h = std::max(1u, h >> i);
+    l.d = std::max(1u, depth >> i);
+    l.pitch = gfx::RowPitch(f, l.w);
+    l.slice = l.pitch * gfx::RowCount(f, l.h);
+    l.size = l.slice * l.d;
+    t->lv.push_back(l);
+  }
+  if (pool == D3DPOOL_DEFAULT) {
+    uint64_t bytes = 0;
+    for (const Texture::Level& l : t->lv) bytes += l.size;
+    if (!ChargeVram(d, bytes)) return 0x8876017C;  // D3DERR_OUTOFVIDEOMEMORY
+    t->vram = bytes;
+  }
+  if (pool != D3DPOOL_SYSTEMMEM && pool != D3DPOOL_SCRATCH) {
+    gfx::ImageDesc id;
+    id.w = int(w);
+    id.h = int(h);
+    id.layers = int(depth);
+    id.levels = int(levels);
+    id.fmt = f;
+    id.kind = gfx::TextureKind::Tex3D;
+    t->tex = d.gfx->CreateImage(id);
+    if (!t->tex) return 0x8876017C;  // D3DERR_OUTOFVIDEOMEMORY
+  }
+  *out = com::Publish(t, VolumeTextureVtable());
+  RECOMP_TRACE("  CreateVolumeTexture %ux%ux%u x%u fmt %X usage %X pool %u -> %08X\n", w, h, depth,
+               levels, fmt, usage, pool, *out);
+  return D3D_OK;
+}
+
 void FillLevel(Texture& t, uint32_t face, uint32_t level, const uint8_t* src,
                uint32_t pitch) {
   Texture::Level& l = t.At(face, level);
@@ -379,6 +476,20 @@ void FillLevel(Texture& t, uint32_t face, uint32_t level, const uint8_t* src,
   for (uint32_t y = 0; y < rows; y++)
     std::memcpy(GPtr(l.mem + y * l.pitch), src + size_t(y) * pitch, row);
   if (t.tex) UploadLevel(t, face, level, {0, 0, int32_t(l.w), int32_t(l.h)});
+}
+
+void WriteLevelRect(Texture& t, uint32_t face, uint32_t level, const gfx::Rect& r,
+                    const uint8_t* src, uint32_t pitch) {
+  Texture::Level& l = t.At(face, level);
+  if (!l.mem) l.mem = HeapAllocProcess(l.size, true);
+  const bool bc = gfx::IsCompressed(t.fmt);
+  const uint32_t x0 = uint32_t(bc ? r.left / 4 : r.left), y0 = uint32_t(bc ? r.top / 4 : r.top);
+  const uint32_t row = gfx::RowPitch(t.fmt, uint32_t(r.right - r.left));
+  const uint32_t rows = gfx::RowCount(t.fmt, uint32_t(r.bottom - r.top));
+  const uint32_t unit = bc ? gfx::RowPitch(t.fmt, 4) : gfx::BitsPerPixel(t.fmt) / 8;
+  for (uint32_t y = 0; y < rows; y++)
+    std::memcpy(GPtr(l.mem + (y0 + y) * l.pitch + x0 * unit), src + size_t(y) * pitch, row);
+  if (t.tex) UploadLevel(t, face, level, r);
 }
 
 uint32_t NewSurface(Device& d, uint32_t device, Surface::Kind kind, uint32_t w,
@@ -553,12 +664,17 @@ HLE_NAMED("d3d9.dll", "IDirect3DDevice9::CreateVertexDeclaration", D3DDev9_Creat
 
 // <ID>_SHADER_DUMP=dir: shaders created from compiled bytecode are written
 // to dir/<FNV-1a>.vso / .pso, as D3D9 tokens (recomp_hlslc reads them).
-void DumpBytecode(const Shader& s) {
-  const char* dir = Env("SHADER_DUMP");
-  if (!dir || !*dir) return;
+uint64_t TokenHash(const Shader& s) {
   uint64_t h = 1469598103934665603ull;
   for (uint32_t t : s.tokens)
     for (int i = 0; i < 4; i++) h = (h ^ ((t >> (8 * i)) & 0xFF)) * 1099511628211ull;
+  return h;
+}
+
+void DumpBytecode(const Shader& s) {
+  const char* dir = Env("SHADER_DUMP");
+  if (!dir || !*dir) return;
+  const uint64_t h = TokenHash(s);
   char path[512];
   std::snprintf(path, sizeof path, "%s/%016llx.%s", dir, (unsigned long long)h,
                 s.pixel ? "pso" : "vso");
@@ -590,7 +706,11 @@ uint32_t CreateShader(Ctx& c, bool pixel) {
     FatalF("d3d9: Create%sShader with a %s shader", pixel ? "Pixel" : "Vertex",
            pixel ? "vertex" : "pixel");
   s->id = Dev(c)->gfx->CreateShader(*s->program);
-  Wr32(Arg(c, 2), com::Publish(s, ShaderVtable(pixel)));
+  const uint32_t obj = com::Publish(s, ShaderVtable(pixel));
+  Wr32(Arg(c, 2), obj);
+  // The name SHADER_DUMP gives its tokens, to find a bound shader's source.
+  RECOMP_TRACE("  %s shader %016llx -> %08X\n", pixel ? "pixel" : "vertex",
+               (unsigned long long)TokenHash(*s), obj);
   return D3D_OK;
 }
 
@@ -635,6 +755,9 @@ HLE_NAMED("d3d9.dll", "IDirect3DDevice9::SetRenderTarget", D3DDev9_SetRenderTarg
     Surface* s = com::As<Surface>(surf);
     d->viewport = {0, 0, s->desc.Width, s->desc.Height, 0.0f, 1.0f};
     d->scissor = {0, 0, LONG(s->desc.Width), LONG(s->desc.Height)};
+    RECOMP_TRACE("  render target 0: kind %d, %ux%u fmt %X%s\n", int(s->kind), s->desc.Width,
+                 s->desc.Height, s->desc.Format,
+                 d->backbuffer && d->backbuffer->guest == surf ? " (the back buffer)" : "");
   }
   BindTargets(*d);
   return D3D_OK;
@@ -848,17 +971,27 @@ HLE_NAMED("d3d9.dll", "IDirect3DSurface9::LockRect", D3DSurf9_LockRect, 4) {
   if (s->kind == Surface::Kind::TextureLevel)
     return LockLevel(*s->texture, uint32_t(s->face), uint32_t(s->level), Arg(c, 1), Arg(c, 2),
                      Arg(c, 3));
-  if (s->kind != Surface::Kind::Offscreen)
+  if (s->kind != Surface::Kind::Offscreen && s->kind != Surface::Kind::RenderTarget)
     FatalF("d3d9: LockRect of a %s surface not supported",
-           s->kind == Surface::Kind::BackBuffer ? "back buffer" :
-           s->kind == Surface::Kind::DepthStencil ? "depth stencil" : "render target");
+           s->kind == Surface::Kind::BackBuffer ? "back buffer" : "depth stencil");
   gfx::Format f = FormatFromD3D(s->desc.Format);
   gfx::Rect r{0, 0, int32_t(s->desc.Width), int32_t(s->desc.Height)};
   if (Arg(c, 2)) r = *G<gfx::Rect>(Arg(c, 2));
   if (!LockRectValid(r, s->desc.Width, s->desc.Height, f)) return D3DERR_INVALIDCALL;
+  if (s->kind == Surface::Kind::RenderTarget && !s->mem) {
+    // A lockable render target (CreateRenderTarget's Lockable): a CPU copy
+    // of its pixels, filled from the GPU on each lock.
+    s->pitch = gfx::RowPitch(f, s->desc.Width);
+    s->mem = HeapAllocProcess(s->pitch * gfx::RowCount(f, s->desc.Height), true);
+  }
   uint32_t off = gfx::IsCompressed(f)
                      ? uint32_t(r.top / 4) * s->pitch + uint32_t(r.left / 4) * gfx::RowPitch(f, 4)
                      : uint32_t(r.top) * s->pitch + uint32_t(r.left) * gfx::BitsPerPixel(f) / 8;
+  if (s->kind == Surface::Kind::RenderTarget) {
+    DeviceOf(s->device)->gfx->ReadImage(s->tex, 0, 0, r, GPtr(s->mem + off), s->pitch);
+    s->locked_rect = r;
+    s->lock_write = !(Arg(c, 3) & D3DLOCK_READONLY);
+  }
   *G<D3DLOCKED_RECT>(Arg(c, 1)) = {INT(s->pitch), s->mem + off};
   return D3D_OK;
 }
@@ -867,6 +1000,13 @@ HLE_NAMED("d3d9.dll", "IDirect3DSurface9::UnlockRect", D3DSurf9_UnlockRect, 1) {
   Surface* s = Surf(c);
   if (s->kind == Surface::Kind::TextureLevel)
     return UnlockLevel(*s->texture, uint32_t(s->face), uint32_t(s->level));
+  if (s->kind == Surface::Kind::RenderTarget && s->lock_write && s->mem) {
+    const gfx::Rect& r = s->locked_rect;
+    gfx::Format f = FormatFromD3D(s->desc.Format);
+    uint32_t off = uint32_t(r.top) * s->pitch + uint32_t(r.left) * gfx::BitsPerPixel(f) / 8;
+    DeviceOf(s->device)->gfx->UpdateTexture(s->tex, 0, r, GPtr(s->mem + off), s->pitch);
+    s->lock_write = false;
+  }
   return D3D_OK;
 }
 
@@ -993,69 +1133,14 @@ HLE_NAMED("d3d9.dll", "IDirect3DCubeTexture9::AddDirtyRect", D3DCube9_AddDirtyRe
 // (UpdateImage uploads as is): 32-bit RGB (X8R8G8B8 with its alpha made
 // opaque), the float ones and the block-compressed ones.
 
-bool VolumeFormat(uint32_t fmt, gfx::Format f) {
-  return fmt == D3DFMT_A8R8G8B8 || fmt == D3DFMT_X8R8G8B8 || gfx::IsFloat(f) ||
-         gfx::IsCompressed(f);
-}
 
 // (Width, Height, Depth, Levels, Usage, Format, Pool, ppVolumeTexture, pSharedHandle)
 HLE_NAMED("d3d9.dll", "IDirect3DDevice9::CreateVolumeTexture", D3DDev9_CreateVolumeTexture, 10) {
-  Device& d = *Dev(c);
-  uint32_t w = Arg(c, 1), h = Arg(c, 2), depth = Arg(c, 3), levels = Arg(c, 4),
-           usage = Arg(c, 5), fmt = Arg(c, 6), pool = Arg(c, 7), out = Arg(c, 8);
-  Wr32(out, 0);
-  gfx::Format f = FormatFromD3D(fmt);
-  if (!w || !h || !depth || f == gfx::Format::Unknown || !VolumeFormat(fmt, f) ||
-      (usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_AUTOGENMIPMAP))) {
-    WarnF("d3d9: CreateVolumeTexture %ux%ux%u fmt %X usage %X pool %u: not supported\n", w, h,
-          depth, fmt, usage, pool);
-    return D3DERR_INVALIDCALL;
-  }
-  uint32_t full = 1;
-  for (uint32_t s = std::max({w, h, depth}); s > 1; s >>= 1) full++;
-  if (!levels || levels > full) levels = full;
-  auto t = std::make_shared<Texture>();
-  t->device = Arg(c, 0);
-  t->volume = true;
-  t->width = w;
-  t->height = h;
-  t->depth = depth;
-  t->levels = levels;
-  t->usage = usage;
-  t->format = fmt;
-  t->pool = pool;
-  t->fmt = f;
-  uint64_t bytes = 0;
-  for (uint32_t i = 0; i < levels; i++) {
-    Texture::Level l;
-    l.w = std::max(1u, w >> i);
-    l.h = std::max(1u, h >> i);
-    l.d = std::max(1u, depth >> i);
-    l.pitch = gfx::RowPitch(f, l.w);
-    l.slice = l.pitch * gfx::RowCount(f, l.h);
-    l.size = l.slice * l.d;
-    bytes += l.size;
-    t->lv.push_back(l);
-  }
-  if (pool == D3DPOOL_DEFAULT) {
-    if (!ChargeVram(d, bytes)) return 0x8876017C;  // D3DERR_OUTOFVIDEOMEMORY
-    t->vram = bytes;
-  }
-  if (pool != D3DPOOL_SYSTEMMEM && pool != D3DPOOL_SCRATCH) {
-    gfx::ImageDesc desc;
-    desc.w = int(w);
-    desc.h = int(h);
-    desc.layers = int(depth);
-    desc.levels = int(levels);
-    desc.fmt = f;
-    desc.kind = gfx::TextureKind::Tex3D;
-    t->tex = d.gfx->CreateImage(desc);
-    if (!t->tex) return 0x8876017C;
-  }
-  Wr32(out, com::Publish(t, VolumeTextureVtable()));
-  RECOMP_TRACE("  CreateVolumeTexture %ux%ux%u x%u fmt %X usage %X pool %u -> %08X\n", w, h,
-               depth, levels, fmt, usage, pool, Rd32(out));
-  return D3D_OK;
+  uint32_t out;
+  uint32_t hr = NewVolumeTexture(*Dev(c), Arg(c, 0), Arg(c, 1), Arg(c, 2), Arg(c, 3), Arg(c, 4),
+                                 Arg(c, 5), Arg(c, 6), Arg(c, 7), &out);
+  Wr32(Arg(c, 8), out);
+  return hr;
 }
 
 // (Level, D3DLOCKED_BOX* {RowPitch, SlicePitch, pBits}, const D3DBOX* {Left,
@@ -1108,15 +1193,13 @@ HLE_NAMED("d3d9.dll", "IDirect3DVolumeTexture9::UnlockBox", D3DVol9_UnlockBox, 2
                              : uint32_t(r.top) * l.pitch + uint32_t(r.left) * gfx::BitsPerPixel(t.fmt) / 8;
   for (uint32_t z = l.locked_front; z < l.locked_back; z++) {
     const uint8_t* src = GPtr(l.mem + z * l.slice + x_off);
-    if (t.format == D3DFMT_X8R8G8B8) {  // the unused byte is alpha on the GPU: opaque
+    if (VolumeConverted(t.fmt)) {  // to A8R8G8B8, the GPU's format for these
       const uint32_t w = uint32_t(r.right - r.left), h = uint32_t(r.bottom - r.top);
+      const uint32_t bpp = gfx::BitsPerPixel(t.fmt) / 8;
       std::vector<uint32_t> px(size_t(w) * h);
       for (uint32_t y = 0; y < h; y++)
-        for (uint32_t x = 0; x < w; x++) {
-          uint32_t v;
-          std::memcpy(&v, src + size_t(y) * l.pitch + 4 * x, 4);
-          px[size_t(y) * w + x] = v | 0xFF000000u;
-        }
+        for (uint32_t x = 0; x < w; x++)
+          px[size_t(y) * w + x] = gfx::DecodePixel(src + size_t(y) * l.pitch + size_t(x) * bpp, t.fmt);
       g->UpdateImage(t.tex, int(level), int(z), r, px.data(), w * 4);
     } else {
       g->UpdateImage(t.tex, int(level), int(z), r, src, l.pitch);

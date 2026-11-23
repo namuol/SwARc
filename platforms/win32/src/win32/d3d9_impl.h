@@ -99,8 +99,10 @@ struct Surface final : com::Object {
   Texture* texture = nullptr;  // TextureLevel
   uint32_t container = 0;      // TextureLevel: the texture's guest pointer
   int face = 0, level = 0;
-  uint32_t mem = 0;  // Offscreen: its pixels
+  uint32_t mem = 0;  // Offscreen: its pixels; RenderTarget: its lock copy
   uint32_t pitch = 0;
+  gfx::Rect locked_rect{};  // RenderTarget: the open lock's rectangle
+  bool lock_write = false;  // RenderTarget: upload it on UnlockRect
   uint64_t vram = 0;  // charged to the device (ChargeVram)
   ~Surface() override;
 };
@@ -301,6 +303,11 @@ uint32_t NewTexture(Device& d, uint32_t device, bool cube, uint32_t w, uint32_t 
                     uint32_t levels, uint32_t usage, uint32_t fmt, uint32_t pool,
                     uint32_t* out);
 
+// CreateVolumeTexture: as NewTexture, for a w x h x depth volume texture.
+uint32_t NewVolumeTexture(Device& d, uint32_t device, uint32_t w, uint32_t h, uint32_t depth,
+                          uint32_t levels, uint32_t usage, uint32_t fmt, uint32_t pool,
+                          uint32_t* out);
+
 // D3DXCompileShader's output: a shader function holding the HLSL
 // translation instead of shader model bytecode. Version token, one comment
 // with kTranslatedTag and the serialised hlsl::Program, END. Create*Shader
@@ -314,5 +321,13 @@ std::shared_ptr<const hlsl::Program> ReadTranslated(const std::vector<uint32_t>&
 // texture's format) and uploads them: D3DX loaders.
 void FillLevel(Texture& t, uint32_t face, uint32_t level, const uint8_t* src,
                uint32_t pitch);
+// FOURCC 'ATI2' (3Dc, BC5 with its channels swapped): D3D9 returns the first
+// block's channel in green and the second's in red (blue and alpha 1).
+constexpr uint32_t kD3DFmtAti2 = 0x32495441;
+
+// Replaces rectangle `r` of a level (whole blocks for compressed formats;
+// rows of `pitch` bytes in the texture's format) and uploads just it.
+void WriteLevelRect(Texture& t, uint32_t face, uint32_t level, const gfx::Rect& r,
+                    const uint8_t* src, uint32_t pitch);
 
 }  // namespace recomp::d3d9
