@@ -235,8 +235,6 @@ std::atomic<int32_t> g_real_x{0}, g_real_y{0};
 // it steers its own pointer by relative motion).
 std::atomic<int64_t> g_last_recentre_ms{-100000};
 std::atomic<int32_t> g_recentre_x{0}, g_recentre_y{0};  // screen coordinates
-// Mouse-look motion past the screen's edge, for after the next re-centre.
-std::atomic<int32_t> g_look_carry_x{0}, g_look_carry_y{0};
 bool g_sdl_up = false;
 std::thread::id g_main_thread_id = std::this_thread::get_id();
 
@@ -838,15 +836,8 @@ void HandleSdlEvent(const SDL_Event& e) {
           l = g_clip.l, t = g_clip.t;
           r = std::max(g_clip.l, g_clip.r - 1), b = std::max(g_clip.t, g_clip.b - 1);
         }
-        // Motion past the edge is kept for the game's next reads
-        // (GetCursorPos, after it re-centres): a fast swipe can cover more than the distance from
-        // the centre to the edge in one frame, and Windows' higher frame
-        // rates rarely let it. Dropped, it would cap how fast mouse look turns.
-        int nx = g_mouse_x + dx, ny = g_mouse_y + dy;
-        g_mouse_x = std::clamp(nx, l, r);
-        g_mouse_y = std::clamp(ny, t, b);
-        g_look_carry_x += nx - g_mouse_x;
-        g_look_carry_y += ny - g_mouse_y;
+        g_mouse_x = std::clamp(g_mouse_x + dx, l, r);
+        g_mouse_y = std::clamp(g_mouse_y + dy, t, b);
       } else {
         int x = int((e.motion.x - cm.x0) * cm.kx), y = int((e.motion.y - cm.y0) * cm.ky);
         if (e.motion.which == kTestPointer) {  // already client pixels
@@ -1232,11 +1223,6 @@ void EnsureSdlVideo() {
   // Leave SIGINT/SIGTERM alone: SDL would turn them into quit events the
   // game may ignore, making the process hard to stop.
   SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
-  // While the pointer is grabbed (mouse look, a clip, DirectInput) its
-  // motion keeps the system's pointer acceleration, as the ungrabbed
-  // pointer has: otherwise the same mouse turns more slowly the moment it
-  // is grabbed.
-  SDL_SetHint(SDL_HINT_MOUSE_RELATIVE_SYSTEM_SCALE, "1");
   if (!SDL_Init(SDL_INIT_VIDEO)) FatalF("SDL_Init: %s", SDL_GetError());
   g_sdl_up = true;
   platform::AddPlayerMenu();  // an installed app's Check for Updates, Uninstall...
@@ -4424,20 +4410,6 @@ bool SyncedCursorPos(int32_t* sx, int32_t* sy) {
 }
 
 HLE64("user32.dll", GetCursorPos, 1) {
-  // Mouse-look motion that ran past the edge (a fast swipe), as far as
-  // this read has room for; the rest waits for the next re-centre and
-  // read. Only while the game keeps re-centring: a stale remainder goes.
-  if (int64_t(TickCount()) - g_last_recentre_ms <= 250) {
-    const int sw = g_display_w, sh = g_display_h;
-    int cx = std::clamp(int(g_look_carry_x), -int(g_mouse_x), std::max(0, sw - 1 - g_mouse_x));
-    int cy = std::clamp(int(g_look_carry_y), -int(g_mouse_y), std::max(0, sh - 1 - g_mouse_y));
-    g_mouse_x += cx;
-    g_mouse_y += cy;
-    g_look_carry_x -= cx;
-    g_look_carry_y -= cy;
-  } else {
-    g_look_carry_x = g_look_carry_y = 0;
-  }
   int32_t x = g_mouse_x, y = g_mouse_y;
   SyncedCursorPos(&x, &y);
   Wr32(Arg(c, 0), uint32_t(x));
