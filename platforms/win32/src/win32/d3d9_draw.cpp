@@ -154,6 +154,7 @@ gfx::FfState DrawState(const Device& d, bool fixed) {
     f.tss[s][21] = ss[10];                    // MAXANISOTROPY
     auto* t = active ? com::As<Texture>(d.textures[s]) : nullptr;
     f.textures[s] = t ? t->tex : 0;
+    if (t) f.tss[s][20] = std::max(f.tss[s][20], t->lod);  // and the texture's SetLOD
   }
   // The material and the first eight enabled lights (in index order: the
   // pipeline does not see indices).
@@ -694,11 +695,18 @@ void Draw(Device& d, gfx::ShaderDraw& sd, const char* what) {
   sd.ps_float = ps ? d.ps_f : ff_ps_consts;
   sd.ps_int = d.ps_i;
   sd.ps_bool = reinterpret_cast<const uint32_t*>(d.ps_b);
+  // A managed texture's SetLOD is the most detailed level it is sampled at,
+  // as the sampler's MAXMIPLEVEL is (D3D9 uses the larger of the two): games
+  // that stream textures in raise the levels as they arrive, and the ones
+  // not loaded yet must not be sampled.
+  uint32_t ss[20][14];
+  std::memcpy(ss, d.ss, sizeof ss);
   for (int i = 0; i < 20; i++) {
     auto* t = com::As<Texture>(d.textures[i]);
     sd.textures[i] = t ? t->tex : 0;
+    if (t) ss[i][9] = std::max(ss[i][9], t->lod);
   }
-  sd.sampler_states = d.ss;
+  sd.sampler_states = ss;
   const gfx::FfState state = DrawState(d, false);
   sd.state = &state;
   BindTargets(d);
