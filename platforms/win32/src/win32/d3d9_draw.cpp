@@ -805,6 +805,23 @@ void Draw(Device& d, gfx::ShaderDraw& sd, const char* what) {
   const gfx::FfState state = DrawState(d, false);
   sd.state = &state;
   BindTargets(d);
+  // TEMP diagnostic: not for landing. The probe pixel of an 8-bit target before the draw.
+  static uint32_t probe_pre8 = 0;
+  static bool probe_pre8_ok = false;
+  {
+    static int px = -1, py = -1, at = -1;
+    static const bool parsed = [] {
+      if (const char* e = recomp::Env("PROBE")) std::sscanf(e, "%d,%d,%d", &px, &py, &at);
+      return true;
+    }();
+    (void)parsed;
+    static const auto start = std::chrono::steady_clock::now();
+    const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    auto* rt = com::As<Surface>(d.render_targets[0]);
+    probe_pre8_ok = at >= 0 && t >= at && t < at + 6 && rt && rt->desc.Width >= 1024 &&
+                    rt->desc.Format != D3DFMT_A16B16G16R16F && rt->desc.Format != D3DFMT_R32F;
+    if (probe_pre8_ok) d.gfx->ReadBack({px, py, px + 1, py + 1}, &probe_pre8, 4, gfx::Format::A8R8G8B8);
+  }
   d.gfx->DrawShader(sd);
   // TEMP diagnostic: not for landing. <ID>_PROBE=x,y,seconds: for one second from `seconds`
   // after the first draw, logs each draw that changes pixel (x, y) of a 1024x768 target.
@@ -881,7 +898,7 @@ void Draw(Device& d, gfx::ShaderDraw& sd, const char* what) {
       }
     }
     if (probe_on && rt && rt->kind == Surface::Kind::TextureLevel && rt->desc.Format == D3DFMT_A16B16G16R16F &&
-        rt->desc.Width == 1024 && rt->desc.Height == 768) {
+        rt->desc.Width >= 1024 && rt->desc.Height >= 768) {
       // Probe pixel (512, 200): log each draw that changes it, with its shader hash.
       static uint16_t last[4];
       uint16_t h[4] = {};
@@ -899,26 +916,36 @@ void Draw(Device& d, gfx::ShaderDraw& sd, const char* what) {
         };
         ProbeLog("  TEMP probe %016llx prim %u n %u: %g %g %g %g\n", (unsigned long long)fnv,
                      sd.prim, sd.primitives, half(h[0]), half(h[1]), half(h[2]), half(h[3]));
-        for (int sm = 0; sm < 2; sm++)
+        for (int sm = 0; sm < 6; sm++)
           if (auto* t = com::As<Texture>(d.textures[sm]))
-            ProbeLog("    TEMP probe s%d: %ux%u fmt %u (%.4s) levels %u usage %X\n", sm, t->width, t->height,
-                     t->format, reinterpret_cast<const char*>(&t->format), t->levels, t->usage);
+            ProbeLog("    TEMP probe s%d: %ux%u fmt %u (%.4s) levels %u usage %X tex %p\n", sm, t->width, t->height,
+                     t->format, reinterpret_cast<const char*>(&t->format), t->levels, t->usage, (void*)t);
+        ProbeLog("    TEMP probe state: ab %u sb %u db %u op %u sepa %u at %u af %u ar %u cw %X z %u zw %u zf %u srgbw %u\n",
+                 d.rs[27], d.rs[19], d.rs[20], d.rs[171], d.rs[206], d.rs[15], d.rs[25], d.rs[24], d.rs[168],
+                 d.rs[7], d.rs[14], d.rs[23], d.rs[194]);
       }
     }
-    if (probe_on && rt && rt->desc.Width == 1024 && rt->desc.Height == 768 &&
+    if (probe_on && rt && rt->desc.Width >= 1024 && rt->desc.Height >= 768 &&
         ((rt->desc.Format != D3DFMT_A16B16G16R16F && rt->desc.Format != D3DFMT_R32F) ||
          rt->kind != Surface::Kind::TextureLevel)) {
       static uint32_t last8 = 0;
       uint32_t px = 0;
       d.gfx->ReadBack({probe_x, probe_y, probe_x + 1, probe_y + 1}, &px, 4, gfx::Format::A8R8G8B8);
-      if (px != last8) {
+      if (probe_pre8_ok ? px != probe_pre8 : px != last8) {
         last8 = px;
+        if (probe_pre8_ok) ProbeLog("  TEMP probe8 before %08X\n", probe_pre8);
         uint64_t fnv = 1469598103934665603ull;
         if (auto* p = com::As<Shader>(d.ps))
           for (uint32_t t : p->tokens)
             for (int i = 0; i < 4; i++) fnv = (fnv ^ ((t >> (8 * i)) & 0xFF)) * 1099511628211ull;
         ProbeLog("  TEMP probe8 kind %d fmt %u %016llx prim %u n %u: %08X\n", int(rt->kind),
                      rt->desc.Format, (unsigned long long)fnv, sd.prim, sd.primitives, px);
+        ProbeLog("    TEMP probe8 rt texture %p\n", rt->kind == Surface::Kind::TextureLevel ? (void*)rt->texture : nullptr);
+        ProbeLog("    TEMP probe8 state: rt %p z %u zw %u zf %u cull %u st %u sf %u sref %u smask %X swmask %X "
+                 "sfail %u szfail %u spass %u two %u ccwf %u ccwzf %u ccwp %u ccwfn %u cw %X ab %u sb %u db %u "
+                 "sc %u\n", (void*)rt, d.rs[7], d.rs[14], d.rs[23], d.rs[22], d.rs[52], d.rs[56], d.rs[57], d.rs[58],
+                 d.rs[59], d.rs[53], d.rs[54], d.rs[55], d.rs[185], d.rs[186], d.rs[187], d.rs[188], d.rs[189],
+                 d.rs[168], d.rs[27], d.rs[19], d.rs[20], d.rs[174]);
       }
     }
     if (rt && rt->kind == Surface::Kind::TextureLevel && rt->desc.Format == D3DFMT_A16B16G16R16F &&
