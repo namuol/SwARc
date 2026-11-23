@@ -17,6 +17,8 @@
 // Position notifications (IDirectSoundNotify) and effects are not
 // implemented: fatal and named.
 
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <memory>
@@ -81,7 +83,37 @@ void WriteVec(uint32_t va, const audio::Vec3& v) {
 struct Format {
   uint16_t channels = 2, bits = 16, block = 4;
   uint32_t rate = 44100;
+  uint32_t mask = 0;  // speaker positions (WAVE_FORMAT_EXTENSIBLE); 0: the default
 };
+
+// The speakers of a format's channels, in channel order: the
+// WAVE_FORMAT_EXTENSIBLE mask's bits from the lowest, or the usual layout
+// for that many channels.
+std::vector<uint32_t> Speakers(const Format& f) {
+  static constexpr uint32_t kDefault[9] = {0, 0x4, 0x3, 0x7, 0x33, 0x37, 0x3F, 0x13F, 0x63F};
+  uint32_t m = f.mask ? f.mask : kDefault[std::min<int>(f.channels, 8)];
+  std::vector<uint32_t> s;
+  for (uint32_t b = 1; b && s.size() < f.channels; b <<= 1)
+    if (m & b) s.push_back(b);
+  while (s.size() < f.channels) s.push_back(0);  // more channels than mask bits: silent
+  return s;
+}
+
+// Stereo gains of a speaker: front left/right to their side, centre and the
+// side/back/front-of-centre ones at -3 dB (to both sides for the centres),
+// LFE and unknown positions dropped.
+void DownmixGains(uint32_t speaker, float* l, float* r) {
+  constexpr float h = 0.70710678f;
+  switch (speaker) {
+    case 0x1: *l = 1, *r = 0; break;      // front left
+    case 0x2: *l = 0, *r = 1; break;      // front right
+    case 0x4: *l = h, *r = h; break;      // front centre
+    case 0x10: case 0x40: case 0x200: *l = h, *r = 0; break;   // back/front-of-centre/side left
+    case 0x20: case 0x80: case 0x400: *l = 0, *r = h; break;   // ... right
+    case 0x100: *l = 0.5f, *r = 0.5f; break;  // back centre
+    default: *l = 0, *r = 0; break;       // LFE, top speakers, unknown
+  }
+}
 
 // A buffer's samples, shared with its duplicates and the mixer: the guest
 // copy for Lock and the host copy the mixer reads (written under the
@@ -100,8 +132,20 @@ struct Data {
 class RingSource : public audio::Source {
  public:
   explicit RingSource(std::shared_ptr<Data> d) : d_(std::move(d)) {
-    channels_ = d_->fmt.channels;
+    channels_ = std::min<int>(d_->fmt.channels, 2);
     rate_ = int(d_->fmt.rate);
+    if (d_->fmt.channels > 2) {
+      // Surround to stereo, scaled so a full-scale signal cannot clip.
+      float sl = 0, sr = 0;
+      for (uint32_t s : Speakers(d_->fmt)) {
+        float l, r;
+        DownmixGains(s, &l, &r);
+        gains_.push_back({l, r});
+        sl += l, sr += r;
+      }
+      float norm = 1.0f / std::max({sl, sr, 1.0f});
+      for (auto& g : gains_) g = {g[0] * norm, g[1] * norm};
+    }
   }
   bool loop = false;
 
@@ -119,6 +163,7 @@ class RingSource : public audio::Source {
     for (; got < n; got++) {
       if (!frames || (!loop && next_ >= frames)) break;
       const uint8_t* p = d_->bytes.data() + size_t(next_ % frames) * f.block;
+      float l = 0, r = 0;
       for (int c = 0; c < f.channels; c++) {
         float s;
         if (f.bits == 8) {
@@ -128,8 +173,14 @@ class RingSource : public audio::Source {
           std::memcpy(&v, p + 2 * c, 2);
           s = float(v) / 32768.0f;
         }
-        *out++ = s;
+        if (gains_.empty()) {
+          *out++ = s;
+        } else {
+          l += s * gains_[size_t(c)][0];
+          r += s * gains_[size_t(c)][1];
+        }
       }
+      if (!gains_.empty()) *out++ = l, *out++ = r;
       next_++;
     }
     return got;
@@ -143,6 +194,7 @@ class RingSource : public audio::Source {
  private:
   std::shared_ptr<Data> d_;
   int64_t next_ = 0;
+  std::vector<std::array<float, 2>> gains_;  // per channel, when downmixing
 };
 
 // ---- objects
@@ -314,10 +366,22 @@ bool ReadFormat(uint32_t va, Format* f) {
   uint16_t tag = uint16_t(Rd32(va)), channels = uint16_t(Rd32(va) >> 16);
   uint32_t rate = Rd32(va + 4);
   uint16_t block = uint16_t(Rd32(va + 12)), bits = uint16_t(Rd32(va + 12) >> 16);
-  if (tag != 1 /* WAVE_FORMAT_PCM */ || (channels != 1 && channels != 2) ||
-      (bits != 8 && bits != 16) || block != channels * bits / 8 || rate < 100 || rate > 200000)
+  uint32_t mask = 0;
+  if (tag == 0xFFFE) {  // WAVE_FORMAT_EXTENSIBLE: PCM subformat only
+    static constexpr uint8_t kPcm[16] = {0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00,
+                                         0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71};
+    if (Rd16(va + 16) >= 22 && std::memcmp(GPtr(va + 24), kPcm, 16) == 0) {
+      tag = 1;
+      mask = Rd32(va + 20);
+    }
+  }
+  if (tag != 1 /* WAVE_FORMAT_PCM */ || channels < 1 || channels > 8 ||
+      (bits != 8 && bits != 16) || block != channels * bits / 8 || rate < 100 || rate > 200000) {
+    RECOMP_TRACE("  format not supported: tag %X, %u channels, %u bits, block %u, %u Hz, cbSize %u\n",
+                 tag, channels, bits, block, rate, tag == 1 ? 0u : uint32_t(Rd16(va + 16)));
     return false;
-  *f = {channels, bits, block, rate};
+  }
+  *f = {channels, bits, block, rate, mask};
   return true;
 }
 
