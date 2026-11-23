@@ -11,9 +11,11 @@
 // fixed-function pixel stage gets a pixel shader generated from the
 // texture-stage state (FfPixelShader); a pixel shader after the
 // fixed-function vertex stage gets a vertex shader standing in for that
-// stage (FfVertexSource, FVF draws). A pixel shader with a vertex
-// declaration and no vertex shader, and fixed-function draws with a vertex
-// declaration (no FVF), are not supported yet (fatal, named).
+// stage (FfVertexSource: FVF draws, and declarations with pretransformed
+// positions, which bypass any vertex shader as in D3D9). A pixel shader with
+// any other vertex declaration and no vertex shader, and fixed-function
+// draws with a vertex declaration (no FVF), are not supported yet (fatal,
+// named).
 
 #include <algorithm>
 #include <cmath>
@@ -81,6 +83,29 @@ std::vector<guest::D3DVERTEXELEMENT9> FvfElements(uint32_t fvf) {
   }
   e.push_back({0xFF, 0, UNUSED, 0, 0, 0});  // D3DDECL_END
   return e;
+}
+
+// The FVF of a vertex declaration with pretransformed positions
+// (POSITIONT): XYZRHW, its colours and texture coordinates (sets 0 up to
+// the highest one declared, each at its declared size). 0 if the
+// declaration has no POSITIONT. D3D9 bypasses the vertex shader for such
+// a declaration, so the fixed-function stand-in replaces it.
+uint32_t PretransformedFvf(const std::vector<guest::D3DVERTEXELEMENT9>& elements) {
+  bool positiont = false;
+  uint32_t fvf = 0x004, ntex = 0;  // XYZRHW
+  for (const auto& e : elements) {
+    if (e.Stream == 0xFF) break;
+    if (e.Usage == USAGE_POSITIONT && e.UsageIndex == 0) positiont = true;
+    if (e.Usage == USAGE_COLOR && e.UsageIndex == 0) fvf |= 0x040;  // DIFFUSE
+    if (e.Usage == USAGE_COLOR && e.UsageIndex == 1) fvf |= 0x080;  // SPECULAR
+    if (e.Usage == USAGE_TEXCOORD && e.UsageIndex < 8) {
+      ntex = std::max(ntex, uint32_t(e.UsageIndex) + 1);
+      // FVF texture coordinate sizes: 0 2D, 1 3D, 2 4D, 3 1D.
+      const uint32_t size = e.Type == FLOAT1 ? 3 : e.Type == FLOAT3 ? 1 : e.Type == FLOAT4 ? 2 : 0;
+      fvf |= size << (16 + 2 * e.UsageIndex);
+    }
+  }
+  return positiont ? fvf | (ntex << 8) : 0;
 }
 
 // Vertices (or indices) a draw of `count` primitives uses; 0 for an
@@ -460,21 +485,21 @@ void NoteFfVertexGaps(const Device& d, uint32_t fvf) {
 
 // The stand-in vertex shader for d.fvf (compiled once per source) and its
 // constants in `c`.
-const Device::FfVertexShader& FfVertexShaderFor(Device& d, float (*c)[4]) {
-  std::string src = FfVertexSource(d, d.fvf);
+const Device::FfVertexShader& FfVertexShaderFor(Device& d, uint32_t fvf, float (*c)[4]) {
+  std::string src = FfVertexSource(d, fvf);
   auto it = d.ff_vs.find(src);
   if (it == d.ff_vs.end()) {
     auto p = std::make_shared<hlsl::Program>();
     std::string err;
     if (!hlsl::Compile(src, {}, "main", "vs_2_0", 0, p.get(), &err))
-      FatalF("d3d9: the fixed-function vertex shader for FVF %X does not translate: %s", d.fvf,
+      FatalF("d3d9: the fixed-function vertex shader for FVF %X does not translate: %s", fvf,
              err.c_str());
     Device::FfVertexShader v;
     v.id = d.gfx->CreateShader(*p);
     v.program = std::move(p);
     it = d.ff_vs.emplace(src, std::move(v)).first;
   }
-  NoteFfVertexGaps(d, d.fvf);
+  NoteFfVertexGaps(d, fvf);
   // World * View * Projection (row vectors), stored by column.
   static const std::array<float, 16> kIdentity = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
   auto get = [&](uint32_t t) {
@@ -517,34 +542,42 @@ const Device::FfVertexShader& FfVertexShaderFor(Device& d, float (*c)[4]) {
 void Draw(Device& d, gfx::ShaderDraw& sd, const char* what) {
   Shader* vs = com::As<Shader>(d.vs);
   Shader* ps = com::As<Shader>(d.ps);
+  // A declaration with pretransformed positions (POSITIONT) bypasses the
+  // vertex shader: the vertices are in screen space, as an XYZRHW FVF's.
+  auto* decl = com::As<VertexDecl>(d.decl);
+  const uint32_t decl_fvf = decl ? PretransformedFvf(decl->elements) : 0;
+  if (decl_fvf && ps) vs = nullptr;
   if (!vs && !ps) {
     DrawFixed(d, sd, what);
     return;
   }
   // A pixel shader after the fixed-function vertex stage: a vertex shader
-  // in its place (FVF draws only).
+  // in its place (an FVF, or a declaration with pretransformed positions).
   const Device::FfVertexShader* ff = nullptr;
   float ff_vs_consts[256][4];
   if (!vs) {
-    if (com::As<VertexDecl>(d.decl) || !d.fvf)
+    if (decl ? !decl_fvf : !d.fvf)
       FatalF("d3d9: %s with a pixel shader, no vertex shader and a vertex declaration", what);
-    ff = &FfVertexShaderFor(d, ff_vs_consts);
+    ff = &FfVertexShaderFor(d, decl ? decl_fvf : d.fvf, ff_vs_consts);
   }
   const hlsl::Program& vprog = ff ? *ff->program : *vs->program;
 
   std::vector<guest::D3DVERTEXELEMENT9> from_fvf;
   const std::vector<guest::D3DVERTEXELEMENT9>* elements = nullptr;
-  if (auto* decl = com::As<VertexDecl>(d.decl)) {
+  if (decl) {
     elements = &decl->elements;
   } else if (d.fvf) {
     from_fvf = FvfElements(d.fvf);
-    // The stand-in shader reads a pretransformed position as POSITION.
-    if (ff)
-      for (auto& e : from_fvf)
-        if (e.Usage == USAGE_POSITIONT) e.Usage = USAGE_POSITION;
     elements = &from_fvf;
   } else {
     FatalF("d3d9: %s without a vertex declaration or FVF", what);
+  }
+  // The stand-in shader reads a pretransformed position as POSITION.
+  if (ff) {
+    if (elements != &from_fvf) from_fvf = *elements;
+    for (auto& e : from_fvf)
+      if (e.Usage == USAGE_POSITIONT) e.Usage = USAGE_POSITION;
+    elements = &from_fvf;
   }
   const auto& sem = vprog.inputs;
   std::vector<gfx::VertexInput> inputs(sem.size());
