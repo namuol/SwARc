@@ -37,6 +37,7 @@ namespace {
 GuestMemory g_mem;
 GuestAllocator g_vm;
 std::atomic<int> g_failures{0};
+volatile sig_atomic_t g_stage = 0;  // the block running, for an unexpected fault's message
 
 #define CHECK(cond)                                                       \
   do {                                                                    \
@@ -52,7 +53,8 @@ void OnFault(int, siginfo_t* si, void*) {
   uintptr_t base = reinterpret_cast<uintptr_t>(g_mem.base());
   if (a - base < g_mem.size() && (watch::HandleFault(a - base) || watch::Reopened(g_mem, a - base)))
     return;
-  const char m[] = "unexpected fault\n";
+  char m[] = "unexpected fault in block 0\n";
+  m[sizeof m - 3] = char('0' + g_stage);
   (void)!write(2, m, sizeof m - 1);
   _exit(2);
 }
@@ -78,6 +80,7 @@ int main() {
   g_vm.Commit(va, uint32_t(size), Prot::RW);
   const auto page = [&](int i) { return va + uint64_t(i) * hp; };
 
+  g_stage = 1;
   {
     watch::Watch w;
     w.Arm(g_mem, page(0) + 5, hp);  // pages 0 and 1
@@ -96,6 +99,7 @@ int main() {
     CHECK(!w.clean());
   }
 
+  g_stage = 2;
   {
     // a: pages 3-4, b: 4-5, c: 7. A write to page 3 disarms a and b (they
     // share page 4); page 5 (only b's) is writable without another fault.
@@ -113,6 +117,7 @@ int main() {
     CHECK(a.clean() && !b.clean() && c.clean());
   }
 
+  g_stage = 3;
   {
     // The kernel does not fault: Release first.
     watch::Watch w;
@@ -129,6 +134,7 @@ int main() {
     close(fds[1]);
   }
 
+  g_stage = 4;
   {
     watch::Watch w;
     w.Arm(g_mem, page(9), hp);
@@ -143,6 +149,7 @@ int main() {
     Store(page(9), 4);
   }
 
+  g_stage = 5;
   {
     auto w = std::make_unique<watch::Watch>();
     w->Arm(g_mem, page(10), hp);
@@ -150,6 +157,7 @@ int main() {
     Store(page(10), 5);  // no watch, no fault
   }
 
+  g_stage = 6;
   {
     // Writers bump a counter in each of their pages; the checker arms a
     // watch per page, then reads the counter: while the watch stays clean
@@ -176,6 +184,7 @@ int main() {
     for (auto& t : writers) t.join();
   }
 
+  g_stage = 7;
   {
     // Several threads write one watched page at once: one fault disarms
     // the watch, the others were raised by it and land after it.
@@ -204,6 +213,7 @@ int main() {
     for (auto& t : writers) t.join();
   }
 
+  g_stage = 8;
   {
     // A writer's fault disarms the watch; its owner destroys it once it
     // reads as written and scribbles over its memory. Many other armed

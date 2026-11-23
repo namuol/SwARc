@@ -7,10 +7,12 @@
 
 #include <SDL3/SDL.h>
 
+#include <algorithm>
 #include <cstring>
 #include <map>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include "runtime/log.h"
 #include "win32/hle.h"
@@ -85,6 +87,34 @@ HLE64(kDll, SDL_Init, kCdecl) {
   uint32_t flags = uint32_t(Arg(c, 0)) & ~0x1u;
   if (flags & SDL_INIT_VIDEO) EnsureSdlVideo();
   return Status(SDL_InitSubSystem(flags));
+}
+HLE64(kDll, SDL_InitSubSystem, kCdecl) {
+  uint32_t flags = uint32_t(Arg(c, 0)) & ~0x1u;
+  if (flags & SDL_INIT_VIDEO) EnsureSdlVideo();
+  return Status(SDL_InitSubSystem(flags));
+}
+// SDL2's subsystem flags are SDL3's (timer 0x1 aside, always on in SDL3).
+HLE64(kDll, SDL_WasInit, kCdecl) {
+  uint32_t flags = uint32_t(Arg(c, 0));
+  return SDL_WasInit(flags & ~0x1u) | (flags & 0x1u);
+}
+// SDL_setenv(name, value, overwrite): the guest's environment, kernel32's
+// (SDL2 on Windows sets it with SetEnvironmentVariable).
+HLE64(kDll, SDL_setenv, kCdecl) {
+  std::string name = GStr(Arg(c, 0)), value = GStr(Arg(c, 1));
+  if (name.empty() || name.find('=') != std::string::npos) return uint32_t(-1);
+  std::vector<std::string> vars = EnvironmentVars();
+  std::string key = win32::Lower(name) + "=";
+  auto it = std::find_if(vars.begin(), vars.end(), [&](const std::string& kv) {
+    return win32::Lower(kv.substr(0, key.size())) == key;
+  });
+  if (it != vars.end()) {
+    if (!Arg(c, 2)) return 0;
+    vars.erase(it);
+  }
+  vars.push_back(name + "=" + value);
+  SetEnvironmentBlock(vars);
+  return 0;
 }
 HLE64(kDll, SDL_QuitSubSystem, kCdecl) {
   // Video stays up: the runtime's windows (and its presentation) need it.

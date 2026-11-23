@@ -34,14 +34,17 @@ add_test(NAME reverb COMMAND reverb_test)
 # portable.
 add_executable(gl_draw_test gl_draw_test.cpp
                ${PROJECT_SOURCE_DIR}/src/runtime/gl/context.cpp
+               ${PROJECT_SOURCE_DIR}/src/runtime/gl/glsl.cpp
+               ${PROJECT_SOURCE_DIR}/src/runtime/gl/program.cpp
                ${PROJECT_SOURCE_DIR}/src/runtime/gfx/format.cpp)
 target_include_directories(gl_draw_test PRIVATE ${PROJECT_SOURCE_DIR}/src)
 target_compile_features(gl_draw_test PRIVATE cxx_std_20)
 target_compile_options(gl_draw_test PRIVATE -O2)
 add_test(NAME gl_draw COMMAND gl_draw_test)
 
-# pacing_test: FramePacer's rate and that it waits without spinning;
-# portable. Timing-sensitive, so it runs alone.
+# pacing_test: FramePacer's rules on a simulated clock, and on the host's
+# that it waits without spinning (punctuality only when the host is quiet);
+# portable. It measures the host's timers, so it runs alone.
 add_executable(pacing_test pacing_test.cpp
                ${PROJECT_SOURCE_DIR}/src/runtime/pacing.cpp
                ${PROJECT_SOURCE_DIR}/src/runtime/platform.cpp)
@@ -144,6 +147,7 @@ add_test(NAME hlsl_bytecode COMMAND hlsl_bytecode_test ${RECOMP_GLSLANG}
 
 # gfx_program_test: gfx::Device's programs (the console GPUs' path) on
 # SDL_GPU; needs a Vulkan device (lavapipe will do), skipped without one.
+# On macOS it runs on Metal by hand: SDL_GPU_DRIVER=metal gfx_program_test.
 if(RECOMP_HOST)
   add_executable(gfx_program_test gfx_program_test.cpp)
   target_link_libraries(gfx_program_test PRIVATE recomp_gfx recomp_log)

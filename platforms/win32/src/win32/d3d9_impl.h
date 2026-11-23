@@ -31,7 +31,8 @@ enum : uint32_t {
   D3DFMT_UNKNOWN = 0, D3DFMT_R8G8B8 = 20, D3DFMT_A8R8G8B8 = 21,
   D3DFMT_X8R8G8B8 = 22, D3DFMT_R5G6B5 = 23, D3DFMT_X1R5G5B5 = 24,
   D3DFMT_A1R5G5B5 = 25, D3DFMT_A4R4G4B4 = 26, D3DFMT_R3G3B2 = 27,
-  D3DFMT_A8 = 28, D3DFMT_X4R4G4B4 = 30, D3DFMT_P8 = 41, D3DFMT_L8 = 50,
+  D3DFMT_A8 = 28, D3DFMT_X4R4G4B4 = 30, D3DFMT_A16B16G16R16 = 36, D3DFMT_P8 = 41,
+  D3DFMT_L8 = 50,
   D3DFMT_A8L8 = 51, D3DFMT_D16_LOCKABLE = 70, D3DFMT_D32 = 71,
   D3DFMT_D15S1 = 73, D3DFMT_D24S8 = 75, D3DFMT_D24X8 = 77, D3DFMT_D16 = 80,
   D3DFMT_INDEX16 = 101, D3DFMT_INDEX32 = 102, D3DFMT_R16F = 111,
@@ -40,6 +41,9 @@ enum : uint32_t {
   D3DFMT_DXT1 = 0x31545844, D3DFMT_DXT2 = 0x32545844,
   D3DFMT_DXT3 = 0x33545844, D3DFMT_DXT4 = 0x34545844,
   D3DFMT_DXT5 = 0x35545844,
+  // The NULL render target ('NULL'): a size for depth-only passes, no
+  // colour (a driver extension of the D3D9 era, checked for by games).
+  D3DFMT_NULL = 0x4C4C554E,
 };
 // D3DRESOURCETYPE
 enum : uint32_t {
@@ -109,14 +113,18 @@ struct Surface final : com::Object {
 struct Texture final : com::Object {
   uint32_t device = 0;
   bool cube = false;  // IDirect3DCubeTexture9: six faces of levels each
-  bool volume = false;  // IDirect3DVolumeTexture9: levels of `depth` slices (halved per level)
+  bool volume = false;  // IDirect3DVolumeTexture9: depth slices per level
   uint32_t width = 0, height = 0, depth = 1, levels = 0, usage = 0, format = 0, pool = 0;
   gfx::Format fmt = gfx::Format::Unknown;
   gfx::TextureId tex = 0;  // none for SYSTEMMEM/SCRATCH
+  // A depth texture (DEPTHSTENCIL usage, a depth format): `tex` is a gfx
+  // depth buffer, its surface a depth-stencil target, and a pixel shader's
+  // 2D sampler reads it as a shadow map (gfx's depth comparison).
+  bool depth_target = false;
   struct Level {
     uint32_t w = 0, h = 0, pitch = 0, size = 0;
     uint32_t d = 1, slice = 0;  // volume levels: depth and slice pitch (size = slice * d)
-    uint32_t box_front = 0, box_back = 1;  // volume levels: the open lock's slices
+    uint32_t locked_front = 0, locked_back = 0;  // volume levels: the locked box's depth
     uint32_t mem = 0;  // lock shadow, allocated on first lock
     bool locked = false;
     gfx::Rect locked_rect{};
@@ -174,10 +182,21 @@ struct Shader final : com::Object {
 struct Query final : com::Object {
   uint32_t device = 0;
   uint32_t type = 0;
+  uint32_t occlusion = 0;  // the gfx device's query (OCCLUSION), 0 before a BEGIN
+  bool ended = false;      // its END was issued
+  uint64_t pixels = 0;     // its count, once known
+  bool known = false;
 };
 
 struct Device : com::Object {
   uint32_t d3d = 0;  // IDirect3D9 guest pointer
+  // The gamma ramp (D3DGAMMARAMP: 256 red, green and blue WORDs), as last
+  // set; identity until then. The gfx device applies it to what is shown.
+  std::array<uint16_t, 3 * 256> gamma = [] {
+    std::array<uint16_t, 3 * 256> g{};
+    for (int i = 0; i < 3 * 256; i++) g[i] = uint16_t((i % 256) * 257);
+    return g;
+  }();
   guest::D3DDEVICE_CREATION_PARAMETERS creation{};
   guest::D3DPRESENT_PARAMETERS pp{};
   uint32_t hwnd = 0;
@@ -186,6 +205,9 @@ struct Device : com::Object {
   // Bound objects: guest pointers the device holds a reference to.
   uint32_t render_targets[4] = {};
   uint32_t depth_stencil = 0;
+  // Colour targets standing in for NULL-format render targets, by size:
+  // the depth buffer's, so a depth-only pass covers it all.
+  std::map<std::pair<uint32_t, uint32_t>, gfx::TextureId> null_targets;
   uint32_t textures[20] = {};  // samplers 0-15, then vertex samplers 0-3
   struct Stream {
     uint32_t buffer = 0, offset = 0, stride = 0, freq = 1;

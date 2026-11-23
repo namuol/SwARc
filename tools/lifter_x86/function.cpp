@@ -759,6 +759,14 @@ void BuildFunction(const Program& p, const Decoder& dec, uint64_t entry,
           uint64_t ct = RelTarget(in);
           if (ct != in.next()) f.direct_calls.insert(ct);
           if (p.setjmps.count(ct)) f.setjmp_returns.insert(in.next());
+        } else if (in.d.mnemonic == ZYDIS_MNEMONIC_CALL &&
+                   in.ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+                   in.ops[0].mem.base == ZYDIS_REGISTER_NONE &&
+                   in.ops[0].mem.index == ZYDIS_REGISTER_NONE &&
+                   p.setjmp_iat.count(static_cast<uint32_t>(in.ops[0].mem.disp.value))) {
+          // A call to an imported setjmp: longjmp (the runtime's) resumes
+          // at its return.
+          f.setjmp_returns.insert(in.next());
         }
         reach(in.next());
         break;

@@ -253,6 +253,10 @@ struct Slots {
   }
 };
 thread_local Slots t_slots;
+// C++ exceptions thrown and not caught yet on this thread (from the throw
+// to the start of the catch block that takes it): what
+// std::uncaught_exceptions() counts.
+thread_local int t_uncaught = 0;
 
 gaddr CurrentSlots() {
   if (!t_slots.va) t_slots.va = HeapAllocProcess(16, true);
@@ -268,11 +272,14 @@ HLE64("vcruntime140.dll", _CxxThrowException, kCdecl) {
   if (!obj && !ti) FatalF("guest C++: rethrow (throw;): not supported yet");
   const PeImage* img = ImageAt(ti);
   uint64_t params[4] = {kCxxMagic, obj, ti, img ? img->image_base : 0};
+  t_uncaught++;
   seh64::Raise(c, kCxxException, seh64::kNoncontinuable, params, 4, seh64::AtReturn(c));
   FatalF("guest C++ exception continued");
 }
 
 HLE64("vcruntime140.dll", __current_exception, kCdecl) { return CurrentSlots(); }
+HLE64("vcruntime140.dll", __uncaught_exceptions, kCdecl) { return uint32_t(t_uncaught); }
+HLE64("vcruntime140.dll", __uncaught_exception, kCdecl) { return t_uncaught > 0; }
 HLE64("vcruntime140.dll", __current_exception_context, kCdecl) { return CurrentSlots() + 8; }
 
 // __CxxFrameHandler4(record, frame, context, dispatcher_context)
@@ -343,6 +350,7 @@ HLE64("vcruntime140_1.dll", __CxxFrameHandler4, kCdecl) {
         CopyException(c, obj, orig + offset, cflags, ct, exc_base);
       Wr64(CurrentSlots(), rec);
       Wr64(CurrentSlots() + 8, seh64::Current()->context);
+      if (cxx && t_uncaught > 0) t_uncaught--;
       // Funclets get (themselves, the parent frame, 0x100), as Windows
       // calls them.
       gaddr cont = CallGuest(c, handler, {handler, orig, 0x100});

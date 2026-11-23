@@ -31,8 +31,24 @@ void Device::ClearDepth(DepthId, float, int, int) {}
 void Device::CopyDepth(DepthId, DepthId, const Rect&) {}
 void Device::DrawProgram(const ProgramDraw&) {}
 void Device::DispatchProgram(const ProgramDispatch&) {}
+void Device::SetGammaRamp(const uint16_t*) {}
+bool Device::SetWindow(SDL_Window*) { return false; }
+void Device::StretchRectFlipped(ColorTarget src, const Rect& sr, ColorTarget dst, const Rect& dr,
+                                bool linear) {
+  static bool warned = false;
+  if (!warned) WarnF("gfx: this device cannot flip a StretchRect; copied unflipped\n");
+  warned = true;
+  StretchRect(src, sr, dst, dr, linear);
+}
 uint64_t Device::WritesQueued() { return 0; }
 uint64_t Device::LandWrites(bool) { return 0; }
+bool Device::SupportsOcclusion() { return false; }
+uint32_t Device::BeginOcclusion() { return 0; }
+void Device::EndOcclusion(uint32_t) {}
+bool Device::OcclusionResult(uint32_t, uint64_t* count, bool) {
+  *count = 0;
+  return true;
+}
 void Device::DrawImage(TextureId, const Rect&) {}
 
 uint32_t BitsPerPixel(Format f) {

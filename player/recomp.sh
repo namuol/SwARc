@@ -10,6 +10,8 @@
 #   ./recomp test [ARGS]        the kit if needed, then vm-test.sh on this repo
 #                               (ARGS: --keep-base, --keep, --update, --steam)
 #   ./recomp uninstall          install.sh --uninstall
+#   ./recomp run [GAME ARGS]    build the developer build (out/release) if anything changed, then
+#                               play it on game/ (or <ENV>_GAME_DIR); GAME ARGS go to the game
 #   ./recomp pin [REF]          pin SwARc's REF (default: the fork's main), then sync
 # kit, install and test stop when external/SwARc isn't the pinned commit or
 # has uncommitted changes (a kit says which SwARc made it); --allow-unpinned
@@ -23,7 +25,7 @@ bold=$'\033[1m' red=$'\033[31m' green=$'\033[32m' yellow=$'\033[33m' off=$'\033[
 [ -t 1 ] || bold="" red="" green="" yellow="" off=""
 die() { printf '%srecomp:%s %s\n' "$red" "$off" "$*" >&2; exit 1; }
 note() { printf '%s==>%s %s\n' "$bold" "$off" "$*"; }
-usage() { sed -n '4,16p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '4,18p' "$0" | sed 's/^# \{0,1\}//'; }
 
 env_out=$(/usr/bin/python3 -I "$PLAYER/kit.py" env --root "$ROOT") || die "kit.py env failed (recomplauncher.json?)"
 eval "$env_out"
@@ -135,6 +137,23 @@ cmd_kit() {
   /usr/bin/python3 -I "$PLAYER/kit.py" build --root "$ROOT" || die "the kit build failed"
 }
 
+# The developer build: what the README's cmake and lift steps make in
+# out/release, rebuilt here only where sources changed (seconds after a
+# small change; the installer's player build starts over each time).
+cmd_run() {
+  [ -f out/release/build.ninja ] || die "no developer build in out/release yet: set one up as README.md says (cmake, the lift)"
+  note "building out/release ($BINARY)"
+  cmake --build out/release --target "$BINARY" || die "the build failed"
+  local bin="out/release/$BINARY.app/Contents/MacOS/$BINARY" dir=()
+  [ -x "$bin" ] || die "the build made no $bin"
+  if [ -z "$(eval "printf '%s' \"\${${ENV}_GAME_DIR:-}\"")" ]; then
+    [ -d game ] || die "no game/ folder: link the game's files there, or set ${ENV}_GAME_DIR"
+    dir=(--game-dir "$ROOT/game")
+  fi
+  note "running $bin${*:+ -- $*}"
+  if [ $# -gt 0 ]; then exec "$bin" ${dir[@]+"${dir[@]}"} -- "$@"; else exec "$bin" ${dir[@]+"${dir[@]}"}; fi
+}
+
 cmd_install() {
   need_pinned "$@"
   local args=(${ARGS[@]+"${ARGS[@]}"})
@@ -172,6 +191,7 @@ case "$cmd" in
   install) cmd_install "$@" ;;
   test) cmd_test "$@" ;;
   uninstall) exec /bin/bash install.sh --uninstall ;;
+  run) cmd_run "$@" ;;
   pin) cmd_pin "$@" ;;
   help|-h|--help) usage ;;
   *) usage >&2; exit 2 ;;

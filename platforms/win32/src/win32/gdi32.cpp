@@ -82,7 +82,7 @@ HLE("gdi32.dll", SetMapMode, 2) {
 // Windows returns 0 and fills nothing.
 HLE("gdi32.dll", GetSystemPaletteEntries, 4) { return 0; }
 
-HLE("gdi32.dll", GetDeviceCaps, 2) {
+HLE64("gdi32.dll", GetDeviceCaps, 2) {
   switch (Arg(c, 1)) {
     case 8: return uint32_t(g_display_w);   // HORZRES
     case 10: return uint32_t(g_display_h);  // VERTRES
@@ -113,8 +113,8 @@ HLE("gdi32.dll", GetDIBits, 7) {
 // ---- gamma ------------------------------------------------------------------
 // No hardware gamma ramp: games fall back to their own brightness
 // handling, as on drivers without one.
-HLE("gdi32.dll", GetDeviceGammaRamp, 2) { return 0; }
-HLE("gdi32.dll", SetDeviceGammaRamp, 2) { return 0; }
+HLE64("gdi32.dll", GetDeviceGammaRamp, 2) { return 0; }
+HLE64("gdi32.dll", SetDeviceGammaRamp, 2) { return 0; }
 
 }  // namespace
 }  // namespace recomp::hle

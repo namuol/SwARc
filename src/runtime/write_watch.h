@@ -53,7 +53,8 @@ bool HandleFault(gaddr addr);
 // (mem's protection) and no watch is armed on it. Such a fault was raised
 // by a watch another thread disarmed between the fault and its handling
 // (two threads writing one watched page, a Release during a write): the
-// page is writable by now, so retry the access.
+// page is writable by now, so retry the access. A watch armed on it again
+// meanwhile (after HandleFault saw none armed) is disarmed: true.
 bool Reopened(const GuestMemory& mem, gaddr addr);
 
 // Disarms the watches overlapping [va, va + size).

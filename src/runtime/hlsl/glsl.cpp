@@ -993,6 +993,9 @@ class Emitter {
     }
     // The backend's per-pixel work on the colour (the alpha test).
     if (out_->color_outputs & 1) outs += "  r_color0(r_c0);\n";
+    // An occlusion query's pixel count (a backend's variant defines it),
+    // after everything that can discard.
+    if (tg_.stage != Stage::Vertex) outs += "#ifdef R_OCCL_COUNT\n  R_OCCL_COUNT();\n#endif\n";
     return o + outs + "}\n";
   }
 

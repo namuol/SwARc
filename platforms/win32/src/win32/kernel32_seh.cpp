@@ -10,6 +10,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <mutex>
+#include <vector>
 
 #include "runtime/log.h"
 #include "win32/hle.h"
@@ -54,6 +56,31 @@ void FillContext(uint32_t ctx, const Ctx& c, uint32_t eip, uint32_t esp) {
   x87::Save(copy, GPtr(ctx + 0x1C));
 }
 
+// Vectored exception handlers (AddVectoredExceptionHandler): called with
+// EXCEPTION_POINTERS before the frame-based ones, first-added first unless
+// added with `first` set. Each returns EXCEPTION_CONTINUE_EXECUTION (-1)
+// or EXCEPTION_CONTINUE_SEARCH (0). The handle is a guest block standing
+// for the registration.
+std::mutex g_veh_mu;
+std::vector<std::pair<uint32_t, uint32_t>> g_veh;  // {handle, handler}
+
+HLE("kernel32.dll", AddVectoredExceptionHandler, 2) {
+  uint32_t h = uint32_t(HeapAllocProcess(8, true));
+  std::lock_guard<std::mutex> l(g_veh_mu);
+  if (Arg(c, 0)) g_veh.insert(g_veh.begin(), {h, Arg(c, 1)});
+  else g_veh.push_back({h, Arg(c, 1)});
+  return h;
+}
+HLE("kernel32.dll", RemoveVectoredExceptionHandler, 1) {
+  std::lock_guard<std::mutex> l(g_veh_mu);
+  for (auto it = g_veh.begin(); it != g_veh.end(); ++it)
+    if (it->first == Arg(c, 0)) {
+      g_veh.erase(it);
+      return 1;
+    }
+  return 0;
+}
+
 // Walks the SEH chain for an exception. Returns true if a handler asked to
 // continue execution, false if no handler took it. A handler that runs an
 // __except block never returns here (GuestResume unwinds past us).
@@ -77,6 +104,33 @@ bool DispatchException(Ctx& c, uint32_t code, uint32_t flags, uint32_t nparams,
   RECOMP_TRACE("  exception %08X at %08X (params %u: %08X %08X), walking SEH chain\n",
             code, eip, nparams, nparams > 0 ? params[0] : 0,
             nparams > 1 ? params[1] : 0);
+  // Registers after a handler continued, from the (possibly edited) CONTEXT.
+  auto resume = [&](uint32_t handler) {
+    if (flags & kExceptionNoncontinuable)
+      FatalF("handler %08X continued a noncontinuable exception %08X", handler, code);
+    if (Rd32(ctx + 0xB8) != eip)
+      FatalF("handler %08X changed EIP to %08X: not supported", handler, Rd32(ctx + 0xB8));
+    c.edi = Rd32(ctx + 0x9C);
+    c.esi = Rd32(ctx + 0xA0);
+    c.ebx = Rd32(ctx + 0xA4);
+    c.edx = Rd32(ctx + 0xA8);
+    c.ecx = Rd32(ctx + 0xAC);
+    c.ebp = Rd32(ctx + 0xB4);
+    c.esp = saved_esp;
+    return true;
+  };
+  std::vector<std::pair<uint32_t, uint32_t>> veh;
+  {
+    std::lock_guard<std::mutex> l(g_veh_mu);
+    veh = g_veh;
+  }
+  if (!veh.empty()) {
+    uint32_t ptrs = rec - 8;  // EXCEPTION_POINTERS {record, context}
+    Wr32(ptrs, rec);
+    Wr32(ptrs + 4, ctx);
+    for (auto [h, handler] : veh)
+      if (int32_t(CallGuest(c, handler, {ptrs})) == -1) return resume(handler);
+  }
   for (uint32_t reg = Rd32(teb); reg != kEnd && reg; reg = Rd32(reg)) {
     if (reg < CurrentThread()->stack_lo || reg >= CurrentThread()->stack_hi)
       FatalF("corrupt SEH chain: record %08X outside the stack", reg);
@@ -86,23 +140,7 @@ bool DispatchException(Ctx& c, uint32_t code, uint32_t flags, uint32_t nparams,
     RECOMP_TRACE("    record %08X: handler %08X, scope table %08X, try level %08X\n", reg,
                  handler, Rd32(reg + 8), Rd32(reg + 12));
     uint32_t disp = CallGuest(c, handler, {rec, reg, ctx, 0});
-    if (disp == kContinueExecution) {
-      if (flags & kExceptionNoncontinuable)
-        FatalF("handler %08X continued a noncontinuable exception %08X",
-               handler, code);
-      if (Rd32(ctx + 0xB8) != eip)
-        FatalF("handler %08X changed EIP to %08X: not supported", handler,
-               Rd32(ctx + 0xB8));
-      // Resume after RaiseException with the (possibly edited) registers.
-      c.edi = Rd32(ctx + 0x9C);
-      c.esi = Rd32(ctx + 0xA0);
-      c.ebx = Rd32(ctx + 0xA4);
-      c.edx = Rd32(ctx + 0xA8);
-      c.ecx = Rd32(ctx + 0xAC);
-      c.ebp = Rd32(ctx + 0xB4);
-      c.esp = saved_esp;
-      return true;
-    }
+    if (disp == kContinueExecution) return resume(handler);
     if (disp != kContinueSearch)
       WarnF("SEH handler %08X returned disposition %u; continuing search\n",
             handler, disp);
@@ -163,11 +201,12 @@ HLE("kernel32.dll", RtlUnwind, 4) {
   return retval;
 }
 
-HLE("kernel32.dll", UnhandledExceptionFilter, 1) {
-  uint32_t ptrs = Arg(c, 0);
-  uint32_t rec = Rd32(ptrs);
-  FatalF("UnhandledExceptionFilter: exception %08X at %08X", Rd32(rec),
-         Rd32(rec + 0x0C));
+// EXCEPTION_POINTERS {record, context}; the record's ExceptionAddress is
+// at 0x0C, or 0x10 on x64 (after the 8-byte ExceptionRecord pointer).
+HLE64("kernel32.dll", UnhandledExceptionFilter, 1) {
+  gaddr rec = RdPtr(Arg(c, 0));
+  FatalF("UnhandledExceptionFilter: exception %08X at %llX", Rd32(rec),
+         (unsigned long long)RdPtr(rec + (g_proc->x64 ? 0x10 : 0x0C)));
 }
 
 // Host pages larger than the guest's 4 KiB (16 KiB on Apple Silicon) are

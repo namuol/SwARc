@@ -40,11 +40,12 @@ bool JoinThread(uint32_t h, uint32_t* exit_code);
 // is 10 MHz) since the process started.
 uint64_t PerfCounter();
 
-// The process environment, as NAME=value strings.
+// The process environment, as NAME=value strings, and its replacement.
 std::vector<std::string> EnvironmentVars();
+void SetEnvironmentBlock(const std::vector<std::string>& vars);
 
 // SYSTEMTIME at guest address st from a broken-down time and milliseconds.
-void WriteSystemTime(uint32_t st, const std::tm& t, int ms);
+void WriteSystemTime(gaddr st, const std::tm& t, int ms);
 
 gaddr HeapAllocProcess(uint64_t size, bool zero);
 void HeapFreeProcess(gaddr p);
@@ -110,6 +111,9 @@ std::string NarrowPath(const std::u16string& path);
 // merged listings (overlay first). One entry outside the install.
 std::vector<std::string> HostDirs(const std::string& guest_dir);
 std::string GuestCurrentDir();
+// The absolute, normalised form of a guest path ("C:\\x\\y"), as
+// GetFullPathName gives it.
+std::string GuestFullPath(const std::string& path);
 
 // The process's main thread gets the thread object CreateThread gives the
 // others (GetCurrentThread, DuplicateHandle, waits).

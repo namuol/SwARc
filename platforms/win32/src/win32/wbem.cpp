@@ -175,6 +175,40 @@ HLE_NAMED("wbemprox.dll", "IWbemServices::CreateInstanceEnum", Svc_CreateInstanc
   return S_OK;
 }
 
+// (strQueryLanguage, strQuery, lFlags, pCtx, ppEnum): WQL "SELECT ... FROM
+// <class> [WHERE ...]" over the classes CreateInstanceEnum has; the WHERE
+// clause is not applied (nothing seen filters Win32_PNPEntity). Other
+// classes are not available, as CreateInstanceEnum's.
+HLE_NAMED("wbemprox.dll", "IWbemServices::ExecQuery", Svc_ExecQuery, 6) {
+  Self<Services>(c, "IWbemServices");
+  uint32_t out = Arg(c, 5);
+  if (!out) return E_POINTER;
+  Wr32(out, 0);
+  std::string q = Arg(c, 2) ? win32::Narrow(GWStr(Arg(c, 2))) : "";
+  std::string lower = q;
+  for (char& ch : lower) ch = char(std::tolower(uint8_t(ch)));
+  size_t from = lower.find(" from ");
+  std::string cls;
+  if (from != std::string::npos) {
+    size_t b = lower.find_first_not_of(' ', from + 6);
+    size_t e = lower.find(' ', b);
+    if (b != std::string::npos) cls = q.substr(b, e == std::string::npos ? e : e - b);
+  }
+  if (!EqualsIgnoreCase(win32::Widen(cls), "Win32_PNPEntity")) {
+    WarnF("wbem: ExecQuery(%s): class not available\n", q.c_str());
+    return WBEM_E_INVALID_CLASS;
+  }
+  auto e = std::make_shared<InstanceEnum>();
+  for (const XInputPad& p : XInputPads()) {
+    char id[64];
+    std::snprintf(id, sizeof id, "HID\\VID_%04X&PID_%04X&IG_00\\8&%X&0&0000", p.vid,
+                  p.pid, p.index + 1);
+    e->device_ids.push_back(win32::Widen(id));
+  }
+  Wr32(out, com::Publish(e, EnumVtable()));
+  return S_OK;
+}
+
 // ---- IEnumWbemClassObject -----------------------------------------------------
 
 HLE_NAMED("wbemprox.dll", "IEnumWbemClassObject::QueryInterface", Enum_QueryInterface, 3) {

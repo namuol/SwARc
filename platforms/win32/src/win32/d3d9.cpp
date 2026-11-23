@@ -66,6 +66,15 @@ gfx::Format FormatFromD3D(uint32_t f) {
     case D3DFMT_R32F: return F::R32F;
     case D3DFMT_G32R32F: return F::G32R32F;
     case D3DFMT_A32B32G32R32F: return F::A32B32G32R32F;
+    // 16-bit unsigned normalised RGBA, red first in memory as the GPU's.
+    case D3DFMT_A16B16G16R16: return F::R16G16B16A16;
+    // Signed (bump maps, Source's signed normalisation cube map): U first
+    // in memory, as the GPU's red.
+    case 63: return F::R8G8B8A8Snorm;  // D3DFMT_Q8W8V8U8
+    case 64: return F::R16G16Snorm;    // D3DFMT_V16U16
+    // NULL render targets: never seen, so any colour format serves; one
+    // the targets support gives the pass its size.
+    case D3DFMT_NULL: return F::A8R8G8B8;
     default: return F::Unknown;
   }
 }
@@ -82,7 +91,7 @@ bool IsBackBufferFormat(uint32_t f) {
 }
 
 bool IsRenderTargetFormat(uint32_t f) {
-  return IsBackBufferFormat(f) || gfx::IsFloat(FormatFromD3D(f));
+  return IsBackBufferFormat(f) || f == D3DFMT_NULL || gfx::IsFloat(FormatFromD3D(f));
 }
 
 namespace {
@@ -469,6 +478,12 @@ HLE("d3d9.dll", D3DPERF_EndEvent, 0) {
   return uint32_t(g_perf_level);
 }
 
+// D3DPERF_SetOptions(1) asks PIX not to profile the program: there is no
+// PIX. D3DPERF_GetStatus: not being profiled.
+HLE("d3d9.dll", D3DPERF_SetOptions, 1) { return 0; }
+HLE("d3d9.dll", D3DPERF_GetStatus, 0) { return 0; }
+HLE("d3d9.dll", D3DPERF_SetMarker, 2) { return 0; }
+
 // ---- IDirect3D9 ------------------------------------------------------------------
 
 HLE_NAMED("d3d9.dll", "IDirect3D9::QueryInterface", D3D9_QueryInterface, 3) {
@@ -494,6 +509,10 @@ HLE_NAMED("d3d9.dll", "IDirect3D9::GetAdapterIdentifier", D3D9_GetAdapterIdentif
   id->DriverVersionLowPart = (13u << 16) | 0u;
   id->DeviceIdentifier = {0x7B2D3B1A, 0x5C8E, 0x4F4D, {0x9A, 0x1E, 0x52, 0x45, 0x43, 0x4F, 0x4D, 0x50}};
   id->WHQLLevel = 1;
+  // The game's adapter identity (GameConfig::adapter), for games that
+  // choose rendering paths by vendor; none (0) by default.
+  id->VendorId = Game().adapter.vendor_id;
+  id->DeviceId = Game().adapter.device_id;
   return D3D_OK;
 }
 
@@ -544,14 +563,26 @@ HLE_NAMED("d3d9.dll", "IDirect3D9::CheckDeviceFormat", D3D9_CheckDeviceFormat, 7
   uint32_t usage = Arg(c, 4), rtype = Arg(c, 5), fmt = Arg(c, 6);
   gfx::Format f = FormatFromD3D(fmt);
   bool ok = Arg(c, 1) == 0 && f != gfx::Format::Unknown && f != gfx::Format::P8;
+  // Depth formats: depth-stencil surfaces, and D16, D24S8 and D24X8 as
+  // textures too (shadow maps: NVIDIA's hardware comparison when sampled).
   if (ok && IsDepthFormat(f))
-    ok = (usage & D3DUSAGE_DEPTHSTENCIL) && rtype == D3DRTYPE_SURFACE;
+    ok = rtype == D3DRTYPE_SURFACE ? (usage & D3DUSAGE_DEPTHSTENCIL) != 0
+         : rtype == D3DRTYPE_TEXTURE &&
+               (f == gfx::Format::D16 || f == gfx::Format::D24S8 || f == gfx::Format::D24X8);
   else if (ok && (usage & D3DUSAGE_DEPTHSTENCIL))
     ok = false;
   if (ok && (usage & D3DUSAGE_RENDERTARGET)) ok = IsRenderTargetFormat(fmt);
-  if (ok && (usage & (D3DUSAGE_QUERY_SRGBREAD | D3DUSAGE_QUERY_SRGBWRITE |
-                      D3DUSAGE_QUERY_VERTEXTEXTURE)))
-    ok = false;
+  if (ok && fmt == D3DFMT_NULL) ok = (usage & D3DUSAGE_RENDERTARGET) != 0;  // render targets only
+  // sRGB reads (SRGBTEXTURE) of 8-bit colour and block-compressed
+  // formats, and sRGB writes (SRGBWRITEENABLE) to 32-bit RGB targets: the
+  // translated shaders decode and encode (gfx). No vertex textures.
+  const bool srgb_read = fmt == D3DFMT_A8R8G8B8 || fmt == D3DFMT_X8R8G8B8 ||
+                         fmt == D3DFMT_DXT1 || fmt == D3DFMT_DXT2 || fmt == D3DFMT_DXT3 ||
+                         fmt == D3DFMT_DXT4 || fmt == D3DFMT_DXT5;
+  const bool srgb_write = fmt == D3DFMT_A8R8G8B8 || fmt == D3DFMT_X8R8G8B8;
+  if (ok && (usage & D3DUSAGE_QUERY_SRGBREAD) && !srgb_read) ok = false;
+  if (ok && (usage & D3DUSAGE_QUERY_SRGBWRITE) && !srgb_write) ok = false;
+  if (ok && (usage & D3DUSAGE_QUERY_VERTEXTEXTURE)) ok = false;
   if (ok && rtype != D3DRTYPE_SURFACE && rtype != D3DRTYPE_TEXTURE &&
       rtype != D3DRTYPE_CUBETEXTURE)
     ok = false;
@@ -831,6 +862,22 @@ HLE_NAMED("d3d9.dll", "IDirect3DDevice9::GetBackBuffer", D3DDev9_GetBackBuffer, 
   com::AddRef(d->backbuffer->guest);
   Wr32(Arg(c, 4), d->backbuffer->guest);
   return D3D_OK;
+}
+
+// SetGammaRamp(swapchain, flags, D3DGAMMARAMP*) / GetGammaRamp(swapchain,
+// ramp*): kept, read back, and applied to what is shown (gfx), windowed
+// too (Windows applied it to the display in fullscreen only).
+HLE_NAMED("d3d9.dll", "IDirect3DDevice9::SetGammaRamp", D3DDev9_SetGammaRamp, 4) {
+  Device* d = Dev(c);
+  std::memcpy(d->gamma.data(), GPtr(Arg(c, 3)), sizeof d->gamma);
+  RECOMP_TRACE("  ramp: red[64] %u [128] %u [192] %u (identity %u, %u, %u)\n", d->gamma[64], d->gamma[128],
+               d->gamma[192], 64 * 257, 128 * 257, 192 * 257);
+  if (d->gfx) d->gfx->SetGammaRamp(d->gamma.data());
+  return 0;
+}
+HLE_NAMED("d3d9.dll", "IDirect3DDevice9::GetGammaRamp", D3DDev9_GetGammaRamp, 3) {
+  std::memcpy(GPtr(Arg(c, 2)), Dev(c)->gamma.data(), sizeof Dev(c)->gamma);
+  return 0;
 }
 
 HLE_NAMED("d3d9.dll", "IDirect3DDevice9::GetRasterStatus", D3DDev9_GetRasterStatus, 3) {

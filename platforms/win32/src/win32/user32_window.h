@@ -17,6 +17,10 @@ inline constexpr uint32_t kPrimaryMonitor = 0x00010001;
 // The SDL window behind a top-level HWND, or nullptr.
 SDL_Window* SdlWindowFor(uint32_t hwnd);
 
+// Whether the game has shown hwnd (IsWindowVisible), whether or not a
+// background run shows the host window.
+bool WindowShown(uint32_t hwnd);
+
 // HDCs: GetDC(hwnd) returns DcForWindow(hwnd); WindowForDc maps it back
 // (0 for the screen DC or anything else).
 uint32_t DcForWindow(uint32_t hwnd);
@@ -80,6 +84,10 @@ void CursorInClient(uint32_t hwnd, int* x, int* y);
 // resources (LoadCursorA(hInstance, id): 0x10000 | id) as made from its
 // RT_CURSOR, any other the host's default arrow.
 void SetHostCursor(uint32_t hcursor);
+
+// SetCursor: whether the game's cursor is none (SetCursor(NULL)), which
+// with a hidden ShowCursor count marks the cursor as hidden (mouse look).
+void SetCursorNone(bool none);
 // PostMessage from host code (any thread): queues msg for hwnd's thread.
 // False if hwnd is not a window.
 bool PostWindowMessage(uint32_t hwnd, uint32_t msg, uint32_t wparam, uint32_t lparam);

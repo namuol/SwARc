@@ -115,9 +115,12 @@ endif()
 set_source_files_properties(src/win32/d3dx9.cpp TARGET_DIRECTORY recomp_d3d9
   PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
 
-# OpenGL 1.x (opengl32, wgl, gdi32 pixel formats) over gfx::Device.
+# OpenGL (opengl32, wgl, gdi32 pixel formats) over gfx::Device: GL 1.x and
+# the ARB/EXT programmable pipeline (GLSL translated to device programs).
 add_library(recomp_opengl SHARED
   ${RECOMP_ROOT}/src/runtime/gl/context.cpp
+  ${RECOMP_ROOT}/src/runtime/gl/glsl.cpp
+  ${RECOMP_ROOT}/src/runtime/gl/program.cpp
   src/win32/opengl32.cpp)
 target_link_libraries(recomp_opengl PUBLIC recomp_win32 recomp_gfx)
 

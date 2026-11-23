@@ -443,19 +443,14 @@ class Translator {
       case MOVA: need(1); return S(s[0]);
       case ADD: need(2); return "(" + S(s[0]) + " + " + S(s[1]) + ")";
       case SUB: need(2); return "(" + S(s[0]) + " - " + S(s[1]) + ")";
-      // Products as Direct3D 9 shader hardware forms them: 0 times anything
-      // (infinity, NaN) is 0 (r_dmul). Shaders rely on it, e.g. a zero
-      // attenuation times a light term that is infinite where it divides by
-      // zero; IEEE gives NaN or infinity there, which then spreads through
-      // blurs and averages.
-      case MUL:
-        need(2);
-        helpers_.insert("dmul");
-        return "r_dmul(" + S(s[0]) + ", " + S(s[1]) + ")";
+      // D3D9's multiplies give 0 when either factor is 0, even with an
+      // infinite or NaN other factor (r_lmul): shaders depend on it (Source's
+      // skin shaders: 0 * log2(0) in a pow).
+      case MUL: need(2); helpers_.insert("lmul"); return "r_lmul(" + S(s[0]) + ", " + S(s[1]) + ")";
       case MAD:
         need(3);
-        helpers_.insert("dmul");
-        return "(r_dmul(" + S(s[0]) + ", " + S(s[1]) + ") + " + S(s[2]) + ")";
+        helpers_.insert("lmul");
+        return "(r_lmul(" + S(s[0]) + ", " + S(s[1]) + ") + " + S(s[2]) + ")";
       case MIN: need(2); return "min(" + S(s[0]) + ", " + S(s[1]) + ")";
       case MAX: need(2); return "max(" + S(s[0]) + ", " + S(s[1]) + ")";
       case SLT: need(2); return "vec4(lessThan(" + S(s[0]) + ", " + S(s[1]) + "))";
@@ -478,36 +473,30 @@ class Translator {
           return "r_logp1(" + S1(s[0]) + ")";
         }
         return "vec4(log2(abs(" + S1(s[0]) + ")))";
-      case POW: need(2); return "vec4(pow(abs(" + S1(s[0]) + "), " + S1(s[1]) + "))";
-      case DP3:
-        need(2);
-        helpers_.insert("dmul");
-        return "vec4(r_ddot(vec4((" + S(s[0]) + ").xyz, 0.0), vec4((" + S(s[1]) + ").xyz, 0.0)))";
-      case DP4:
-        need(2);
-        helpers_.insert("dmul");
-        return "vec4(r_ddot(" + S(s[0]) + ", " + S(s[1]) + "))";
+      case POW: need(2); helpers_.insert("lmul"); return "vec4(r_lpow(" + S1(s[0]) + ", " + S1(s[1]) + "))";
+      case DP3: need(2); helpers_.insert("lmul"); return "vec4(r_ldot3(" + S(s[0]) + ", " + S(s[1]) + "))";
+      case DP4: need(2); helpers_.insert("lmul"); return "vec4(r_ldot4(" + S(s[0]) + ", " + S(s[1]) + "))";
       case DP2ADD:
         need(3);
-        helpers_.insert("dmul");
-        return "vec4(r_ddot(vec4((" + S(s[0]) + ").xy, 0.0, 0.0), vec4((" + S(s[1]) + ").xy, 0.0, 0.0)) + " +
-               S1(s[2]) + ")";
+        helpers_.insert("lmul");
+        return "vec4(r_ldot2(" + S(s[0]) + ", " + S(s[1]) + ") + " + S1(s[2]) + ")";
       case LIT: need(1); helpers_.insert("lit"); return "r_lit(" + S(s[0]) + ")";
       case DST:
         need(2);
         return "vec4(1.0, (" + S(s[0]) + ").y * (" + S(s[1]) + ").y, (" + S(s[0]) + ").z, (" +
                S(s[1]) + ").w)";
-      case LRP: need(3); return "mix(" + S(s[2]) + ", " + S(s[1]) + ", " + S(s[0]) + ")";
+      case LRP:
+        need(3);
+        helpers_.insert("lmul");
+        return "(r_lmul(" + S(s[0]) + ", " + S(s[1]) + " - " + S(s[2]) + ") + " + S(s[2]) + ")";
       case FRC: need(1); return "fract(" + S(s[0]) + ")";
       case ABS: need(1); return "abs(" + S(s[0]) + ")";
       case SGN: need(1); return "sign(" + S(s[0]) + ")";
       case CRS: need(2); return "vec4(cross((" + S(s[0]) + ").xyz, (" + S(s[1]) + ").xyz), 0.0)";
-      // D3D9's multiply (0 * inf = 0): a zero vector normalizes to zero, not NaN.
       case NRM:
         need(1);
-        helpers_.insert("dmul");
-        return "r_dmul(" + S(s[0]) + ", vec4(inversesqrt(dot((" + S(s[0]) + ").xyz, (" + S(s[0]) +
-               ").xyz))))";
+        helpers_.insert("lmul");
+        return "r_lmul(" + S(s[0]) + ", vec4(inversesqrt(r_ldot3(" + S(s[0]) + ", " + S(s[0]) + "))))";
       case SINCOS: need(1); return "vec4(cos(" + S1(s[0]) + "), sin(" + S1(s[0]) + "), 0.0, 0.0)";
       case CMP:
         need(3);
@@ -532,9 +521,8 @@ class Translator {
           Param row = s[1];
           row.num += uint32_t(k);
           std::string b = S(row);
-          helpers_.insert("dmul");
-          r += three ? "r_ddot(vec4((" + a + ").xyz, 0.0), vec4((" + b + ").xyz, 0.0))"
-                     : "r_ddot(" + a + ", " + b + ")";
+          helpers_.insert("lmul");
+          r += (three ? "r_ldot3(" : "r_ldot4(") + a + ", " + b + ")";
         }
         return r + ")";
       }
@@ -545,28 +533,41 @@ class Translator {
         std::string co = ty == ParamType::Sampler2D ? "(" + c + ").xy" : "(" + c + ").xyz";
         // The sampler's LOD bias (R_BIAS, hlsl.h); texld is pixel-only.
         std::string b = "R_BIAS(" + std::to_string(s[1].num) + ")";
+        // The sampler's SRGBTEXTURE (R_SRGB, the device's prelude): the
+        // texel decoded from sRGB to linear.
+        const std::string n = std::to_string(s[1].num);
+        auto srgb = [&](const std::string& e) { return "R_SRGB(" + n + ", " + e + ")"; };
+        // 2D: through r_texN (in the declarations), which a depth texture's
+        // variant makes a shadow map comparison.
+        if (ty == ParamType::Sampler2D) {
+          const std::string f = "r_tex" + n + "(" + c + ", ";
+          if (in.ctl == 1) return srgb(f + "true, " + b + ")");                       // texldp
+          if (in.ctl == 2) return srgb(f + "false, (" + c + ").w + " + b + ")");  // texldb
+          return srgb(f + "false, " + b + ")");
+        }
         if (in.ctl == 1) {  // texldp
-          if (ty == ParamType::Sampler2D) return "textureProj(" + smp + ", " + c + ", " + b + ")";
-          return "texture(" + smp + ", (" + c + ").xyz / (" + c + ").w, " + b + ")";
+          return srgb("texture(" + smp + ", (" + c + ").xyz / (" + c + ").w, " + b + ")");
         }
         if (in.ctl == 2)  // texldb
-          return "texture(" + smp + ", " + co + ", (" + c + ").w + " + b + ")";
-        return "texture(" + smp + ", " + co + ", " + b + ")";
+          return srgb("texture(" + smp + ", " + co + ", (" + c + ").w + " + b + ")");
+        return srgb("texture(" + smp + ", " + co + ", " + b + ")");
       }
       case TEXLDL: {
         need(2);
         ParamType ty = sampler_type_.count(s[1].num) ? sampler_type_[s[1].num] : ParamType::Sampler2D;
         std::string smp = SamplerName(s[1].num), c = S(s[0]);
         std::string co = ty == ParamType::Sampler2D ? "(" + c + ").xy" : "(" + c + ").xyz";
-        return "textureLod(" + smp + ", " + co + ", (" + c + ").w)";
+        std::string e = "textureLod(" + smp + ", " + co + ", (" + c + ").w)";
+        return pixel_ ? "R_SRGB(" + std::to_string(s[1].num) + ", " + e + ")" : e;
       }
       case TEXLDD: {
         need(4);
         ParamType ty = sampler_type_.count(s[1].num) ? sampler_type_[s[1].num] : ParamType::Sampler2D;
         std::string smp = SamplerName(s[1].num);
         const char* sw = ty == ParamType::Sampler2D ? ".xy" : ".xyz";
-        return "textureGrad(" + smp + ", (" + S(s[0]) + ")" + sw + ", (" + S(s[2]) + ")" + sw +
-               ", (" + S(s[3]) + ")" + sw + ")";
+        std::string e = "textureGrad(" + smp + ", (" + S(s[0]) + ")" + sw + ", (" + S(s[2]) + ")" +
+                        sw + ", (" + S(s[3]) + ")" + sw + ")";
+        return pixel_ ? "R_SRGB(" + std::to_string(s[1].num) + ", " + e + ")" : e;
       }
       default:
         Fail("unsupported opcode " + std::to_string(in.op) + " in " +
@@ -916,8 +917,23 @@ class Translator {
       const char* ty = t == ParamType::SamplerCube ? "samplerCube"
                        : t == ParamType::Sampler3D ? "sampler3D"
                                                    : "sampler2D";
-      h += "layout(R_SAMPLER_BINDING(" + std::to_string(n) + ")) uniform " + ty + " r_s" +
-           std::to_string(n) + ";\n";
+      const std::string ns = std::to_string(n);
+      const std::string decl = "layout(R_SAMPLER_BINDING(" + ns + ")) uniform ";
+      if (pixel_ && t == ParamType::Sampler2D) {
+        // A depth texture bound here (a backend's variant defines
+        // R_SHADOW_n): Direct3D 9's hardware shadow maps, the texel's
+        // depth compared with the coordinate's z (z / w projected), 1
+        // where it is not nearer, filtered as the sampler's filter says.
+        h += "#ifdef R_SHADOW_" + ns + "\n" + decl + "sampler2DShadow r_s" + ns + ";\n" +
+             "vec4 r_tex" + ns + "(vec4 c, bool proj, float bias) {\n" +
+             "  return vec4(texture(r_s" + ns + ", proj ? c.xyz / c.w : c.xyz));\n}\n" +
+             "#else\n" + decl + "sampler2D r_s" + ns + ";\n" +
+             "vec4 r_tex" + ns + "(vec4 c, bool proj, float bias) {\n" +
+             "  return proj ? textureProj(r_s" + ns + ", c, bias) : texture(r_s" + ns + ", c.xy, bias);\n}\n" +
+             "#endif\n";
+      } else {
+        h += decl + ty + " r_s" + ns + ";\n";
+      }
       out_->samplers.push_back(Sampler{n, t});
     }
 
@@ -1037,6 +1053,9 @@ class Translator {
       if ((out_->color_outputs & 1) && major_ < 3)
         post += "  r_fog(r_c0, " + Varying({kFog, 0}, false) + ".x);\n";
       if (out_->color_outputs & 1) post += "  r_color0(r_c0);\n";
+      // An occlusion query's pixel count (a backend's variant defines it),
+      // after everything that can discard.
+      post += "#ifdef R_OCCL_COUNT\n  R_OCCL_COUNT();\n#endif\n";
     }
     pre = "  for (int i = 0; i < " + std::to_string(std::max(temps_, 1u)) + "; i++) r_t[i] = vec4(0.0);\n" + pre;
 
@@ -1047,15 +1066,22 @@ class Translator {
         help += "  if (i == " + std::to_string(k) + ") return r_dc" + std::to_string(k) + ";\n";
       help += "  return i >= 0 && i < " + std::to_string(max_c_) + " ? c[i] : vec4(0.0);\n}\n";
     }
-    if (helpers_.count("dmul"))
-      help += "vec4 r_dmul(vec4 a, vec4 b) {\n"
-              "  bvec4 z = bvec4(vec4(equal(a, vec4(0.0))) + vec4(equal(b, vec4(0.0))));\n"
-              "  return mix(a * b, vec4(0.0), z);\n"
-              "}\n"
-              "float r_ddot(vec4 a, vec4 b) {\n"
-              "  vec4 m = r_dmul(a, b);\n"
-              "  return m.x + m.y + m.z + m.w;\n"
-              "}\n";
+    if (helpers_.count("lmul"))
+      help +=
+          "vec4 r_lmul(vec4 a, vec4 b) {\n"
+          "  bvec4 z = bvec4(uvec4(equal(a, vec4(0.0))) | uvec4(equal(b, vec4(0.0))));\n"
+          "  return mix(a * b, vec4(0.0), z);\n"
+          "}\n"
+          "float r_ldot2(vec4 a, vec4 b) { vec4 p = r_lmul(a, b); return p.x + p.y; }\n"
+          "float r_ldot3(vec4 a, vec4 b) { vec4 p = r_lmul(a, b); return p.x + p.y + p.z; }\n"
+          "float r_ldot4(vec4 a, vec4 b) { vec4 p = r_lmul(a, b); return p.x + p.y + p.z + p.w; }\n"
+          "// pow as D3D9's exp2(y * log2(|x|)) with its multiply: x^0 is 1, 0^y 0 (y > 0).\n"
+          "float r_lpow(float x, float y) {\n"
+          "  x = abs(x);\n"
+          "  if (y == 0.0) return 1.0;\n"
+          "  if (x == 0.0) return y > 0.0 ? 0.0 : uintBitsToFloat(0x7F800000u);\n"
+          "  return exp2(y * log2(x));\n"
+          "}\n";
     if (helpers_.count("lit"))
       help += "vec4 r_lit(vec4 s) {\n"
               "  float p = clamp(s.w, -128.0, 128.0);\n"

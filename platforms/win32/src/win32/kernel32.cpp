@@ -33,7 +33,7 @@ GuestHeap* g_process_heap = nullptr;
 
 const auto g_start = std::chrono::steady_clock::now();
 
-GuestHeap* NewHeap(uint32_t initial, uint32_t max) {
+GuestHeap* NewHeap(uint64_t initial, uint64_t max) {
   auto h = std::make_unique<GuestHeap>(g_proc->vm, initial, max);
   GuestHeap* raw = h.get();
   if (!raw->handle()) return nullptr;
@@ -66,7 +66,7 @@ uint32_t TickCount() {
   return uint32_t(duration_cast<milliseconds>(steady_clock::now() - g_start).count());
 }
 
-void WriteSystemTime(uint32_t st, const std::tm& t, int ms) {
+void WriteSystemTime(gaddr st, const std::tm& t, int ms) {
   Wr16(st + 0, uint16_t(t.tm_year + 1900));
   Wr16(st + 2, uint16_t(t.tm_mon + 1));
   Wr16(st + 4, uint16_t(t.tm_wday));
@@ -138,26 +138,102 @@ using namespace win32;
 
 // ---- process / module ----------------------------------------------------
 
-HLE("kernel32.dll", GetVersion, 0) {
+// The version the PEB gives (process.cpp): Windows XP for 32-bit guests,
+// Windows 10 22H2 for x64 ones: build << 16 | minor << 8 | major (an NT
+// platform leaves bit 31 clear).
+HLE64("kernel32.dll", GetVersion, 0) {
+  if (g_proc->x64) return 0x4A65000A;  // 10.0, build 19045
   return 0x0A280105;  // Windows XP: build 2600, 5.1, NT platform
 }
 
-HLE("kernel32.dll", GetVersionExA, 1) {
-  uint32_t vi = Arg(c, 0);
+// The Windows guests see (as the PEB says): XP SP3 for 32-bit guests,
+// Windows 10 22H2 for x64 ones.
+struct OsVersion {
+  uint32_t major, minor, build;
+  uint16_t sp_major;
+  const char* csd;
+};
+OsVersion GuestOsVersion() {
+  return g_proc->x64 ? OsVersion{10, 0, 19045, 0, ""} : OsVersion{5, 1, 2600, 3, "Service Pack 3"};
+}
+
+// OSVERSIONINFO{,EX}{A,W}: no pointers, the same on x64. The W form's
+// szCSDVersion is 128 WCHARs, so the EX fields after it sit 128 bytes on.
+uint64_t GetVersionEx(gaddr vi, bool wide) {
+  const OsVersion v = GuestOsVersion();
   uint32_t size = Rd32(vi);
-  Wr32(vi + 4, 5);
-  Wr32(vi + 8, 1);
-  Wr32(vi + 12, 2600);
+  Wr32(vi + 4, v.major);
+  Wr32(vi + 8, v.minor);
+  Wr32(vi + 12, v.build);
   Wr32(vi + 16, 2);  // VER_PLATFORM_WIN32_NT
-  std::memset(GPtr(vi + 20), 0, 128);
-  PutStr(vi + 20, "Service Pack 3");
-  if (size >= 156) {  // OSVERSIONINFOEXA
-    Wr16(vi + 148, 3);
-    Wr16(vi + 150, 0);
-    Wr16(vi + 152, 0x100);  // VER_SUITE_SINGLEUSERTS
-    Wr8(vi + 154, 1);       // VER_NT_WORKSTATION
+  std::memset(GPtr(vi + 20), 0, wide ? 256 : 128);
+  if (wide) PutWStr(vi + 20, v.csd);
+  else PutStr(vi + 20, v.csd);
+  const gaddr ex = vi + (wide ? 276 : 148);
+  if (size >= (wide ? 284u : 156u)) {  // OSVERSIONINFOEX
+    Wr16(ex + 0, v.sp_major);
+    Wr16(ex + 2, 0);
+    Wr16(ex + 4, 0x100);  // VER_SUITE_SINGLEUSERTS
+    Wr8(ex + 6, 1);       // VER_NT_WORKSTATION
   }
   return 1;
+}
+HLE64("kernel32.dll", GetVersionExA, 1) { return GetVersionEx(Arg(c, 0), false); }
+HLE64("kernel32.dll", GetVersionExW, 1) { return GetVersionEx(Arg(c, 0), true); }
+
+// VerSetConditionMask(mask, type, condition): each VER_* type bit (minor
+// 1, major 2, build 4, platform 8, service pack minor 0x10 and major 0x20,
+// suite 0x40, product type 0x80) has a 3-bit condition, at 3 * its bit
+// index, as Windows packs them.
+HLE64("kernel32.dll", VerSetConditionMask, 3) {
+  uint64_t mask = Arg(c, 0);
+  uint32_t type = uint32_t(Arg(c, 1));
+  uint64_t cond = Arg(c, 2) & 7;
+  for (int i = 0; i < 8; i++)
+    if (type & (1u << i)) mask = (mask & ~(uint64_t(7) << (3 * i))) | cond << (3 * i);
+  return mask;
+}
+
+// VerifyVersionInfoW(OSVERSIONINFOEXW*, type, condition mask): the major,
+// minor and service-pack versions compare as one number under the
+// condition of the most significant of them asked for, as Windows does;
+// the build number and platform on their own. FALSE with
+// ERROR_OLD_WIN_VERSION when the system does not match.
+HLE64("kernel32.dll", VerifyVersionInfoW, 3) {
+  const gaddr vi = Arg(c, 0);
+  const uint32_t type = uint32_t(Arg(c, 1));
+  const uint64_t mask = Arg(c, 2);
+  const OsVersion v = GuestOsVersion();
+  auto cond = [&](int bit) { return uint32_t(mask >> (3 * bit)) & 7; };
+  auto test = [](uint32_t cnd, uint64_t have, uint64_t want) {
+    switch (cnd) {
+      case 1: return have == want;  // VER_EQUAL
+      case 2: return have > want;   // VER_GREATER
+      case 3: return have >= want;  // VER_GREATER_EQUAL
+      case 4: return have < want;   // VER_LESS
+      case 5: return have <= want;  // VER_LESS_EQUAL
+      default: return false;
+    }
+  };
+  bool ok = true;
+  // major (bit 1), minor (bit 0), service pack major (bit 5), minor (bit 4)
+  if (type & (0x2 | 0x1 | 0x20 | 0x10)) {
+    int top = (type & 0x2) ? 1 : (type & 0x1) ? 0 : (type & 0x20) ? 5 : 4;
+    uint64_t have = uint64_t(v.major) << 48 | uint64_t(v.minor) << 32 | uint64_t(v.sp_major) << 16;
+    uint64_t want = 0;
+    if (type & 0x2) want |= uint64_t(Rd32(vi + 4)) << 48;
+    else have &= ~(uint64_t(0xFFFF) << 48);
+    if (type & 0x1) want |= uint64_t(Rd32(vi + 8)) << 32;
+    else have &= ~(uint64_t(0xFFFF) << 32);
+    if (type & 0x20) want |= uint64_t(Rd16(vi + 276)) << 16;
+    else have &= ~(uint64_t(0xFFFF) << 16);
+    if (type & 0x10) want |= Rd16(vi + 278);
+    ok &= test(cond(top), have, want);
+  }
+  if (type & 0x4) ok &= test(cond(2), v.build, Rd32(vi + 12));
+  if (type & 0x8) ok &= test(cond(3), 2, Rd32(vi + 16));
+  if (!ok) SetLastError(1150);  // ERROR_OLD_WIN_VERSION
+  return ok ? 1 : 0;
 }
 
 // Lifted DLLs (GameConfig::lifted_dlls) are mapped at startup; LoadLibrary
@@ -369,9 +445,9 @@ HLE64("kernel32.dll", GetStartupInfoA, 1) { return StartupInfo(Arg(c, 0)); }
 HLE64("kernel32.dll", GetStartupInfoW, 1) { return StartupInfo(Arg(c, 0)); }
 
 HLE("kernel32.dll", GetEnvironmentStrings, 0) { return g_win32->environ_a; }
-HLE("kernel32.dll", GetEnvironmentStringsW, 0) { return g_win32->environ_w; }
+HLE64("kernel32.dll", GetEnvironmentStringsW, 0) { return g_win32->environ_w; }
 HLE("kernel32.dll", FreeEnvironmentStringsA, 1) { return 1; }
-HLE("kernel32.dll", FreeEnvironmentStringsW, 1) { return 1; }
+HLE64("kernel32.dll", FreeEnvironmentStringsW, 1) { return 1; }
 
 HLE("kernel32.dll", GetEnvironmentVariableA, 3) {
   std::string name = GStr(Arg(c, 0));
@@ -403,12 +479,12 @@ uint32_t SetEnvVar(const std::string& name, const std::string* value) {
   return 1;
 }
 
-HLE("kernel32.dll", SetEnvironmentVariableA, 2) {
+HLE64("kernel32.dll", SetEnvironmentVariableA, 2) {
   std::string v = Arg(c, 1) ? GStr(Arg(c, 1)) : "";
   return SetEnvVar(GStr(Arg(c, 0)), Arg(c, 1) ? &v : nullptr);
 }
 
-HLE("kernel32.dll", SetEnvironmentVariableW, 2) {
+HLE64("kernel32.dll", SetEnvironmentVariableW, 2) {
   std::string v = Arg(c, 1) ? Narrow(GWStr(Arg(c, 1))) : "";
   return SetEnvVar(Narrow(GWStr(Arg(c, 0))), Arg(c, 1) ? &v : nullptr);
 }
@@ -438,8 +514,18 @@ HLE("kernel32.dll", SetThreadExecutionState, 1) {
 // terminal's signals end the process directly. Registration succeeds.
 HLE("kernel32.dll", SetConsoleCtrlHandler, 2) { return 1; }
 
-HLE("kernel32.dll", GetSystemDirectoryA, 2) {
-  return CopyOut(Arg(c, 0), Arg(c, 1), "C:\\WINDOWS\\system32");
+HLE64("kernel32.dll", GetSystemDirectoryA, 2) {
+  return CopyOut(Arg(c, 0), uint32_t(Arg(c, 1)), "C:\\WINDOWS\\system32");
+}
+
+// HeapCompact(heap, flags): the size of the largest free block. Heaps
+// grow on demand, so a large block is always available.
+HLE64("kernel32.dll", HeapCompact, 2) { return FindHeap(Arg(c, 0)) ? 0x00100000 : 0; }
+
+HLE64("kernel32.dll", SwitchToThread, 0) {
+  GuestSyncPoint sync;
+  std::this_thread::yield();
+  return 1;
 }
 
 HLE64("kernel32.dll", GetCurrentProcess, 0) { return HandleRet(0xFFFFFFFF); }
@@ -458,7 +544,8 @@ HLE64("kernel32.dll", ExitProcess, 1) {
 HLE64("kernel32.dll", TerminateProcess, 2) {
   auto p = GetHandle(uint32_t(Arg(c, 0)));
   if (p && p->type == KObject::Type::Process) {
-    std::fprintf(stderr, "TerminateProcess(self, %u)\n", uint32_t(Arg(c, 1)));
+    std::fprintf(stderr, "TerminateProcess(self, %u) (return address %08X, guest thread %04X)\n",
+                 uint32_t(Arg(c, 1)), uint32_t(Rd32(c.esp)), CurrentThread()->tid);
     std::_Exit(int(Arg(c, 1)));
   }
   return 0;
@@ -619,12 +706,12 @@ HLE("kernel32.dll", GetComputerNameA, 2) {
 
 HLE64("kernel32.dll", GetProcessHeap, 0) { return g_win32->process_heap; }
 
-HLE("kernel32.dll", HeapCreate, 3) {
+HLE64("kernel32.dll", HeapCreate, 3) {
   GuestHeap* h = NewHeap(Arg(c, 1), Arg(c, 2));
   return h ? h->handle() : 0;
 }
 
-HLE("kernel32.dll", HeapDestroy, 1) {
+HLE64("kernel32.dll", HeapDestroy, 1) {
   std::lock_guard<std::mutex> l(g_heaps_mu);
   return g_heaps.erase(Arg(c, 0)) ? 1 : 0;
 }
@@ -647,30 +734,36 @@ HLE64("kernel32.dll", HeapFree, 3) {
   return 1;
 }
 
-HLE("kernel32.dll", HeapReAlloc, 4) {
+HLE64("kernel32.dll", HeapReAlloc, 4) {
   GuestHeap* h = FindHeap(Arg(c, 0));
-  uint32_t flags = Arg(c, 1);
+  uint32_t flags = uint32_t(Arg(c, 1));
   if (!h) return 0;
   return h->ReAlloc(Arg(c, 2), Arg(c, 3), flags & kHeapZeroMemory,
                     flags & kHeapReallocInPlaceOnly);
 }
 
-HLE("kernel32.dll", HeapSize, 3) {
+HLE64("kernel32.dll", HeapSize, 3) {
   GuestHeap* h = FindHeap(Arg(c, 0));
-  return h ? h->Size(Arg(c, 2)) : 0xFFFFFFFF;
+  // (SIZE_T)-1 on failure.
+  return h ? h->Size(Arg(c, 2)) : g_proc->x64 ? ~uint64_t(0) : 0xFFFFFFFF;
 }
 
-HLE("kernel32.dll", GlobalAlloc, 2) {
+// HeapSetInformation(heap, class, info, length): the low-fragmentation
+// heap and terminate-on-corruption (the CRT's and Source's startup) change
+// nothing a guest can see.
+HLE64("kernel32.dll", HeapSetInformation, 4) { return 1; }
+
+HLE64("kernel32.dll", GlobalAlloc, 2) {
   // GMEM_MOVEABLE handles are returned as plain pointers; GlobalLock is
   // then the identity. Only used for clipboard data here.
   return HeapAllocProcess(Arg(c, 1), Arg(c, 0) & 0x40);
 }
-HLE("kernel32.dll", GlobalLock, 1) { return Arg(c, 0); }
+HLE64("kernel32.dll", GlobalLock, 1) { return Arg(c, 0); }
 HLE("kernel32.dll", GlobalSize, 1) {
   uint32_t s = g_process_heap->Size(Arg(c, 0));
   return s == 0xFFFFFFFF ? 0 : s;
 }
-HLE("kernel32.dll", GlobalUnlock, 1) { return 1; }
+HLE64("kernel32.dll", GlobalUnlock, 1) { return 1; }
 HLE("kernel32.dll", GlobalFree, 1) {
   g_process_heap->Free(Arg(c, 0));
   return 0;
@@ -678,7 +771,7 @@ HLE("kernel32.dll", GlobalFree, 1) {
 
 // LocalAlloc(flags, size): like GlobalAlloc, LMEM_MOVEABLE handles are plain
 // pointers (LocalLock would be the identity); LMEM_ZEROINIT is 0x40.
-HLE("kernel32.dll", LocalAlloc, 2) {
+HLE64("kernel32.dll", LocalAlloc, 2) {
   return HeapAllocProcess(Arg(c, 1) ? Arg(c, 1) : 1, Arg(c, 0) & 0x40);
 }
 
@@ -1066,7 +1159,7 @@ HLE64("kernel32.dll", InitializeCriticalSection, 1) {
 
 // InitializeCriticalSectionEx(cs, spin count, flags): the flags only
 // control debug info.
-HLE("kernel32.dll", InitializeCriticalSectionEx, 3) {
+HLE64("kernel32.dll", InitializeCriticalSectionEx, 3) {
   InitCs(Arg(c, 0), uint32_t(Arg(c, 1)));
   return 1;
 }
@@ -1114,21 +1207,52 @@ uint64_t SListPack(uint32_t next, uint64_t depth, uint64_t seq) {
 }
 }  // namespace
 
+// x64 SLIST_HEADER: 16 bytes, updated by cmpxchg16b on Windows. The low
+// qword holds Depth (bits 0-15) and Sequence (16-63); the high one the
+// first entry's address (16-byte aligned, so its low 4 bits are free) with
+// HeaderType (bit 0) set, as x64 Windows writes it. An entry's first qword
+// is its Next link. The four operations run under one lock: guests reach
+// the list only through these calls (RtlFirstEntrySList reads the high
+// qword, which a locked update writes whole).
+std::mutex g_slist64_mu;
+gaddr SList64First(gaddr head) { return Rd64(head + 8) & ~uint64_t(0xF); }
+void SList64Set(gaddr head, gaddr first, uint64_t depth, uint64_t seq) {
+  Wr64(head, (depth & 0xFFFF) | seq << 16);
+  Wr64(head + 8, first | 1);
+}
+
 // Returns the previous first entry (0 if the list was empty).
-HLE("kernel32.dll", InterlockedPushEntrySList, 2) {
+HLE64("kernel32.dll", InterlockedPushEntrySList, 2) {
   gaddr head = Arg(c, 0), entry = Arg(c, 1);
+  if (g_proc->x64) {
+    std::lock_guard<std::mutex> l(g_slist64_mu);
+    const gaddr first = SList64First(head);
+    const uint64_t lo = Rd64(head);
+    Wr64(entry, first);
+    SList64Set(head, entry, (lo & 0xFFFF) + 1, (lo >> 16) + 1);
+    return first;
+  }
   auto w = SListWord(head);
   uint64_t old = w.load();
   for (;;) {
     uint32_t first = uint32_t(old);
     Wr32(entry, first);
-    uint64_t neu = SListPack(entry, (old >> 32) + 1, (old >> 48) + 1);
+    uint64_t neu = SListPack(uint32_t(entry), (old >> 32) + 1, (old >> 48) + 1);
     if (w.compare_exchange_weak(old, neu)) return first;
   }
 }
 
 // Returns the removed first entry, or 0 if the list was empty.
-HLE("kernel32.dll", InterlockedPopEntrySList, 1) {
+HLE64("kernel32.dll", InterlockedPopEntrySList, 1) {
+  if (g_proc->x64) {
+    gaddr head = Arg(c, 0);
+    std::lock_guard<std::mutex> l(g_slist64_mu);
+    const gaddr first = SList64First(head);
+    if (!first) return 0;
+    const uint64_t lo = Rd64(head);
+    SList64Set(head, Rd64(first), (lo & 0xFFFF) - 1, (lo >> 16) + 1);
+    return first;
+  }
   auto w = SListWord(Arg(c, 0));
   uint64_t old = w.load();
   for (;;) {
@@ -1140,7 +1264,14 @@ HLE("kernel32.dll", InterlockedPopEntrySList, 1) {
 }
 
 // Empties the list; returns the old first entry (the chain stays linked).
-HLE("kernel32.dll", InterlockedFlushSList, 1) {
+HLE64("kernel32.dll", InterlockedFlushSList, 1) {
+  if (g_proc->x64) {
+    gaddr head = Arg(c, 0);
+    std::lock_guard<std::mutex> l(g_slist64_mu);
+    const gaddr first = SList64First(head);
+    SList64Set(head, 0, 0, (Rd64(head) >> 16) + 1);
+    return first;
+  }
   auto w = SListWord(Arg(c, 0));
   uint64_t old = w.load();
   while (!w.compare_exchange_weak(old, SListPack(0, 0, old >> 48))) {
@@ -1148,7 +1279,11 @@ HLE("kernel32.dll", InterlockedFlushSList, 1) {
   return uint32_t(old);
 }
 
-HLE("kernel32.dll", QueryDepthSList, 1) {
+HLE64("kernel32.dll", QueryDepthSList, 1) {
+  if (g_proc->x64) {
+    std::lock_guard<std::mutex> l(g_slist64_mu);
+    return Rd64(Arg(c, 0)) & 0xFFFF;
+  }
   return uint32_t(SListWord(Arg(c, 0)).load() >> 32 & 0xFFFF);
 }
 
@@ -1192,12 +1327,13 @@ HLE("kernel32.dll", InterlockedExchangeAdd, 2) {
 
 // ---- time ----------------------------------------------------------------
 
-HLE("kernel32.dll", GetTickCount, 0) { return TickCount(); }
+HLE64("kernel32.dll", GetTickCount, 0) { return TickCount(); }
 // ULONGLONG GetTickCount64(): EDX:EAX, milliseconds since start; does not
 // wrap after 49.7 days as GetTickCount does.
-HLE("kernel32.dll", GetTickCount64, 0) {
+HLE64("kernel32.dll", GetTickCount64, 0) {
   using namespace std::chrono;
   uint64_t ms = uint64_t(duration_cast<milliseconds>(steady_clock::now() - g_start).count());
+  if (g_proc->x64) return ms;
   c.edx = uint32_t(ms >> 32);
   return uint32_t(ms);
 }
@@ -1219,7 +1355,35 @@ HLE64("kernel32.dll", GetSystemTimeAsFileTime, 1) {
   return 0;
 }
 
-HLE("kernel32.dll", GetSystemTime, 1) {
+// GetThreadTimes(thread, creation, exit, kernel, user) and
+// GetProcessTimes(process, ...): FILETIMEs. The CPU time is the host's:
+// the calling thread's own for the current thread (profilers time their
+// own work), the process's for the process and for any other thread
+// (host threads are not tracked by guest handle). Creation is the
+// process's start, exit 0 (still running); all CPU time counts as user.
+uint64_t CpuTime100ns(clockid_t clock) {
+  timespec ts;
+  clock_gettime(clock, &ts);
+  return uint64_t(ts.tv_sec) * 10000000 + uint64_t(ts.tv_nsec) / 100;
+}
+uint32_t PutTimes(Ctx& c, uint64_t cpu) {
+  using namespace std::chrono;
+  static const uint64_t start =
+      uint64_t(duration_cast<nanoseconds>(system_clock::now().time_since_epoch()).count() / 100) +
+      kFileTimeUnixEpoch;
+  if (Arg(c, 1)) Wr64(Arg(c, 1), start);
+  if (Arg(c, 2)) Wr64(Arg(c, 2), 0);
+  if (Arg(c, 3)) Wr64(Arg(c, 3), 0);
+  if (Arg(c, 4)) Wr64(Arg(c, 4), cpu);
+  return 1;
+}
+HLE("kernel32.dll", GetThreadTimes, 5) {
+  return PutTimes(c, CpuTime100ns(uint32_t(Arg(c, 0)) == 0xFFFFFFFE ? CLOCK_THREAD_CPUTIME_ID
+                                                                       : CLOCK_PROCESS_CPUTIME_ID));
+}
+HLE("kernel32.dll", GetProcessTimes, 5) { return PutTimes(c, CpuTime100ns(CLOCK_PROCESS_CPUTIME_ID)); }
+
+HLE64("kernel32.dll", GetSystemTime, 1) {
   using namespace std::chrono;
   auto now = system_clock::now();
   std::time_t tt = system_clock::to_time_t(now);
@@ -1244,8 +1408,8 @@ HLE("kernel32.dll", GetLocalTime, 1) {
 // The host's current UTC offset as a zone without DST transitions
 // (TIME_ZONE_ID_UNKNOWN): the guest's local time then equals the host's
 // now, though not across a DST change while it runs.
-HLE("kernel32.dll", GetTimeZoneInformation, 1) {
-  uint32_t tzi = Arg(c, 0);
+HLE64("kernel32.dll", GetTimeZoneInformation, 1) {
+  gaddr tzi = Arg(c, 0);
   std::time_t now = std::time(nullptr);
   std::tm t{};
   localtime_r(&now, &t);
@@ -1257,15 +1421,16 @@ HLE("kernel32.dll", GetTimeZoneInformation, 1) {
   return 0;
 }
 
-HLE("winmm.dll", timeGetTime, 0) { return TickCount(); }
+HLE64("winmm.dll", timeGetTime, 0) { return TickCount(); }
 // The host timer is always fine-grained; nothing to change.
-HLE("winmm.dll", timeBeginPeriod, 1) { return Arg(c, 0) ? 0 : 97; }  // TIMERR_NOCANDO
-HLE("winmm.dll", timeEndPeriod, 1) { return Arg(c, 0) ? 0 : 97; }
+HLE64("winmm.dll", timeBeginPeriod, 1) { return Arg(c, 0) ? 0 : 97; }  // TIMERR_NOCANDO
+HLE64("winmm.dll", timeEndPeriod, 1) { return Arg(c, 0) ? 0 : 97; }
 
 // No joystick or MIDI input drivers: games see zero devices.
-HLE("winmm.dll", joyGetNumDevs, 0) { return 0; }
-HLE("winmm.dll", joyGetDevCapsA, 3) { return 6; }   // MMSYSERR_NODRIVER
-HLE("winmm.dll", joyGetPosEx, 2) { return 6; }
+HLE64("winmm.dll", joyGetNumDevs, 0) { return 0; }
+HLE64("winmm.dll", joyGetDevCapsA, 3) { return 6; }   // MMSYSERR_NODRIVER
+HLE64("winmm.dll", joyGetDevCapsW, 3) { return 6; }
+HLE64("winmm.dll", joyGetPosEx, 2) { return 6; }
 HLE("winmm.dll", midiInGetNumDevs, 0) { return 0; }
 HLE("winmm.dll", midiInGetDevCapsA, 3) { return 2; }  // MMSYSERR_BADDEVICEID
 HLE("winmm.dll", midiInOpen, 5) { return 2; }
@@ -1275,15 +1440,15 @@ HLE("winmm.dll", midiInClose, 1) { return 5; }
 
 // A kernel entry on Windows, so a barrier for guests that poll a flag
 // with Sleep in the loop.
-HLE("kernel32.dll", FlushProcessWriteBuffers, 0) {
+HLE64("kernel32.dll", FlushProcessWriteBuffers, 0) {
   GuestSyncPoint sync;
   std::atomic_thread_fence(std::memory_order_seq_cst);
   return 0;
 }
 
-HLE("kernel32.dll", GetCurrentProcessorNumber, 0) { return 0; }
+HLE64("kernel32.dll", GetCurrentProcessorNumber, 0) { return 0; }
 
-HLE("kernel32.dll", Sleep, 1) {
+HLE64("kernel32.dll", Sleep, 1) {
   GuestSyncPoint sync;
   std::this_thread::sleep_for(std::chrono::milliseconds(Arg(c, 0)));
   return 0;
@@ -1291,15 +1456,15 @@ HLE("kernel32.dll", Sleep, 1) {
 
 // ---- code pages and locale -----------------------------------------------
 
-HLE("kernel32.dll", GetACP, 0) { return 1252; }
-HLE("kernel32.dll", GetOEMCP, 0) { return 437; }
-HLE("kernel32.dll", IsValidCodePage, 1) {
-  uint32_t cp = Arg(c, 0);
+HLE64("kernel32.dll", GetACP, 0) { return 1252; }
+HLE64("kernel32.dll", GetOEMCP, 0) { return 437; }
+HLE64("kernel32.dll", IsValidCodePage, 1) {
+  uint32_t cp = uint32_t(Arg(c, 0));
   return cp == 1252 || cp == 437 || cp == 0 ? 1 : 0;
 }
 
-HLE("kernel32.dll", GetCPInfo, 2) {
-  uint32_t info = Arg(c, 1);
+HLE64("kernel32.dll", GetCPInfo, 2) {
+  gaddr info = Arg(c, 1);
   std::memset(GPtr(info), 0, 20);
   Wr32(info, 1);       // MaxCharSize
   Wr8(info + 4, '?');  // DefaultChar
@@ -1383,8 +1548,9 @@ HLE64("kernel32.dll", WideCharToMultiByte, 8) {
   return s.size();
 }
 
-HLE("kernel32.dll", GetStringTypeW, 4) {
-  uint32_t type = Arg(c, 0), src = Arg(c, 1), out = Arg(c, 3);
+HLE64("kernel32.dll", GetStringTypeW, 4) {
+  uint32_t type = uint32_t(Arg(c, 0));
+  gaddr src = Arg(c, 1), out = Arg(c, 3);
   int32_t n = int32_t(Arg(c, 2));
   if (type != kCtCtype1) return 0;
   if (n < 0) n = int32_t(GWStr(src).size() + 1);
@@ -1403,7 +1569,7 @@ HLE("kernel32.dll", GetStringTypeA, 5) {
   return 1;
 }
 
-uint32_t LcMapW(uint32_t flags, uint32_t src, int32_t n, uint32_t dst, int32_t cap) {
+uint32_t LcMapW(uint32_t flags, gaddr src, int32_t n, gaddr dst, int32_t cap) {
   if (n < 0) n = int32_t(GWStr(src).size() + 1);
   if (!cap) return uint32_t(n);
   if (n > cap) return 0;
@@ -1412,18 +1578,19 @@ uint32_t LcMapW(uint32_t flags, uint32_t src, int32_t n, uint32_t dst, int32_t c
   return uint32_t(n);
 }
 
-HLE("kernel32.dll", LCMapStringW, 6) {
-  return LcMapW(Arg(c, 1), Arg(c, 2), int32_t(Arg(c, 3)), Arg(c, 4), int32_t(Arg(c, 5)));
+HLE64("kernel32.dll", LCMapStringW, 6) {
+  return LcMapW(uint32_t(Arg(c, 1)), Arg(c, 2), int32_t(Arg(c, 3)), Arg(c, 4), int32_t(Arg(c, 5)));
 }
 
 // LCMapStringEx(locale name, flags, src, cch, dst, cap, version, reserved,
 // sort handle): the Vista form of LCMapStringW; every locale is en-US.
-HLE("kernel32.dll", LCMapStringEx, 9) {
-  return LcMapW(Arg(c, 1), Arg(c, 2), int32_t(Arg(c, 3)), Arg(c, 4), int32_t(Arg(c, 5)));
+HLE64("kernel32.dll", LCMapStringEx, 9) {
+  return LcMapW(uint32_t(Arg(c, 1)), Arg(c, 2), int32_t(Arg(c, 3)), Arg(c, 4), int32_t(Arg(c, 5)));
 }
 
-HLE("kernel32.dll", LCMapStringA, 6) {
-  uint32_t flags = Arg(c, 1), src = Arg(c, 2), dst = Arg(c, 4);
+HLE64("kernel32.dll", LCMapStringA, 6) {
+  uint32_t flags = uint32_t(Arg(c, 1));
+  gaddr src = Arg(c, 2), dst = Arg(c, 4);
   int32_t n = int32_t(Arg(c, 3)), cap = int32_t(Arg(c, 5));
   if (n < 0) n = int32_t(std::strlen(g_proc->mem.ptr<const char>(src)) + 1);
   if (!cap) return uint32_t(n);
@@ -1437,7 +1604,7 @@ HLE("kernel32.dll", LCMapStringA, 6) {
   return uint32_t(n);
 }
 
-HLE("kernel32.dll", GetUserDefaultLCID, 0) { return 0x0409; }
+HLE64("kernel32.dll", GetUserDefaultLCID, 0) { return 0x0409; }
 HLE("kernel32.dll", GetThreadLocale, 0) { return 0x0409; }
 
 // BOOL GetSystemPowerStatus(SYSTEM_POWER_STATUS*): on mains power, no
@@ -1450,21 +1617,6 @@ HLE("kernel32.dll", GetSystemPowerStatus, 1) {
   Wr8(s + 3, 0);            // SystemStatusFlag
   Wr32(s + 4, 0xFFFFFFFF);  // BatteryLifeTime: unknown
   Wr32(s + 8, 0xFFFFFFFF);  // BatteryFullLifeTime: unknown
-  return 1;
-}
-
-// BOOL GetProcessTimes(h, creation, exit, kernel, user): FILETIMEs. The
-// process started TickCount() ms ago; kernel and user time are the host
-// process's. Only the current process (its pseudo handle or id's handle).
-HLE("kernel32.dll", GetProcessTimes, 5) {
-  const uint64_t now = uint64_t(time(nullptr)) * 10000000ull + kFileTimeUnixEpoch;
-  if (Arg(c, 1)) Wr64(Arg(c, 1), now - uint64_t(TickCount()) * 10000ull);
-  if (Arg(c, 2)) Wr64(Arg(c, 2), 0);
-  rusage ru{};
-  getrusage(RUSAGE_SELF, &ru);
-  auto ft = [](const timeval& t) { return uint64_t(t.tv_sec) * 10000000ull + uint64_t(t.tv_usec) * 10ull; };
-  if (Arg(c, 3)) Wr64(Arg(c, 3), ft(ru.ru_stime));
-  if (Arg(c, 4)) Wr64(Arg(c, 4), ft(ru.ru_utime));
   return 1;
 }
 
@@ -1553,7 +1705,7 @@ std::u16string AnsiArg(gaddr s, int32_t cch) {
 
 // CompareStringW(lcid, flags, s1, cch1, s2, cch2): CSTR_LESS_THAN (1),
 // CSTR_EQUAL (2) or CSTR_GREATER_THAN (3).
-HLE("kernel32.dll", CompareStringW, 6) {
+HLE64("kernel32.dll", CompareStringW, 6) {
   uint32_t flags = uint32_t(Arg(c, 1));
   return uint32_t(2 + CollateUnits(WideArg(Arg(c, 2), int32_t(Arg(c, 3))),
                                    WideArg(Arg(c, 4), int32_t(Arg(c, 5))), flags));
@@ -1561,7 +1713,7 @@ HLE("kernel32.dll", CompareStringW, 6) {
 
 // CompareStringEx(locale name, flags, s1, cch1, s2, cch2, version,
 // reserved, param): CompareStringW for the one locale.
-HLE("kernel32.dll", CompareStringEx, 9) {
+HLE64("kernel32.dll", CompareStringEx, 9) {
   uint32_t flags = uint32_t(Arg(c, 1));
   return uint32_t(2 + CollateUnits(WideArg(Arg(c, 2), int32_t(Arg(c, 3))),
                                    WideArg(Arg(c, 4), int32_t(Arg(c, 5))), flags));
@@ -1670,10 +1822,10 @@ uint32_t LocaleInfo(Ctx& c, bool wide) {
 }
 
 HLE64("kernel32.dll", GetLocaleInfoA, 4) { return LocaleInfo(c, false); }
-HLE("kernel32.dll", GetLocaleInfoW, 4) { return LocaleInfo(c, true); }
+HLE64("kernel32.dll", GetLocaleInfoW, 4) { return LocaleInfo(c, true); }
 // GetLocaleInfoEx(name, type, buf, cap): the name is ignored (en-US), the
 // other arguments are GetLocaleInfoW's.
-HLE("kernel32.dll", GetLocaleInfoEx, 4) { return LocaleInfo(c, true); }
+HLE64("kernel32.dll", GetLocaleInfoEx, 4) { return LocaleInfo(c, true); }
 
 }  // namespace
 }  // namespace hle

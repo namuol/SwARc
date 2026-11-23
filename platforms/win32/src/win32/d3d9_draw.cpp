@@ -154,6 +154,7 @@ gfx::FfState DrawState(const Device& d, bool fixed) {
     f.tss[s][21] = ss[10];                    // MAXANISOTROPY
     auto* t = active ? com::As<Texture>(d.textures[s]) : nullptr;
     f.textures[s] = t ? t->tex : 0;
+    if (t) f.tss[s][20] = std::max(f.tss[s][20], t->lod);  // and the texture's SetLOD
   }
   // The material and the first eight enabled lights (in index order: the
   // pipeline does not see indices).
@@ -694,11 +695,18 @@ void Draw(Device& d, gfx::ShaderDraw& sd, const char* what) {
   sd.ps_float = ps ? d.ps_f : ff_ps_consts;
   sd.ps_int = d.ps_i;
   sd.ps_bool = reinterpret_cast<const uint32_t*>(d.ps_b);
+  // A managed texture's SetLOD is the most detailed level it is sampled at,
+  // as the sampler's MAXMIPLEVEL is (D3D9 uses the larger of the two): games
+  // that stream textures in raise the levels as they arrive, and the ones
+  // not loaded yet must not be sampled.
+  uint32_t ss[20][14];
+  std::memcpy(ss, d.ss, sizeof ss);
   for (int i = 0; i < 20; i++) {
     auto* t = com::As<Texture>(d.textures[i]);
     sd.textures[i] = t ? t->tex : 0;
+    if (t) ss[i][9] = std::max(ss[i][9], t->lod);
   }
-  sd.sampler_states = d.ss;
+  sd.sampler_states = ss;
   const gfx::FfState state = DrawState(d, false);
   sd.state = &state;
   BindTargets(d);
@@ -849,6 +857,26 @@ HLE_NAMED("d3d9.dll", "IDirect3DDevice9::ColorFill", D3DDev9_ColorFill, 4) {
            s->level);
   }
   d->gfx->FillTexture(t, SurfaceRect(s, Arg(c, 2)), Arg(c, 3));
+  return D3D_OK;
+}
+
+// GetRenderTargetData(render target, system-memory surface): the target's
+// pixels (the back buffer, a render target or a render-target texture's
+// level) copied into the surface, which has its size and format. The GPU
+// work so far is waited for (the copy is of what it drew).
+HLE_NAMED("d3d9.dll", "IDirect3DDevice9::GetRenderTargetData", D3DDev9_GetRenderTargetData, 3) {
+  Device* d = Dev(c);
+  auto* src = com::As<Surface>(Arg(c, 1));
+  auto* dst = com::As<Surface>(Arg(c, 2));
+  if (!src || !dst || dst->kind != Surface::Kind::Offscreen ||
+      src->desc.Width != dst->desc.Width || src->desc.Height != dst->desc.Height)
+    return D3DERR_INVALIDCALL;
+  gfx::ColorTarget t = StretchTarget(src, "source");
+  gfx::ColorTarget color[4] = {t};
+  d->gfx->SetRenderTargets(color, 0);
+  gfx::Rect r{0, 0, int32_t(dst->desc.Width), int32_t(dst->desc.Height)};
+  d->gfx->ReadBack(r, GPtr(dst->mem), dst->pitch, FormatFromD3D(dst->desc.Format));
+  BindTargets(*d);
   return D3D_OK;
 }
 

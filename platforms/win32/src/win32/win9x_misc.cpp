@@ -46,12 +46,14 @@ HLE("kernel32.dll", lstrlenW, 1) {
 // GetDiskFreeSpaceA(root, &sectors_per_cluster, &bytes_per_sector,
 // &free_clusters, &total_clusters): a 2 GB disk with 1 GB free, the most a
 // FAT32-era API reports without overflowing callers' arithmetic.
-HLE("kernel32.dll", GetDiskFreeSpaceA, 5) {
+uint64_t GetDiskFreeSpace(Ctx& c) {
   const uint32_t v[4] = {8, 512, (1u << 30) / 4096, (2u << 30) / 4096 - 1};
   for (int i = 0; i < 4; i++)
     if (Arg(c, i + 1)) Wr32(Arg(c, i + 1), v[i]);
   return 1;
 }
+HLE64("kernel32.dll", GetDiskFreeSpaceA, 5) { return GetDiskFreeSpace(c); }
+HLE64("kernel32.dll", GetDiskFreeSpaceW, 5) { return GetDiskFreeSpace(c); }
 
 // DosDateTimeToFileTime(date, time, FILETIME*): local time, as FAT stores it.
 HLE("kernel32.dll", DosDateTimeToFileTime, 3) {
@@ -74,7 +76,7 @@ HLE("kernel32.dll", FatalAppExitA, 2) {
   FatalF("FatalAppExit: %s", GStr(Arg(c, 1)).c_str());
 }
 
-HLE("kernel32.dll", HeapValidate, 3) { return 1; }
+HLE64("kernel32.dll", HeapValidate, 3) { return 1; }
 
 // Consoles: none is attached; output goes to stderr.
 HLE("kernel32.dll", AllocConsole, 0) { return 1; }
@@ -117,7 +119,6 @@ COMM_FAILS(SetCommBreak, 1)
 COMM_FAILS(SetCommState, 2)
 COMM_FAILS(SetCommTimeouts, 2)
 COMM_FAILS(SetupComm, 3)
-COMM_FAILS(GetOverlappedResult, 4)
 #undef COMM_FAILS
 
 // ---- user32 ------------------------------------------------------------------------
@@ -198,7 +199,7 @@ HLE("shell32.dll", FindExecutableA, 3) {
 }
 
 // timeGetDevCaps(TIMECAPS*, size): 1 ms to 1,000,000 ms.
-HLE("winmm.dll", timeGetDevCaps, 2) {
+HLE64("winmm.dll", timeGetDevCaps, 2) {
   Wr32(Arg(c, 0), 1);
   Wr32(Arg(c, 0) + 4, 1000000);
   return 0;
@@ -225,15 +226,15 @@ HLE("ole32.dll", CoFileTimeNow, 1) {
 }
 
 // StringFromCLSID(clsid, LPOLESTR*): "{XXXXXXXX-XXXX-...}" in task memory.
-HLE("ole32.dll", StringFromCLSID, 2) {
-  uint32_t g = Arg(c, 0);
+HLE64("ole32.dll", StringFromCLSID, 2) {
+  gaddr g = Arg(c, 0);
   char s[40];
   std::snprintf(s, sizeof s, "{%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}", Rd32(g),
                 Rd16(g + 4), Rd16(g + 6), Rd8(g + 8), Rd8(g + 9), Rd8(g + 10), Rd8(g + 11),
                 Rd8(g + 12), Rd8(g + 13), Rd8(g + 14), Rd8(g + 15));
-  uint32_t out = HeapAllocProcess(2 * 39, false);
+  gaddr out = HeapAllocProcess(2 * 39, false);
   for (int i = 0; i < 39; i++) Wr16(out + 2 * uint32_t(i), uint8_t(s[i]));
-  Wr32(Arg(c, 1), out);
+  WrPtr(Arg(c, 1), out);
   return 0;
 }
 
@@ -296,25 +297,21 @@ HLE_NAMED("wsock32.dll", "#10", wsock_inet_addr, 1) {
     return 0xFFFFFFFF;
   return a | b << 8 | cc << 16 | d << 24;
 }
-
-// inet_ntoa(struct in_addr, by value): "a.b.c.d" in a buffer the guest may
-// keep until the next call, as Winsock's per-thread one.
+// inet_ntoa(struct in_addr, by value): "a.b.c.d" in a buffer per thread.
 HLE_NAMED("wsock32.dll", "#11", wsock_inet_ntoa, 1) {
-  static thread_local uint32_t buf = 0;
-  if (!buf) buf = HeapAllocProcess(16, true);
+  static thread_local gaddr buf = 0;
+  if (!buf) buf = HeapAllocProcess(16, false);
   uint32_t a = Arg(c, 0);
   char s[16];
   std::snprintf(s, sizeof s, "%u.%u.%u.%u", a & 0xFF, (a >> 8) & 0xFF, (a >> 16) & 0xFF, a >> 24);
   PutStr(buf, s);
   return buf;
 }
-
-// The rest of the socket calls fail the same way (no socket exists to use).
+// With no socket to be had, the calls that take one fail (WSAENETDOWN as
+// the rest), and select finds nothing ready.
 HLE_NAMED("wsock32.dll", "#1", wsock_accept, 3) { return SockFail(); }
 HLE_NAMED("wsock32.dll", "#4", wsock_connect, 3) { return SockFail(); }
-HLE_NAMED("wsock32.dll", "#5", wsock_getpeername, 3) { return SockFail(); }
 HLE_NAMED("wsock32.dll", "#6", wsock_getsockname, 3) { return SockFail(); }
-HLE_NAMED("wsock32.dll", "#12", wsock_ioctlsocket, 3) { return SockFail(); }
 HLE_NAMED("wsock32.dll", "#13", wsock_listen, 2) { return SockFail(); }
 HLE_NAMED("wsock32.dll", "#16", wsock_recv, 4) { return SockFail(); }
 HLE_NAMED("wsock32.dll", "#18", wsock_select, 5) { return SockFail(); }
@@ -324,6 +321,18 @@ HLE_NAMED("wsock32.dll", "#112", wsock_WSASetLastError, 1) {
   g_wsa_error = Arg(c, 0);
   return 0;
 }
+// __WSAFDIsSet(socket, fd_set* {u_int count; SOCKET array[]}).
+HLE_NAMED("wsock32.dll", "#151", wsock___WSAFDIsSet, 2) {
+  gaddr set = Arg(c, 1);
+  uint32_t n = Rd32(set);
+  for (uint32_t i = 0; i < n && i < 64; i++)
+    if (Rd32(set + 4 + 4 * i) == Arg(c, 0)) return 1;
+  return 0;
+}
+
+// The rest of the socket calls fail the same way (no socket exists to use).
+HLE_NAMED("wsock32.dll", "#5", wsock_getpeername, 3) { return SockFail(); }
+HLE_NAMED("wsock32.dll", "#12", wsock_ioctlsocket, 3) { return SockFail(); }
 
 // Lookups find nothing: NULL with WSANO_DATA (a valid name, no record).
 constexpr uint32_t kWsaNoData = 11004;
@@ -337,16 +346,6 @@ HLE_NAMED("wsock32.dll", "#56", wsock_getservbyport, 2) { return NoRecord(); }
 // WSAAsyncGetHostByName(hwnd, msg, name, buf, buflen): no task handle (0).
 HLE_NAMED("wsock32.dll", "#103", wsock_WSAAsyncGetHostByName, 5) {
   SockFail();
-  return 0;
-}
-
-// __WSAFDIsSet(SOCKET s, fd_set* set): whether s is among the set's
-// fd_count sockets (u_int fd_count; SOCKET fd_array[]).
-HLE_NAMED("wsock32.dll", "#151", wsock___WSAFDIsSet, 2) {
-  uint32_t s = Arg(c, 0), set = Arg(c, 1);
-  uint32_t n = std::min<uint32_t>(Rd32(set), 64);
-  for (uint32_t i = 0; i < n; i++)
-    if (Rd32(set + 4 + 4 * i) == s) return 1;
   return 0;
 }
 

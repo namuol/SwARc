@@ -75,6 +75,9 @@ struct Program {
   std::set<uint64_t> noreturn;                // functions that never return
   std::map<uint64_t, std::vector<uint64_t>> jumptables;  // jmp va -> targets
   std::set<uint64_t> noreturn_iat;            // import slots of ExitProcess etc.
+  std::set<uint64_t> setjmp_iat;              // import slots of the CRT's setjmp
+                                              // (msvcrt's _setjmp3): calls through
+                                              // them are setjmp calls
   std::map<uint64_t, std::string> probes;     // manifest: probe on entry
   std::set<uint64_t> replaced;                // manifest: the game project
                                               // defines f_X; the lifted body

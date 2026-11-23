@@ -180,6 +180,20 @@ int main(int argc, char** argv) {
     }
   }
   lifter::Decoder dec(p.x64);
+  // A stub that only jumps through an imported setjmp's IAT slot (MinGW's
+  // `_setjmp3: jmp [__imp__setjmp3]`) is a setjmp: its callers' returns are
+  // where the runtime's longjmp resumes.
+  if (!p.setjmp_iat.empty())
+    for (uint64_t e : p.entries) {
+      lifter::Insn in;
+      if (!dec.Decode(p, e, &in) || !in.ok || in.d.mnemonic != ZYDIS_MNEMONIC_JMP ||
+          in.ops[0].type != ZYDIS_OPERAND_TYPE_MEMORY ||
+          in.ops[0].mem.base != ZYDIS_REGISTER_NONE ||
+          in.ops[0].mem.index != ZYDIS_REGISTER_NONE)
+        continue;
+      if (p.setjmp_iat.count(static_cast<uint32_t>(in.ops[0].mem.disp.value)))
+        p.setjmps.insert(e);
+    }
   // Files lifted from x64 images see lifted.h's x64 register model.
   std::string prologue = kFilePrologue;
   if (p.x64)

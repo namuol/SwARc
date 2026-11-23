@@ -305,6 +305,7 @@ struct PipelineState {
   TargetBlend blend[4];
   Color blend_constant{0, 0, 0, 0};
 };
+// lod_bias is not applied on Metal, whose samplers have none.
 struct SamplerDesc {
   bool min_linear = false, mag_linear = false, mip_linear = false;
   AddressMode u = AddressMode::Repeat, v = AddressMode::Repeat, w = AddressMode::Repeat;
@@ -407,6 +408,12 @@ class Device {
   // or nearest filtering (Direct3D 9's StretchRect).
   virtual void StretchRect(ColorTarget src, const Rect& sr, ColorTarget dst, const Rect& dr,
                            bool linear) = 0;
+  // StretchRect upside down: the source's first row becomes the
+  // destination's last (between targets whose rows run in opposite
+  // directions, as a GL front end's window and framebuffer objects do).
+  // Backends without it copy unflipped and warn once.
+  virtual void StretchRectFlipped(ColorTarget src, const Rect& sr, ColorTarget dst, const Rect& dr,
+                                  bool linear);
 
   // ---- 2D (DirectDraw Blt onto the back buffer / render target)
   // Copies `src_rect` of a linear image into `dst_rect` of the current
@@ -501,8 +508,29 @@ class Device {
   // The land_later dispatches with read-write buffers for the host: how
   // many were queued, and how many have landed after writing back, in
   // order, those the GPU has run (all of them, waiting, with wait).
+  // The display's gamma ramp (Direct3D 9's SetGammaRamp): 256 red, then
+  // green, then blue 16-bit values, applied to what is shown (not to what
+  // is read back), as a display's lookup table does. The identity: none.
+  virtual void SetGammaRamp(const uint16_t ramp[3 * 256]);
+  // Presents to `window` from now on instead of the window the device was
+  // made for (a GL share group's device follows the window being drawn;
+  // ResetSwapChain then sizes its back buffer). Backends that cannot move
+  // their swap chain report false.
+  virtual bool SetWindow(SDL_Window* window);
   virtual uint64_t WritesQueued();
   virtual uint64_t LandWrites(bool wait);
+  // Occlusion queries (Direct3D 9's): the shader draws between
+  // BeginOcclusion and EndOcclusion count the pixels that pass the depth
+  // and stencil tests (and the shader's discards and alpha test). A
+  // backend without them returns 0 from BeginOcclusion; the caller then
+  // reports the query type as unavailable. One query is open at a time.
+  virtual bool SupportsOcclusion();
+  virtual uint32_t BeginOcclusion();  // an id, never 0
+  virtual void EndOcclusion(uint32_t id);
+  // The count once the GPU has run the query's draws: true; with wait it
+  // waits for that (submitting what is recorded). Each id is asked until
+  // it answers, then forgotten.
+  virtual bool OcclusionResult(uint32_t id, uint64_t* count, bool wait);
   // Draws `r` of a level 0 colour image into the back buffer from its
   // top-left corner, for Present to show: its texels as they are stored,
   // so an sRGB image's encoded values.

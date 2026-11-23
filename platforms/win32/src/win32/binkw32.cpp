@@ -1,14 +1,17 @@
-// binkw32 (Bink video, RAD 1.x API, up to 1.8's) on ffmpeg's Bink demuxer
+// binkw32 (Bink video, RAD 1.x API, up to 1.9's) on ffmpeg's Bink demuxer
 // and decoders. Movies may be opened from memory (BINKFROMMEMORY, e.g. a
 // view of an archive file); games decode one frame per BinkWait /
-// BinkDoFrame and copy it into locked memory with BinkCopyToBuffer(Rect).
+// BinkDoFrame and copy it into locked memory with BinkCopyToBuffer(Rect),
+// or (1.9, BINKNOFRAMEBUFFERS) have it decoded into planes they allocate
+// (BinkGetFrameBuffersInfo, BinkRegisterFrameBuffers: Source's videos).
 // Audio goes to the software mixer whichever sound system the game picks
-// (BinkOpenMiles or BinkOpenDirectSound route it there too).
+// (BinkOpenMiles or BinkOpenDirectSound route it there too; DirectSound
+// when it picks none), which Bink opens if the game's sound has not.
 //
 // Sound tracks: BinkSetSoundTrack(index) (older Bink: ~0 for none) or
-// BinkSetSoundTrack(count, track IDs) with BINKSNDTRACK (1.8) choose the
-// audio tracks; by default the first one plays. Each track has its volume
-// (BinkSetVolume by track ID).
+// BinkSetSoundTrack(count, track IDs) with BINKSNDTRACK (1.8; for the next
+// BinkOpen only, track 0 otherwise) choose the audio tracks; by default the
+// first one plays. Each track has its volume (BinkSetVolume by track ID).
 //
 // The BINK struct is a guest block: games read Width, Height, Frames
 // (+0x08), FrameNum (+0x0C) and, in 1.8, NumTracks (+0xD0) and the track
@@ -81,6 +84,11 @@ struct Movie {
   bool started = false, paused = false;
   Clock::time_point start, paused_at;
   bool video_eof = false;
+  std::vector<uint32_t> track_ids;  // the file's (BinkGetTrackID)
+  // BinkRegisterFrameBuffers: the game's BINKFRAMEBUFFERS, into whose
+  // planes each decoded frame goes (0: none, BinkCopyToBuffer's way).
+  uint32_t frame_buffers = 0;
+  bool alpha = false;  // the video has an alpha plane
 
   ~Movie() {
     {
@@ -106,9 +114,11 @@ std::map<uint32_t, std::unique_ptr<Movie>> g_movies;  // by BINK guest ptr
 // BinkSetSoundTrack: the older form's track index (~0: no sound), or the
 // 1.8 form's track IDs, used with BINKSNDTRACK.
 uint32_t g_sound_track = 0;
-std::vector<uint32_t> g_track_ids;
+std::vector<uint32_t> g_track_ids{0};  // for the next BinkOpen (then {0} again)
 // BinkSetSoundSystem: none, Miles or DirectSound.
-enum class SoundSystem { None, Miles, DirectSound } g_sound_system = SoundSystem::None;
+// DirectSound until a game picks another (Bink on Windows plays through
+// DirectSound by default).
+enum class SoundSystem { None, Miles, DirectSound } g_sound_system = SoundSystem::DirectSound;
 
 uint32_t Le32(const uint8_t* p) {
   return p[0] | p[1] << 8 | p[2] << 16 | uint32_t(p[3]) << 24;
@@ -206,11 +216,42 @@ void ConvertVideo(Movie& m) {
 
 // Demuxes until the next video frame is decoded (queueing audio met on
 // the way). False at the end of the movie.
+// BINKFRAMEBUFFERS (Bink 1.9's game-allocated planes): TotalFrames,
+// YABufferWidth/Height, cRcBBufferWidth/Height, FrameNum (the set the last
+// BinkDoFrame filled), then per set four BINKPLANEs (Y, cR, cB, A: Allocate,
+// Buffer, BufferPitch).
+constexpr uint32_t kFbTotal = 0x00, kFbYaW = 0x04, kFbYaH = 0x08, kFbCW = 0x0C, kFbCH = 0x10,
+                   kFbFrameNum = 0x14, kFbFrames = 0x18, kFbSetSize = 0x30, kFbPlaneSize = 0x0C;
+constexpr uint32_t kMaxFrameSets = 2;
+
+// Copies the decoded frame's planes into the next set of the game's buffers
+// and makes it the current one.
+void ToFrameBuffers(Movie& m) {
+  const uint32_t fb = m.frame_buffers;
+  const uint32_t total = std::clamp<uint32_t>(Rd32(fb + kFbTotal), 1, kMaxFrameSets);
+  const uint32_t set = (Rd32(fb + kFbFrameNum) + 1) % total;
+  const AVFrame* f = m.frame;
+  const int cw = (m.w + 1) / 2, ch = (m.h + 1) / 2;
+  // Bink's planes: Y, cR (ffmpeg's V, plane 2), cB (U, plane 1), A (3).
+  const struct { int src, w, h; } planes[4] = {{0, m.w, m.h}, {2, cw, ch}, {1, cw, ch}, {3, m.w, m.h}};
+  for (int p = 0; p < 4; p++) {
+    const uint32_t pl = fb + kFbFrames + set * kFbSetSize + uint32_t(p) * kFbPlaneSize;
+    const uint32_t buf = Rd32(pl + 4), pitch = Rd32(pl + 8);
+    const int src = planes[p].src;
+    if (!buf || !f->data[src]) continue;
+    const int w = std::min<int>(planes[p].w, int(pitch));
+    for (int y = 0; y < planes[p].h; y++)
+      std::memcpy(GPtr(buf + uint32_t(y) * pitch), f->data[src] + size_t(y) * f->linesize[src], size_t(w));
+  }
+  Wr32(fb + kFbFrameNum, set);
+}
+
 bool DecodeNextFrame(Movie& m) {
   for (;;) {
     int r = avcodec_receive_frame(m.vdec, m.frame);
     if (r == 0) {
-      ConvertVideo(m);
+      if (m.frame_buffers) ToFrameBuffers(m);
+      else ConvertVideo(m);
       av_frame_unref(m.frame);
       m.decoded++;
       return true;
@@ -313,11 +354,18 @@ void ChooseTracks(Movie& m, uint32_t flags, const std::vector<uint32_t>& ids) {
     std::lock_guard<std::mutex> l(g_mu);
     switch (g_sound_system) {
       case SoundSystem::None: sound = false; break;
-      case SoundSystem::Miles: sound = MilesDriverOpen(); break;
-      default: sound = audio::GetMixer().rate() > 0; break;
+      // Miles: SwARc's while its driver is open. Otherwise (DirectSound,
+      // or a game's own lifted Miles, which plays through DirectSound) the
+      // mixer, opened as DirectSound opens it if the game's sound has not
+      // started yet (Bink made its own DirectSound object then).
+      case SoundSystem::Miles: sound = MilesDriverOpen() || audio::GetMixer().Open(48000); break;
+      default: sound = audio::GetMixer().Open(48000); break;
     }
     if (g_sound_track == 0xFFFFFFFF) sound = false;
     if (flags & kBinkSndTrack) want = g_track_ids;
+    // The list applies to the next BinkOpen; then track 0 again (Source
+    // sets an empty list only to open a movie without sound).
+    g_track_ids.assign(1, 0);
   }
   if (!sound) return;
   std::vector<int> streams;
@@ -417,6 +465,8 @@ HLE_NAMED("binkw32.dll", "_BinkOpen@8", BinkOpen, 2) {
     return 0;
   }
   std::vector<uint32_t> ids = TrackIds(m->data);
+  m->track_ids = ids;
+  m->alpha = m->vdec->pix_fmt == AV_PIX_FMT_YUVA420P;
   ChooseTracks(*m, flags, ids);
   m->w = int(width);
   m->h = int(height);
@@ -492,6 +542,56 @@ HLE_NAMED("binkw32.dll", "_BinkNextFrame@4", BinkNextFrame, 1) {
   if (m->frame_num < m->frames) m->frame_num++;
   SyncGuest(*m);
   return 0;
+}
+
+// BinkGetFrameBuffersInfo(HBINK, BINKFRAMEBUFFERS*): the planes a game
+// allocates itself (BINKNOFRAMEBUFFERS): two sets, Y (and A) at the
+// video's size, cR and cB at half of it.
+HLE_NAMED("binkw32.dll", "_BinkGetFrameBuffersInfo@8", BinkGetFrameBuffersInfo, 2) {
+  std::lock_guard<std::mutex> l(g_mu);
+  Movie* m = Find(Arg(c, 0), "BinkGetFrameBuffersInfo");
+  const uint32_t fb = Arg(c, 1);
+  if (!m || !fb) return 0;
+  std::memset(GPtr(fb), 0, kFbFrames + kMaxFrameSets * kFbSetSize);
+  Wr32(fb + kFbTotal, kMaxFrameSets);
+  Wr32(fb + kFbYaW, uint32_t(m->w));
+  Wr32(fb + kFbYaH, uint32_t(m->h));
+  Wr32(fb + kFbCW, uint32_t((m->w + 1) / 2));
+  Wr32(fb + kFbCH, uint32_t((m->h + 1) / 2));
+  for (uint32_t set = 0; set < kMaxFrameSets; set++)
+    for (uint32_t p = 0; p < 4; p++)
+      Wr32(fb + kFbFrames + set * kFbSetSize + p * kFbPlaneSize, p < 3 || m->alpha ? 1 : 0);
+  return 0;
+}
+
+// BinkRegisterFrameBuffers(HBINK, BINKFRAMEBUFFERS*): the game's buffers,
+// which each BinkDoFrame then fills (FrameNum: the set it filled).
+HLE_NAMED("binkw32.dll", "_BinkRegisterFrameBuffers@8", BinkRegisterFrameBuffers, 2) {
+  std::lock_guard<std::mutex> l(g_mu);
+  Movie* m = Find(Arg(c, 0), "BinkRegisterFrameBuffers");
+  if (!m) return 0;
+  m->frame_buffers = Arg(c, 1);
+  if (m->frame_buffers) Wr32(m->frame_buffers + kFbFrameNum, kMaxFrameSets - 1);  // the first fills set 0
+  return 0;
+}
+
+// BinkGetTrackID(HBINK, index) -> the index'th audio track's ID.
+HLE_NAMED("binkw32.dll", "_BinkGetTrackID@8", BinkGetTrackID, 2) {
+  std::lock_guard<std::mutex> l(g_mu);
+  Movie* m = Find(Arg(c, 0), "BinkGetTrackID");
+  const uint32_t i = Arg(c, 1);
+  if (!m) return 0;
+  return i < m->track_ids.size() ? m->track_ids[i] : i;
+}
+
+// BinkShouldSkip(HBINK): 1 while playback is more than a frame behind
+// (the game then skips decoding frames to catch up).
+HLE_NAMED("binkw32.dll", "_BinkShouldSkip@4", BinkShouldSkip, 1) {
+  std::lock_guard<std::mutex> l(g_mu);
+  Movie* m = Find(Arg(c, 0), "BinkShouldSkip");
+  if (!m || !m->started || m->paused || m->frame_num >= m->frames) return 0;
+  auto late = std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(m->frame_num / m->fps));
+  return Clock::now() > m->start + late ? 1 : 0;
 }
 
 // BinkPause(HBINK, pause) -> the new pause state.

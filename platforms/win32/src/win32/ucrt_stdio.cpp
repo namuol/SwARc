@@ -11,6 +11,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <fcntl.h>
+#include <unistd.h>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -18,6 +20,7 @@
 
 #include "runtime/log.h"
 #include "win32/hle.h"
+#include "win32/msvcrt.h"
 #include "win32/kernel32_state.h"
 #include "win32/ucrt.h"
 #include "win32/win32.h"
@@ -35,8 +38,15 @@ struct Stream {
 std::recursive_mutex g_streams_mu;
 std::map<gaddr, Stream> g_streams;  // by guest FILE*
 
+// The guest FILE block. Its first fields are the UCRT's buffer pointers,
+// which _get_stream_buffer_pointers hands out: _ptr (0), _base (8) and
+// _cnt (16). They stay null and 0, so C++ stream buffers built on a FILE
+// (the STL's basic_filebuf) find its buffer empty and go through
+// fgetc/fputc/fread/fwrite, where the host stream does the buffering.
+constexpr uint32_t kFileBlock = 48;
+
 gaddr NewStream(FILE* f, bool text, bool owned) {
-  gaddr p = HeapAllocProcess(16, true);
+  gaddr p = HeapAllocProcess(kFileBlock, true);
   std::lock_guard<std::recursive_mutex> l(g_streams_mu);
   g_streams[p] = {f, text, owned};
   return p;
@@ -377,6 +387,22 @@ HLE("msvcrt.dll", sprintf, kCdecl) {
   std::memcpy(GPtr(Arg(c, 0)), s.c_str(), s.size() + 1);
   return uint32_t(s.size());
 }
+// printf(fmt, ...), fprintf(fp, fmt, ...), vfprintf(fp, fmt, va_list):
+// the characters written.
+HLE("msvcrt.dll", printf, kCdecl) {
+  std::string s = Format(GStr(Arg(c, 0)), Args{c.esp + 4 + 4, true}, true);
+  return uint32_t(std::fwrite(s.data(), 1, s.size(), stdout));
+}
+HLE("msvcrt.dll", fprintf, kCdecl) {
+  std::FILE* f = MsvcrtFile(Arg(c, 0), "fprintf");
+  std::string s = Format(GStr(Arg(c, 1)), Args{c.esp + 4 + 8, true}, true);
+  return uint32_t(std::fwrite(s.data(), 1, s.size(), f));
+}
+HLE("msvcrt.dll", vfprintf, kCdecl) {
+  std::FILE* f = MsvcrtFile(Arg(c, 0), "vfprintf");
+  std::string s = Format(GStr(Arg(c, 1)), Args{Arg(c, 2), true}, true);
+  return uint32_t(std::fwrite(s.data(), 1, s.size(), f));
+}
 // _vsnprintf(buf, count, fmt, va_list): -1 if it does not fit.
 HLE("msvcrt.dll", _vsnprintf, kCdecl) {
   std::string s = Format(GStr(Arg(c, 2)), Args{Arg(c, 3), true}, true);
@@ -592,6 +618,221 @@ HLE64("ucrtbase.dll", rewind, kCdecl) {
   std::lock_guard<std::recursive_mutex> l(g_streams_mu);
   std::rewind(s.f);
   return 0;
+}
+
+// fgetc / ungetc / feof: the host stream's, with text mode's \r\n and ^Z.
+HLE64("ucrtbase.dll", fgetc, kCdecl) {
+  Stream& s = Must(Arg(c, 0), "fgetc");
+  std::lock_guard<std::recursive_mutex> l(g_streams_mu);
+  return uint32_t(GetC(s));
+}
+HLE64("ucrtbase.dll", ungetc, kCdecl) {
+  int ch = int32_t(Arg(c, 0));
+  Stream& s = Must(Arg(c, 1), "ungetc");
+  std::lock_guard<std::recursive_mutex> l(g_streams_mu);
+  return uint32_t(std::ungetc(ch, s.f));
+}
+HLE64("ucrtbase.dll", feof, kCdecl) { return std::feof(Must(Arg(c, 0), "feof").f) != 0; }
+
+// fpos_t is a 64-bit offset in the UCRT.
+HLE64("ucrtbase.dll", fgetpos, kCdecl) {
+  Stream& s = Must(Arg(c, 0), "fgetpos");
+  std::lock_guard<std::recursive_mutex> l(g_streams_mu);
+  off_t pos = ftello(s.f);
+  if (pos < 0) {
+    Wr32(GuestErrno(), EINVAL);
+    return uint32_t(-1);
+  }
+  Wr64(Arg(c, 1), uint64_t(pos));
+  return 0;
+}
+HLE64("ucrtbase.dll", fsetpos, kCdecl) {
+  Stream& s = Must(Arg(c, 0), "fsetpos");
+  std::lock_guard<std::recursive_mutex> l(g_streams_mu);
+  return fseeko(s.f, off_t(Rd64(Arg(c, 1))), SEEK_SET) == 0 ? 0 : uint32_t(-1);
+}
+HLE64("ucrtbase.dll", _ftelli64, kCdecl) {
+  Stream& s = Must(Arg(c, 0), "_ftelli64");
+  std::lock_guard<std::recursive_mutex> l(g_streams_mu);
+  return uint64_t(int64_t(ftello(s.f)));
+}
+
+// setvbuf(stream, buf, mode, size): the host stream buffers; the guest's
+// buffer is not used (its contents are never read by the guest either).
+HLE64("ucrtbase.dll", setvbuf, kCdecl) {
+  Must(Arg(c, 0), "setvbuf");
+  int mode = int32_t(Arg(c, 2));
+  if (mode != 0 && mode != 0x40 && mode != 4) {  // _IOFBF, _IOLBF, _IONBF
+    Wr32(GuestErrno(), EINVAL);
+    return uint32_t(-1);
+  }
+  return 0;
+}
+
+// _get_stream_buffer_pointers(stream, &base, &ptr, &count): where the
+// FILE's buffer pointers are (see kFileBlock).
+HLE64("ucrtbase.dll", _get_stream_buffer_pointers, kCdecl) {
+  const gaddr fp = Arg(c, 0);
+  Must(fp, "_get_stream_buffer_pointers");
+  if (gaddr p = Arg(c, 1)) Wr64(p, fp + 8);   // _base
+  if (gaddr p = Arg(c, 2)) Wr64(p, fp + 0);   // _ptr
+  if (gaddr p = Arg(c, 3)) Wr64(p, fp + 16);  // _cnt
+  return 0;
+}
+
+// _lock_file / _unlock_file: every stream function here runs under one
+// recursive lock, which these take and release for the guest (the STL
+// locks a stream for the duration of an operation on it).
+HLE64("ucrtbase.dll", _lock_file, kCdecl) {
+  g_streams_mu.lock();
+  return 0;
+}
+HLE64("ucrtbase.dll", _unlock_file, kCdecl) {
+  g_streams_mu.unlock();
+  return 0;
+}
+
+// ---- low-level I/O (_open, _write...) --------------------------------------
+// File descriptors are the CRT's own small integers: 0-2 are the standard
+// streams; the others are host descriptors kept here. Text mode turns \n
+// into \r\n on writes.
+
+namespace {
+struct LowFile {
+  int fd = -1;
+  bool text = false;
+};
+std::mutex g_lowio_mu;
+std::map<int, LowFile> g_lowio{{0, {0, true}}, {1, {1, true}}, {2, {2, true}}};
+
+int NewLowFile(int host_fd, bool text) {
+  std::lock_guard<std::mutex> l(g_lowio_mu);
+  int fd = 3;
+  while (g_lowio.count(fd)) fd++;
+  g_lowio[fd] = {host_fd, text};
+  return fd;
+}
+LowFile* FindLowFile(int fd) {
+  auto it = g_lowio.find(fd);
+  return it == g_lowio.end() ? nullptr : &it->second;
+}
+}  // namespace
+
+// _wsopen_s(&fd, path, oflag, shflag, pmode): _O_RDONLY 0, _O_WRONLY 1,
+// _O_RDWR 2, _O_APPEND 8, _O_CREAT 0x100, _O_TRUNC 0x200, _O_EXCL 0x400,
+// _O_TEXT 0x4000, _O_BINARY 0x8000 (text unless binary, as _fmode is).
+HLE64("ucrtbase.dll", _wsopen_s, kCdecl) {
+  const gaddr out = Arg(c, 0);
+  const std::string path = NarrowPath(GWStr(Arg(c, 1)));
+  const uint32_t of = uint32_t(Arg(c, 2));
+  if (out) Wr32(out, uint32_t(-1));
+  int flags = (of & 3) == 1 ? O_WRONLY : (of & 3) == 2 ? O_RDWR : O_RDONLY;
+  if (of & 0x8) flags |= O_APPEND;
+  if (of & 0x100) flags |= O_CREAT;
+  if (of & 0x200) flags |= O_TRUNC;
+  if (of & 0x400) flags |= O_EXCL;
+  PathAccess acc = (of & 3) == 0 ? PathAccess::kRead
+                   : (of & 0x300) ? PathAccess::kWrite
+                                  : PathAccess::kUpdate;
+  const std::string host = HostPath(path, acc);
+  int h = open(host.c_str(), flags | O_CLOEXEC, 0644);
+  RECOMP_TRACE("  _wsopen_s(%s, %X) -> %s%s\n", path.c_str(), of, host.c_str(),
+               h < 0 ? " (failed)" : "");
+  if (h < 0) {
+    uint32_t e = errno == ENOENT ? ENOENT : errno == EEXIST ? EEXIST : EACCES;
+    Wr32(GuestErrno(), e);
+    return e;
+  }
+  int fd = NewLowFile(h, !(of & 0x8000));
+  if (out) Wr32(out, uint32_t(fd));
+  return 0;
+}
+
+HLE64("ucrtbase.dll", _close, kCdecl) {
+  int fd = int32_t(Arg(c, 0));
+  std::lock_guard<std::mutex> l(g_lowio_mu);
+  LowFile* f = FindLowFile(fd);
+  if (!f) {
+    Wr32(GuestErrno(), EBADF);
+    return uint32_t(-1);
+  }
+  int r = fd > 2 ? close(f->fd) : 0;
+  if (fd > 2) g_lowio.erase(fd);
+  return r == 0 ? 0 : uint32_t(-1);
+}
+
+// _write(fd, buf, count): the bytes taken from buf (text mode counts the
+// \n, not the \r added before it).
+HLE64("ucrtbase.dll", _write, kCdecl) {
+  int fd = int32_t(Arg(c, 0));
+  const gaddr buf = Arg(c, 1);
+  const uint32_t n = uint32_t(Arg(c, 2));
+  std::lock_guard<std::mutex> l(g_lowio_mu);
+  LowFile* f = FindLowFile(fd);
+  if (!f) {
+    Wr32(GuestErrno(), EBADF);
+    return uint32_t(-1);
+  }
+  const char* p = g_proc->mem.ptr<const char>(buf);
+  if (!f->text || fd <= 2) {
+    ssize_t w = write(f->fd, p, n);
+    return w < 0 ? uint32_t(-1) : uint32_t(w);
+  }
+  std::string out;
+  for (uint32_t i = 0; i < n; i++) {
+    if (p[i] == '\n') out.push_back('\r');
+    out.push_back(p[i]);
+  }
+  if (write(f->fd, out.data(), out.size()) != ssize_t(out.size())) return uint32_t(-1);
+  return n;
+}
+
+HLE64("ucrtbase.dll", _lseeki64, kCdecl) {
+  int fd = int32_t(Arg(c, 0));
+  std::lock_guard<std::mutex> l(g_lowio_mu);
+  LowFile* f = FindLowFile(fd);
+  off_t r = f ? lseek(f->fd, off_t(int64_t(Arg(c, 1))), int(Arg(c, 2))) : -1;
+  if (r < 0) Wr32(GuestErrno(), f ? EINVAL : EBADF);
+  return uint64_t(int64_t(r));
+}
+
+// _setmode(fd, mode): the previous mode (_O_TEXT 0x4000 or _O_BINARY 0x8000).
+HLE64("ucrtbase.dll", _setmode, kCdecl) {
+  int fd = int32_t(Arg(c, 0));
+  uint32_t mode = uint32_t(Arg(c, 1));
+  std::lock_guard<std::mutex> l(g_lowio_mu);
+  LowFile* f = FindLowFile(fd);
+  if (!f) {
+    Wr32(GuestErrno(), EBADF);
+    return uint32_t(-1);
+  }
+  uint32_t old = f->text ? 0x4000 : 0x8000;
+  f->text = (mode & 0x4000) != 0;
+  return old;
+}
+
+// _fileno(stream): the standard streams are 0-2; another stream gets a
+// descriptor for its host file the first time it is asked.
+HLE64("ucrtbase.dll", _fileno, kCdecl) {
+  const gaddr fp = Arg(c, 0);
+  for (uint32_t i = 0; i < 3; i++)
+    if (fp == StdStream(i)) return i;
+  static std::map<gaddr, int> known;
+  std::lock_guard<std::recursive_mutex> l(g_streams_mu);
+  Stream& s = Must(fp, "_fileno");
+  auto it = known.find(fp);
+  if (it != known.end()) return uint32_t(it->second);
+  int fd = NewLowFile(fileno(s.f), s.text);
+  known[fp] = fd;
+  return uint32_t(fd);
+}
+
+// _wunlink(path): 0, or -1 with errno.
+HLE64("ucrtbase.dll", _wunlink, kCdecl) {
+  const std::string host = HostPath(NarrowPath(GWStr(Arg(c, 0))), PathAccess::kWrite);
+  if (unlink(host.c_str()) == 0) return 0;
+  Wr32(GuestErrno(), errno == ENOENT ? ENOENT : EACCES);
+  return uint32_t(-1);
 }
 
 }  // namespace recomp::hle
