@@ -188,6 +188,14 @@ bool Program::LoadManifest(const std::string& path, std::string* err) {
       entries.insert(va);
       replaced.insert(va);
       if (!name.empty()) names[va] = name;
+    } else if (kind == "unlifted") {
+      // unlifted <va>: the function (and any secondary entry it owns) is
+      // emitted as a stub that is fatal when reached, naming the address;
+      // its body is not emitted. For a function the compiler cannot build
+      // in reasonable time, while finding out whether the game reaches it.
+      entries.insert(va);
+      unlifted.insert(va);
+      if (!name.empty()) names[va] = name;
     } else if (kind == "native") {
       if (name.empty()) {
         *err = path + ":" + std::to_string(no) + ": native needs a function name";

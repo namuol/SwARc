@@ -82,6 +82,8 @@ struct Program {
   std::set<uint64_t> replaced;                // manifest: the game project
                                               // defines f_X; the lifted body
                                               // is emitted as f_X_lifted
+  std::set<uint64_t> unlifted;                // manifest: emitted as a stub
+                                              // that is fatal when called
   std::map<uint64_t, std::string> natives;    // manifest: replaced by a
                                               // shared native function
                                               // (recomp::native::<name>)

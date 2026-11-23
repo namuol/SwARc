@@ -433,6 +433,10 @@ void Unreachable(Ctx& c, uint64_t va) {
   (void)c;
   FatalF("returned from a no-return call at %08llX", (unsigned long long)va);
 }
+void UnliftedFunction(Ctx& c, uint64_t va) {
+  (void)c;
+  FatalF("call to %08llX, a function the manifest marks unlifted", (unsigned long long)va);
+}
 void Trap(Ctx& c, uint64_t va) {
   (void)c;
   FatalF("breakpoint/trap instruction at %08llX", (unsigned long long)va);
