@@ -202,6 +202,7 @@ uint32_t MapVirtualKey(uint32_t code, uint32_t type) {
   return 0;
 }
 
+
 HLE("user32.dll", VkKeyScanA, 1) {
   char ch = char(Arg(c, 0));
   for (const auto& k : kKeys) {
@@ -240,8 +241,8 @@ HLE("user32.dll", GetKeyboardLayoutNameA, 1) {
 // letter as the control character. Returns 1 with the character in
 // *out, 0 for keys without one. Bit 15 of the scan code is a key release,
 // which translates the same. No dead keys on this layout.
-HLE("user32.dll", ToAscii, 5) {
-  uint32_t vk = Arg(c, 0) & 0xFF, ks = Arg(c, 2), out = Arg(c, 3);
+uint8_t KeyChar(uint32_t vk, gaddr ks) {
+  vk &= 0xFF;
   auto down = [&](uint32_t k) { return (Rd8(ks + k) & 0x80) != 0; };
   bool shift = down(0x10), ctrl = down(0x11), alt = down(0x12);
   bool caps = Rd8(ks + 0x14) & 1;
@@ -256,9 +257,45 @@ HLE("user32.dll", ToAscii, 5) {
   } else if (const KeyDef* k = ByVk(uint8_t(vk))) {
     ch = uint8_t(shift && k->shifted ? k->shifted : k->ch);
   }
+  return ch;
+}
+
+HLE("user32.dll", ToAscii, 5) {
+  uint8_t ch = KeyChar(Arg(c, 0), Arg(c, 2));
   if (!ch) return 0;
-  Wr16(out, ch);
+  Wr16(Arg(c, 3), ch);
   return 1;
+}
+// ToAsciiEx(vk, scan, keystate, WORD* out, flags, layout): as ToAscii (US).
+HLE("user32.dll", ToAsciiEx, 6) {
+  uint8_t ch = KeyChar(Arg(c, 0), Arg(c, 2));
+  if (!ch) return 0;
+  Wr16(Arg(c, 3), ch);
+  return 1;
+}
+// ToUnicode(vk, scan, keystate, WCHAR* buf, buf_len, flags) and ToUnicodeEx
+// (+ layout): the same character as one WCHAR (the US layout's are ASCII),
+// NUL-terminated when there is room; 1, or 0 for keys without one.
+uint32_t KeyCharW(Ctx& c) {
+  uint8_t ch = KeyChar(Arg(c, 0), Arg(c, 2));
+  uint32_t buf = Arg(c, 3), n = Arg(c, 4);
+  if (!ch || !n) return 0;
+  Wr16(buf, ch);
+  if (n > 1) Wr16(buf + 2, 0);
+  return 1;
+}
+HLE("user32.dll", ToUnicode, 6) { return KeyCharW(c); }
+HLE("user32.dll", ToUnicodeEx, 7) { return KeyCharW(c); }
+
+// GetKeyboardType(which): 0 the type (4: enhanced 101/102-key), 1 the
+// subtype (0), 2 the number of function keys (12).
+HLE("user32.dll", GetKeyboardType, 1) {
+  switch (Arg(c, 0)) {
+    case 0: return 4;
+    case 1: return 0;
+    case 2: return 12;
+  }
+  return 0;
 }
 
 // ---- characters (Windows-1252) -------------------------------------------
@@ -572,6 +609,7 @@ HLE64("user32.dll", SetCursor, 1) {
   static uint32_t cur = 0;
   uint32_t old = cur;
   cur = Arg(c, 0);
+  if (cur != old) SetHostCursor(cur);
   SetCursorNone(cur == 0);
   return old;
 }
