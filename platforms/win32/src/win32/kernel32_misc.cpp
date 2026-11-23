@@ -510,7 +510,7 @@ HLE64("kernel32.dll", DebugBreak, 0) {
 // Finds the first RT_VERSION resource in the mapped image. Returns its
 // guest VA and size.
 bool IsOwnExe(const std::string& path) {
-  std::string l = Lower(path), exe = Lower(Game().exe_name);
+  std::string l = Lower(path), exe = ExeFileName();
   size_t slash = l.find_last_of("\\/");
   return l.substr(slash == std::string::npos ? 0 : slash + 1) == exe;
 }

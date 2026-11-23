@@ -21,7 +21,9 @@ struct GameConfig : recomp::GameConfig {
   // Where the game believes it is installed, e.g. "C:\Games\Game";
   // guest paths below it map onto the host game directory.
   std::string guest_dir;
-  // The EXE's file name in guest_dir (GetModuleFileName, command line).
+  // The EXE's path relative to guest_dir (GetModuleFileName, command
+  // line): its file name, or "Bin\\Game.exe" for games whose EXE is in a
+  // subfolder of the install. Lifted DLLs are named the same way.
   std::string exe_name;
 
   // Registry values the retail installer would have written, seeded on
@@ -138,7 +140,7 @@ struct Module {
   PeImage img;
   int refs = 0;        // LoadLibrary count (under kernel32's loader lock)
   bool stale = false;  // has run since it was mapped: map afresh on load
-  int tls_index = -1;  // its static TLS slot (x64 guests), -1: none
+  int tls_index = -1;  // its static TLS slot, -1: none
   bool static_import = false;  // the EXE imports from it: loaded before the EXE runs
   // Lifted DLLs it imports from (bound to their exports, MapModule):
   // loaded and initialised before it, released after it.
