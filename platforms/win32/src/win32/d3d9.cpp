@@ -72,6 +72,9 @@ gfx::Format FormatFromD3D(uint32_t f) {
     // in memory, as the GPU's red.
     case 63: return F::R8G8B8A8Snorm;  // D3DFMT_Q8W8V8U8
     case 64: return F::R16G16Snorm;    // D3DFMT_V16U16
+    // NULL render targets: never seen, so any colour format serves; one
+    // the targets support gives the pass its size.
+    case D3DFMT_NULL: return F::A8R8G8B8;
     default: return F::Unknown;
   }
 }
@@ -88,7 +91,7 @@ bool IsBackBufferFormat(uint32_t f) {
 }
 
 bool IsRenderTargetFormat(uint32_t f) {
-  return IsBackBufferFormat(f) || gfx::IsFloat(FormatFromD3D(f));
+  return IsBackBufferFormat(f) || f == D3DFMT_NULL || gfx::IsFloat(FormatFromD3D(f));
 }
 
 namespace {
@@ -569,6 +572,7 @@ HLE_NAMED("d3d9.dll", "IDirect3D9::CheckDeviceFormat", D3D9_CheckDeviceFormat, 7
   else if (ok && (usage & D3DUSAGE_DEPTHSTENCIL))
     ok = false;
   if (ok && (usage & D3DUSAGE_RENDERTARGET)) ok = IsRenderTargetFormat(fmt);
+  if (ok && fmt == D3DFMT_NULL) ok = (usage & D3DUSAGE_RENDERTARGET) != 0;  // render targets only
   // sRGB reads (SRGBTEXTURE) of 8-bit colour and block-compressed
   // formats, and sRGB writes (SRGBWRITEENABLE) to 32-bit RGB targets: the
   // translated shaders decode and encode (gfx). No vertex textures.

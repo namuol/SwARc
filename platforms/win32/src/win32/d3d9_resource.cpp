@@ -545,6 +545,16 @@ void BindTargets(Device& d) {
   for (int i = 0; i < 4; i++) {
     Surface* rt = com::As<Surface>(d.render_targets[i]);
     if (!rt) break;
+    // A NULL-format target (drivers' depth-only passes) has no memory, so
+    // its size does not limit drawing: the pass gets one of the depth
+    // buffer's size (or the target's, without one), never read.
+    if (rt->desc.Format == D3DFMT_NULL) {
+      const uint32_t w = z ? z->desc.Width : rt->desc.Width, h = z ? z->desc.Height : rt->desc.Height;
+      gfx::TextureId& tex = d.null_targets[{w, h}];
+      if (!tex) tex = d.gfx->CreateTexture(int(w), int(h), 1, gfx::Format::A8R8G8B8, true);
+      color[i] = {tex, 0};
+      continue;
+    }
     if (rt->kind == Surface::Kind::RenderTarget) color[i].tex = rt->tex;
     if (rt->kind == Surface::Kind::TextureLevel) {
       if (rt->texture->cube)
