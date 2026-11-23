@@ -443,8 +443,19 @@ class Translator {
       case MOVA: need(1); return S(s[0]);
       case ADD: need(2); return "(" + S(s[0]) + " + " + S(s[1]) + ")";
       case SUB: need(2); return "(" + S(s[0]) + " - " + S(s[1]) + ")";
-      case MUL: need(2); return "(" + S(s[0]) + " * " + S(s[1]) + ")";
-      case MAD: need(3); return "(" + S(s[0]) + " * " + S(s[1]) + " + " + S(s[2]) + ")";
+      // Products as Direct3D 9 shader hardware forms them: 0 times anything
+      // (infinity, NaN) is 0 (r_dmul). Shaders rely on it, e.g. a zero
+      // attenuation times a light term that is infinite where it divides by
+      // zero; IEEE gives NaN or infinity there, which then spreads through
+      // blurs and averages.
+      case MUL:
+        need(2);
+        helpers_.insert("dmul");
+        return "r_dmul(" + S(s[0]) + ", " + S(s[1]) + ")";
+      case MAD:
+        need(3);
+        helpers_.insert("dmul");
+        return "(r_dmul(" + S(s[0]) + ", " + S(s[1]) + ") + " + S(s[2]) + ")";
       case MIN: need(2); return "min(" + S(s[0]) + ", " + S(s[1]) + ")";
       case MAX: need(2); return "max(" + S(s[0]) + ", " + S(s[1]) + ")";
       case SLT: need(2); return "vec4(lessThan(" + S(s[0]) + ", " + S(s[1]) + "))";
@@ -468,11 +479,19 @@ class Translator {
         }
         return "vec4(log2(abs(" + S1(s[0]) + ")))";
       case POW: need(2); return "vec4(pow(abs(" + S1(s[0]) + "), " + S1(s[1]) + "))";
-      case DP3: need(2); return "vec4(dot((" + S(s[0]) + ").xyz, (" + S(s[1]) + ").xyz))";
-      case DP4: need(2); return "vec4(dot(" + S(s[0]) + ", " + S(s[1]) + "))";
+      case DP3:
+        need(2);
+        helpers_.insert("dmul");
+        return "vec4(r_ddot(vec4((" + S(s[0]) + ").xyz, 0.0), vec4((" + S(s[1]) + ").xyz, 0.0)))";
+      case DP4:
+        need(2);
+        helpers_.insert("dmul");
+        return "vec4(r_ddot(" + S(s[0]) + ", " + S(s[1]) + "))";
       case DP2ADD:
         need(3);
-        return "vec4(dot((" + S(s[0]) + ").xy, (" + S(s[1]) + ").xy) + " + S1(s[2]) + ")";
+        helpers_.insert("dmul");
+        return "vec4(r_ddot(vec4((" + S(s[0]) + ").xy, 0.0, 0.0), vec4((" + S(s[1]) + ").xy, 0.0, 0.0)) + " +
+               S1(s[2]) + ")";
       case LIT: need(1); helpers_.insert("lit"); return "r_lit(" + S(s[0]) + ")";
       case DST:
         need(2);
@@ -483,7 +502,12 @@ class Translator {
       case ABS: need(1); return "abs(" + S(s[0]) + ")";
       case SGN: need(1); return "sign(" + S(s[0]) + ")";
       case CRS: need(2); return "vec4(cross((" + S(s[0]) + ").xyz, (" + S(s[1]) + ").xyz), 0.0)";
-      case NRM: need(1); return "(" + S(s[0]) + " * inversesqrt(dot((" + S(s[0]) + ").xyz, (" + S(s[0]) + ").xyz)))";
+      // D3D9's multiply (0 * inf = 0): a zero vector normalizes to zero, not NaN.
+      case NRM:
+        need(1);
+        helpers_.insert("dmul");
+        return "r_dmul(" + S(s[0]) + ", vec4(inversesqrt(dot((" + S(s[0]) + ").xyz, (" + S(s[0]) +
+               ").xyz))))";
       case SINCOS: need(1); return "vec4(cos(" + S1(s[0]) + "), sin(" + S1(s[0]) + "), 0.0, 0.0)";
       case CMP:
         need(3);
@@ -508,7 +532,9 @@ class Translator {
           Param row = s[1];
           row.num += uint32_t(k);
           std::string b = S(row);
-          r += three ? "dot((" + a + ").xyz, (" + b + ").xyz)" : "dot(" + a + ", " + b + ")";
+          helpers_.insert("dmul");
+          r += three ? "r_ddot(vec4((" + a + ").xyz, 0.0), vec4((" + b + ").xyz, 0.0))"
+                     : "r_ddot(" + a + ", " + b + ")";
         }
         return r + ")";
       }
@@ -1021,6 +1047,15 @@ class Translator {
         help += "  if (i == " + std::to_string(k) + ") return r_dc" + std::to_string(k) + ";\n";
       help += "  return i >= 0 && i < " + std::to_string(max_c_) + " ? c[i] : vec4(0.0);\n}\n";
     }
+    if (helpers_.count("dmul"))
+      help += "vec4 r_dmul(vec4 a, vec4 b) {\n"
+              "  bvec4 z = bvec4(vec4(equal(a, vec4(0.0))) + vec4(equal(b, vec4(0.0))));\n"
+              "  return mix(a * b, vec4(0.0), z);\n"
+              "}\n"
+              "float r_ddot(vec4 a, vec4 b) {\n"
+              "  vec4 m = r_dmul(a, b);\n"
+              "  return m.x + m.y + m.z + m.w;\n"
+              "}\n";
     if (helpers_.count("lit"))
       help += "vec4 r_lit(vec4 s) {\n"
               "  float p = clamp(s.w, -128.0, 128.0);\n"
