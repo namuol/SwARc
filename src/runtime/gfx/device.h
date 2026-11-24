@@ -214,6 +214,7 @@ struct ShaderDraw {
   uint32_t min_index = 0, vertex_count = 0;
   const void* indices = nullptr;  // null: not indexed
   uint32_t index_size = 2;        // bytes
+  uint32_t index_lock = 0;        // as VertexStream::lock, for the indices
   // Constant registers: float c (vs 256, ps 224), int i (16 x 4), bool b
   // (16).
   const float (*vs_float)[4] = nullptr;
