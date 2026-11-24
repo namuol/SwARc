@@ -1404,8 +1404,8 @@ bool InsnEmitter::EmitX87Double(X87Sim& sim, const std::string& fail, bool* can_
   };
   // An arithmetic result into x, with PE and C1.
   auto arith = [&](const std::string& o, const std::string& x, const std::string& src) {
-    check(Fmt("%s::ArithD(%s, %s, %s, &%s, &rfl, &rc1)", R, o.c_str(), x.c_str(), src.c_str(),
-              x.c_str()));
+    check(Fmt("%s::ArithD(%s, %s, %s, &%s, &rfl, &rc1, rcw)", R, o.c_str(), x.c_str(),
+              src.c_str(), x.c_str()));
     sim.c1_written = true;
   };
 
@@ -1547,7 +1547,7 @@ bool InsnEmitter::EmitX87Double(X87Sim& sim, const std::string& fail, bool* can_
     }
     case ZYDIS_MNEMONIC_FSQRT: {
       std::string x = sim.Read(0);
-      check(Fmt("%s::SqrtD(%s, &%s, &rfl, &rc1)", R, x.c_str(), x.c_str()));
+      check(Fmt("%s::SqrtD(%s, &%s, &rfl, &rc1, rcw)", R, x.c_str(), x.c_str()));
       sim.c1_written = true;
       sim.Write(0);
       return sim.ok;

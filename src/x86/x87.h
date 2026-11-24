@@ -630,10 +630,17 @@ template <bool kWide = false>
 // changed; every thread that runs guest code checks it,
 // platform::HostFpProblem).
 
-// Whether runs under control word cw use host doubles: PC=53 with
-// RC=nearest (Guard has checked the exception masks).
+// Whether runs under control word cw use host doubles: PC=53 or PC=64
+// with RC=nearest (Guard has checked the exception masks). At PC=64 an
+// operation is kept only when its double result is exact (no rounding
+// error): then it is the exact result, which PC=64 keeps as it is, with no
+// PE and no C1; an inexact one is redone exactly (ArithD, SqrtD).
 [[gnu::always_inline]] inline bool DoubleMode(uint32_t cw) {
-  return g_doubles && (cw & 0x0F00u) == 0x0200u;
+  return g_doubles && ((cw & 0x0F00u) == 0x0200u || (cw & 0x0F00u) == 0x0300u);
+}
+// PC=64: only exact results are kept (Mutated(20): any).
+[[gnu::always_inline]] inline bool ExactOnly(uint32_t cw) {
+  return (cw & 0x0300u) == 0x0300u && !Mutated(20);
 }
 
 // Zero, or a magnitude in [2^-511, 2^512): biased exponent 512..1534.
@@ -697,9 +704,10 @@ template <bool kWide = false>
   *up = inexact && ((eb ^ std::bit_cast<uint64_t>(ref)) >> 63);
 }
 
-// dst op src (Intel operand order), as Arith at PC=53/RC=nearest.
+// dst op src (Intel operand order), as Arith at PC=53 (or, exact results
+// only, PC=64) with RC=nearest.
 [[gnu::always_inline]] inline bool ArithD(Op op, double dst, double src, double* out,
-                                          uint32_t* fl, bool* up) {
+                                          uint32_t* fl, bool* up, uint32_t cw = 0x027F) {
   double a = dst, b = src, r, e, ref;
   if (op == Op::SubR || op == Op::DivR) {
     a = src;
@@ -727,18 +735,20 @@ template <bool kWide = false>
       break;
     }
   }
-  if (!InRange(r)) return false;
+  if (!InRange(r) || (ExactOnly(cw) && e != 0)) return false;
   *out = r;
   NoteD(e, ref, fl, up);
   return true;
 }
 
 // FSQRT: a negative operand gives NaN, out of range.
-[[gnu::always_inline]] inline bool SqrtD(double a, double* out, uint32_t* fl, bool* up) {
+[[gnu::always_inline]] inline bool SqrtD(double a, double* out, uint32_t* fl, bool* up,
+                                         uint32_t cw = 0x027F) {
   const double r = std::sqrt(a);
-  if (!InRange(r)) return false;
+  const double e = std::fma(-r, r, a);
+  if (!InRange(r) || (ExactOnly(cw) && e != 0)) return false;
   *out = r;
-  NoteD(std::fma(-r, r, a), Mutated(12) ? -r : r, fl, up);
+  NoteD(e, Mutated(12) ? -r : r, fl, up);
   return true;
 }
 
