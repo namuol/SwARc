@@ -119,6 +119,8 @@ constexpr bool Mutated(int n) { return RECOMP_X86_MUTATION == n; }
 //
 //   (1) MXCSR is the default but for its flags: every exception masked,
 //       round to nearest even, FTZ and DAZ off ((mxcsr & 0xFFC0) == 0x1F80).
+//       FastArith also takes FTZ and DAZ on ((mxcsr & 0x7F80) == 0x1F80):
+//       (2) and (3) keep denormals out of its operands and results.
 //       The host runs in its default environment too (round to nearest
 //       even, no flush to zero, no traps: platform::HostFpProblem, checked
 //       on every guest thread), and this file is built with
@@ -263,7 +265,12 @@ inline bool FastLane(Op op, Bits<D> a, Bits<D> b, Bits<D>* out, bool* inexact) {
 template <bool D>
 inline bool FastArith(Ctx& c, Op op, int lanes, Xmm& d, const Xmm& s) {
   using U = Bits<D>;
-  if ((c.mxcsr & 0xFFC0) != kMxcsrDefault) return false;
+  // FTZ and DAZ may be set (0x8040 left out): (2) keeps denormal operands
+  // out, so DAZ never applies, and (3) keeps tiny results out, so FTZ
+  // never flushes and the flags are as without them. Not with the flags
+  // unobserved: that path does not check (2) and (3).
+  constexpr uint32_t kMask = RECOMP_SSE_FLAGS_UNOBSERVED ? 0xFFC0 : 0x7F80;
+  if ((c.mxcsr & kMask) != kMxcsrDefault) return false;
   U r[16 / sizeof(U)];
   bool inexact = false;
   const bool pe_set = Mutated(106) || (c.mxcsr & 0x20) != 0;  // 106: always skipped
