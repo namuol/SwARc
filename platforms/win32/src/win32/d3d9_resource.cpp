@@ -391,11 +391,11 @@ uint32_t NewTexture(Device& d, uint32_t device, bool cube, uint32_t w, uint32_t 
   return D3D_OK;
 }
 
-// Volume textures: the formats whose memory layout is the GPU's
-// (UpdateImage uploads their slices as is: A8R8G8B8, the float ones and the
-// block-compressed ones), and those UnlockBox converts to A8R8G8B8 as 2D
-// textures are (gfx::DecodePixel's: X8R8G8B8 with its alpha opaque, A8, L8,
-// A8L8, the 16-bit RGB ones).
+// Volume textures: the formats whose memory layout is the GPU's (A8R8G8B8,
+// the float ones and the block-compressed ones), and those the device
+// converts to A8R8G8B8 as it does 2D textures' (X8R8G8B8 with its alpha
+// opaque, A8, L8, A8L8, the 16-bit RGB ones). UnlockBox uploads slices as
+// they are in memory either way.
 bool VolumeConverted(gfx::Format f) {
   switch (f) {
     case gfx::Format::X8R8G8B8: case gfx::Format::A8: case gfx::Format::L8:
@@ -1139,9 +1139,7 @@ HLE_NAMED("d3d9.dll", "IDirect3DCubeTexture9::AddDirtyRect", D3DCube9_AddDirtyRe
 // ---- IDirect3DVolumeTexture9 ------------------------------------------------------------
 // Levels halve in depth too. A level's lock shadow holds its slices one
 // after another (SlicePitch apart); unlocking uploads the locked box's
-// slices. The formats are those whose memory layout is the GPU's
-// (UpdateImage uploads as is): 32-bit RGB (X8R8G8B8 with its alpha made
-// opaque), the float ones and the block-compressed ones.
+// slices, as they are in memory (the formats: VolumeFormat).
 
 
 // (Width, Height, Depth, Levels, Usage, Format, Pool, ppVolumeTexture, pSharedHandle)
@@ -1203,17 +1201,7 @@ HLE_NAMED("d3d9.dll", "IDirect3DVolumeTexture9::UnlockBox", D3DVol9_UnlockBox, 2
                              : uint32_t(r.top) * l.pitch + uint32_t(r.left) * gfx::BitsPerPixel(t.fmt) / 8;
   for (uint32_t z = l.locked_front; z < l.locked_back; z++) {
     const uint8_t* src = GPtr(l.mem + z * l.slice + x_off);
-    if (VolumeConverted(t.fmt)) {  // to A8R8G8B8, the GPU's format for these
-      const uint32_t w = uint32_t(r.right - r.left), h = uint32_t(r.bottom - r.top);
-      const uint32_t bpp = gfx::BitsPerPixel(t.fmt) / 8;
-      std::vector<uint32_t> px(size_t(w) * h);
-      for (uint32_t y = 0; y < h; y++)
-        for (uint32_t x = 0; x < w; x++)
-          px[size_t(y) * w + x] = gfx::DecodePixel(src + size_t(y) * l.pitch + size_t(x) * bpp, t.fmt);
-      g->UpdateImage(t.tex, int(level), int(z), r, px.data(), w * 4);
-    } else {
-      g->UpdateImage(t.tex, int(level), int(z), r, src, l.pitch);
-    }
+    g->UpdateImage(t.tex, int(level), int(z), r, src, l.pitch);
   }
   return D3D_OK;
 }
