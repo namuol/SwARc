@@ -309,9 +309,10 @@ inline int FastComi(const Xmm& x, const Xmm& y) {
 
 // ---- conversions (inline in lifted code) -----------------------------------
 //
-// Under condition (1) above (MXCSR the default but for its flags; the host
-// in its default environment), checked per instruction, and per lane the
-// conditions below; otherwise the exact model (the ...Exact functions).
+// Under condition (1) above (MXCSR the default but for its flags, FTZ and
+// DAZ: see CvtMxcsr; the host in its default environment), checked per
+// instruction, and per lane the conditions below; otherwise the exact
+// model (the ...Exact functions).
 //
 //   int32 -> float (CVTDQ2PS, CVTSI2SS) and int32 -> double (CVTSI2SD): IEEE
 //     754's conversion is the correctly rounded value in round to nearest
@@ -337,14 +338,22 @@ inline int FastComi(const Xmm& x, const Xmm& y) {
 //     overflow). Inexact iff double(r) != d.
 //
 // tests/x86/sse_fast_test compares them with the exact paths bit for bit
-// (results and MXCSR); planted bugs 107-110 must make it fail.
+// (results and MXCSR); planted bugs 107-110 and 112 must make it fail.
 
-inline bool DefaultMxcsr(const Ctx& c) {
-  return (c.mxcsr & 0xFFC0) == kMxcsrDefault;
+// The conversions also run under FTZ and DAZ (0x8040 left out of the
+// check): int -> float/double has an integer operand and no tiny result;
+// float <-> double leaves denormal operands and tiny results out; to int32
+// leaves denormal operands out when DAZ is on (DAZ makes them an exact
+// zero: no PE), and its result is an integer (FTZ never applies).
+// Mutated(112): every conversion requires the default control word but
+// for DAZ's denormal check, which is left out.
+inline bool CvtMxcsr(const Ctx& c) {
+  return (c.mxcsr & 0x7F80) == kMxcsrDefault;
 }
+inline bool Daz(const Ctx& c) { return (c.mxcsr & 0x40) && !Mutated(112); }
 
 inline bool FastIntToF(Ctx& c, bool dbl, int32_t v, Xmm& d) {
-  if (!DefaultMxcsr(c)) return false;
+  if (!CvtMxcsr(c)) return false;
   if (dbl) {
     SetLane<uint64_t>(d, 0, std::bit_cast<uint64_t>(double(v)));
     return true;
@@ -356,7 +365,7 @@ inline bool FastIntToF(Ctx& c, bool dbl, int32_t v, Xmm& d) {
 }
 
 inline bool FastCvtdq2ps(Ctx& c, Xmm& d, const Xmm& s) {
-  if (!DefaultMxcsr(c)) return false;
+  if (!CvtMxcsr(c)) return false;
   Xmm r;
   bool inexact = false;
   for (int i = 0; i < 4; i++) {
@@ -372,13 +381,14 @@ inline bool FastCvtdq2ps(Ctx& c, Xmm& d, const Xmm& s) {
 
 // One lane to int32 without touching MXCSR: false outside the conditions.
 template <bool D>
-inline bool ToI32Lane(Bits<D> v, bool truncate, int32_t* out, bool* inexact) {
+inline bool ToI32Lane(Bits<D> v, bool truncate, int32_t* out, bool* inexact, bool daz) {
   using F = typename Host<D>::F;
   // |x| < 2^30: biased exponent below bias + 30 (Mutated(108): 2^31, where
   // rounding can leave int32).
   const Bits<D> e = (v >> Host<D>::kShift) & (D ? 0x7FF : 0xFF);
   const Bits<D> limit = (D ? 1023 : 127) + (Mutated(108) ? 32 : 30);
   if (e >= limit) return false;
+  if (daz && e == 0 && (v << 1)) return false;  // a denormal: DAZ's zero
   const F x = std::bit_cast<F>(v);
   const F r = truncate ? std::trunc(x) : std::nearbyint(x);
   *out = int32_t(r);
@@ -388,22 +398,23 @@ inline bool ToI32Lane(Bits<D> v, bool truncate, int32_t* out, bool* inexact) {
 
 template <bool D>
 inline bool FastToI32(Ctx& c, Bits<D> v, bool truncate, int32_t* out) {
-  if (!DefaultMxcsr(c)) return false;
+  if (!CvtMxcsr(c)) return false;
   bool inexact;
-  if (!ToI32Lane<D>(v, truncate, out, &inexact)) return false;
+  if (!ToI32Lane<D>(v, truncate, out, &inexact, Daz(c))) return false;
   if (inexact) c.mxcsr |= 0x20;
   return true;
 }
 
 inline bool FastToDq(Ctx& c, bool dbl, bool truncate, Xmm& d, const Xmm& s) {
-  if (!DefaultMxcsr(c)) return false;
+  if (!CvtMxcsr(c)) return false;
+  const bool daz = Daz(c);
   Xmm r{};
   bool inexact = false;
   for (int i = 0; i < (dbl ? 2 : 4); i++) {
     int32_t v;
     bool ix;
-    if (!(dbl ? ToI32Lane<true>(Lane<uint64_t>(s, i), truncate, &v, &ix)
-              : ToI32Lane<false>(Lane<uint32_t>(s, i), truncate, &v, &ix)))
+    if (!(dbl ? ToI32Lane<true>(Lane<uint64_t>(s, i), truncate, &v, &ix, daz)
+              : ToI32Lane<false>(Lane<uint32_t>(s, i), truncate, &v, &ix, daz)))
       return false;
     SetLane<int32_t>(r, i, v);
     inexact |= ix;
@@ -414,7 +425,7 @@ inline bool FastToDq(Ctx& c, bool dbl, bool truncate, Xmm& d, const Xmm& s) {
 }
 
 inline bool FastCvtFloat(Ctx& c, bool to_dbl, int lanes, Xmm& d, const Xmm& s) {
-  if (!DefaultMxcsr(c)) return false;
+  if (!CvtMxcsr(c)) return false;
   Xmm r = d;
   bool inexact = false;
   if (to_dbl) {
