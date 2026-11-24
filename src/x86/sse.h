@@ -222,18 +222,20 @@ inline bool FastLane(Op op, Bits<D> a, Bits<D> b, Bits<D>* out, bool* inexact,
     // that is denormal once rounded (the host rounds as the guest, RC being
     // nearest) is the zero of its sign.
     constexpr U kExp = D ? 0x7FF0000000000000ull : 0x7F800000u;
-    constexpr U kMant = D ? 0x000FFFFFFFFFFFFFull : 0x007FFFFFu;
-    auto denormal = [&](U v) { return !(v & kExp) && (v & kMant); };
+    constexpr U kSign = U(1) << (sizeof(U) * 8 - 1);
+    // A zero or denormal as the zero of its sign, the rest as it is
+    // (branch-free: denormals are common under FTZ/DAZ).
+    auto flush = [&](U v) { return v & ((v & kExp) ? ~U(0) : kSign); };
     if ((ftz_daz & 0x40) && !Mutated(114)) {
-      if (denormal(a)) a &= ~(kExp | kMant);
-      if (denormal(b)) b &= ~(kExp | kMant);
+      a = flush(a);
+      b = flush(b);
     }
     const F x = std::bit_cast<F>(a), y = std::bit_cast<F>(b);
     // x - y is x + (-y) in IEEE 754, signed zeros included.
     const F r = op == kAdd ? x + y : op == kSub ? x - y : op == kMul ? x * y : x / y;
     if (r != r && !Mutated(111)) return false;  // NaN: the exact model's bits
     U rb = std::bit_cast<U>(r);
-    if ((ftz_daz & 0x8000) && !Mutated(113) && denormal(rb)) rb &= ~(kExp | kMant);
+    if ((ftz_daz & 0x8000) && !Mutated(113)) rb = flush(rb);
     *out = rb;
     (void)inexact;  // flags unobserved: PE is not maintained
     return true;
