@@ -3,7 +3,8 @@
 // target, the scissor, clears and depth testing, a compute dispatch
 // writing a buffer (written back) and a storage image, GPU buffers read
 // by draws and dispatches and drawn from as indices, image layers, copies
-// and mip levels, and reading images back, on a device without a window.
+// and mip levels, volumes in Direct3D colour formats, and reading images
+// back, on a device without a window.
 // Needs a Vulkan device (lavapipe will do) or Metal; exits 77 (skipped)
 // without one.
 
@@ -226,6 +227,24 @@ int main() {
   for (uint32_t i = 0; i < 64; i++) ok &= out[i] == (i + 100) * 2 + 1;
   Check(big != 0 && ok, "GPU buffers keep their contents when their room grows");
   for (BufferId b : {vbuf, ibuf, gbuf, big}) dev->DestroyBuffer(b);
+
+  // A volume in a Direct3D colour format the GPU holds as A8R8G8B8 (A8):
+  // a slice uploads and reads back as it is in memory, at its depth.
+  {
+    ImageDesc vd;
+    vd.w = 4;
+    vd.h = 2;
+    vd.layers = 3;
+    vd.fmt = Format::A8;
+    vd.kind = TextureKind::Tex3D;
+    const TextureId vol = dev->CreateImage(vd);
+    const uint8_t slice[8] = {1, 2, 3, 4, 5, 6, 7, 8}, zero[8] = {};
+    for (int z = 0; z < 3; z++) dev->UpdateImage(vol, 0, z, {0, 0, 4, 2}, z == 1 ? slice : zero, 4);
+    uint8_t back[8] = {};
+    dev->ReadImage(vol, 0, 1, {0, 0, 4, 2}, back, 4);
+    Check(vol != 0 && std::memcmp(back, slice, 8) == 0, "an A8 volume slice uploads and reads back");
+    dev->DestroyTexture(vol);
+  }
 
   dev->DrawImage(rt, {0, 0, 4, 4});
   dev->Present();

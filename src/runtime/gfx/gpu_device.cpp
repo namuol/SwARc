@@ -1884,7 +1884,10 @@ void r_color0(inout vec4 c) {
     const uint32_t w = uint32_t(c.right - c.left), h = uint32_t(c.bottom - c.top);
     if (!w || !h || IsCompressed(t.fmt)) return;
     Flush();
-    const uint32_t row = RowPitch(t.fmt, w), size = row * h;
+    // The Direct3D colour formats are A8R8G8B8 on the GPU (GpuFormat):
+    // read as that and converted back.
+    const bool convert = !IsRaw(t.fmt);
+    const uint32_t row = convert ? w * 4 : RowPitch(t.fmt, w), size = row * h;
     SDL_GPUTransferBufferCreateInfo tbi{};
     tbi.usage = SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD;
     tbi.size = size;
@@ -1895,7 +1898,9 @@ void r_color0(inout vec4 c) {
     SDL_GPUTextureRegion src{};
     src.texture = t.tex;
     src.mip_level = Uint32(level);
-    src.layer = Uint32(layer);
+    // A 3D image's layers are its depth.
+    if (t.kind == TextureKind::Tex3D) src.z = Uint32(layer);
+    else src.layer = Uint32(layer);
     src.x = Uint32(c.left);
     src.y = Uint32(c.top);
     src.w = w;
@@ -1910,8 +1915,19 @@ void r_color0(inout vec4 c) {
     SubmitOpen();
     Drain();
     const auto* p = static_cast<const uint8_t*>(SDL_MapGPUTransferBuffer(dev_, tb, false));
-    for (uint32_t y = 0; y < h; y++)
-      std::memcpy(static_cast<uint8_t*>(dst) + size_t(y) * pitch, p + size_t(y) * row, row);
+    const uint32_t bpp = BitsPerPixel(t.fmt) / 8;
+    for (uint32_t y = 0; y < h; y++) {
+      uint8_t* d = static_cast<uint8_t*>(dst) + size_t(y) * pitch;
+      if (!convert) {
+        std::memcpy(d, p + size_t(y) * row, row);
+        continue;
+      }
+      for (uint32_t x = 0; x < w; x++) {
+        uint32_t argb;
+        std::memcpy(&argb, p + size_t(y) * row + size_t(x) * 4, 4);
+        EncodePixel(d + size_t(x) * bpp, t.fmt, argb);
+      }
+    }
     SDL_UnmapGPUTransferBuffer(dev_, tb);
     SDL_ReleaseGPUTransferBuffer(dev_, tb);
   }
