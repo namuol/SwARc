@@ -101,6 +101,7 @@ uint32_t Mxcsr() {
     case 0: m |= uint32_t(Rand() % 4) << 13; break;
     case 1: m |= 0x8000; break;
     case 2: m |= 0x40; break;
+    case 3: m |= 0x8040; break;  // both, as some games run
     default: break;
   }
   return m;
@@ -144,7 +145,7 @@ void ArithCase() {
       const U lo = D ? 107 : 49, hi = D ? 2045 : 253;
       return e >= lo && e <= hi;
     };
-    bool taken = (before & 0xFFC0) == sse::kMxcsrDefault;
+    bool taken = (before & (RECOMP_SSE_FLAGS_UNOBSERVED ? 0xFFC0 : 0x7F80)) == sse::kMxcsrDefault;
     for (int i = 0; i < lanes && taken; i++)
       taken = RECOMP_SSE_FLAGS_UNOBSERVED ? !IsNaN<D>(sse::Lane<U>(de, i))
                                           : in(sse::Lane<U>(d, i)) && in(sse::Lane<U>(s, i)) &&
