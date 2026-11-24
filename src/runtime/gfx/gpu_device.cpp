@@ -1609,9 +1609,12 @@ void r_color0(inout vec4 c) {
         int64_t end = std::min<int64_t>(start + int64_t(nverts) * vsm.stride, vsm.size);
         size_t pos = (verts_.size() + 3) & ~size_t(3);
         size_t bytes = start >= 0 && end > start ? size_t(end - start) : 0;
-        // Room for a whole last vertex and the shader's unaligned reads.
-        verts_.resize(pos + size_t(nverts) * vsm.stride + 8, 0);
+        // Room for a whole last vertex and the shader's unaligned reads:
+        // what is not copied is zeroed (the arena grows without zeroing).
+        const size_t room = size_t(nverts) * vsm.stride + 8;
+        verts_.resize(pos + room);
         if (bytes) std::memcpy(verts_.data() + pos, vsm.data + start, bytes);
+        std::memset(verts_.data() + pos + bytes, 0, room - bytes);
         stream_base[in.stream] = int32_t(pos) - int32_t(indexed ? d.min_index : 0) * int32_t(vsm.stride);
         copied[in.stream] = true;
       }
@@ -1642,7 +1645,19 @@ void r_color0(inout vec4 c) {
         }
         c.count = count * 3;
       } else {
-        for (uint32_t i = 0; i < n; i++) indices_.push_back(at(i));
+        // The common case, one pass per index size (at() per index, through
+        // push_back, cost more than the copy).
+        indices_.resize(size_t(c.first) + n);
+        uint32_t* out = indices_.data() + c.first;
+        if (!indexed) {
+          for (uint32_t i = 0; i < n; i++) out[i] = i;
+        } else if (d.index_size == 4) {
+          const uint32_t* in = static_cast<const uint32_t*>(d.indices);
+          for (uint32_t i = 0; i < n; i++) out[i] = std::clamp(in[i], lo, hi);
+        } else {
+          const uint16_t* in = static_cast<const uint16_t*>(d.indices);
+          for (uint32_t i = 0; i < n; i++) out[i] = std::clamp(uint32_t(in[i]), lo, hi);
+        }
         c.count = n;
       }
       c.base = 0;
