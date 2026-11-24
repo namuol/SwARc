@@ -655,14 +655,32 @@ void Draw(Device& d, gfx::ShaderDraw& sd, const char* what) {
     for (int s = 0; s < 16; s++) {
       gfx::VertexStream& vs_ = sd.streams[s];
       if (!vs_.data || !vs_.stride) continue;
-      std::vector<uint8_t> out(size_t(instances) * vc * vs_.stride, 0);
-      for (uint32_t i = 0; i < instances; i++) {
-        for (uint32_t v = 0; v < vc; v++) {
-          uint64_t src = per_instance[s] ? uint64_t(i / per_instance[s]) * vs_.stride
-                                         : uint64_t(first + v) * vs_.stride;
-          uint8_t* dst = out.data() + (size_t(i) * vc + v) * vs_.stride;
-          if (src + vs_.stride <= vs_.size) std::memcpy(dst, vs_.data + src, vs_.stride);
+      // Copies whole blocks (a vertex at a time cost more than the draw):
+      // each vertex or element is read only if it lies wholly inside the
+      // stream, and the rest stays zero.
+      const size_t stride = vs_.stride, block = size_t(vc) * stride;
+      std::vector<uint8_t> out(size_t(instances) * block, 0);
+      // dst[0, unit) repeated over dst[0, total), by doubling.
+      auto repeat = [](uint8_t* dst, size_t unit, size_t total) {
+        for (size_t have = unit; unit && have < total;) {
+          const size_t n = std::min(have, total - have);
+          std::memcpy(dst + have, dst, n);
+          have += n;
         }
+      };
+      if (per_instance[s]) {  // instance i's element over its vc vertices
+        for (uint32_t i = 0; i < instances; i++) {
+          const uint64_t src = uint64_t(i / per_instance[s]) * stride;
+          if (!vc || src + stride > vs_.size) continue;
+          uint8_t* dst = out.data() + size_t(i) * block;
+          std::memcpy(dst, vs_.data + src, stride);
+          repeat(dst, stride, block);
+        }
+      } else {  // vertices first .. first + vc - 1, the same for every instance
+        const uint64_t lo = uint64_t(first) * stride;
+        const size_t valid = lo < vs_.size ? size_t(std::min<uint64_t>(vc, (vs_.size - lo) / stride)) : 0;
+        if (valid) std::memcpy(out.data(), vs_.data + lo, valid * stride);
+        repeat(out.data(), block, out.size());
       }
       expanded.push_back(std::move(out));
       vs_ = {expanded.back().data(), uint32_t(expanded.back().size()), vs_.stride};
