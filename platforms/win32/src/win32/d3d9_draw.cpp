@@ -608,7 +608,7 @@ void Draw(Device& d, gfx::ShaderDraw& sd, const char* what) {
     auto* b = com::As<Buffer>(st.buffer);
     if (!b || st.offset >= b->length) continue;
     sd.streams[s] = {static_cast<const uint8_t*>(GPtr(b->mem)) + st.offset, b->length - st.offset,
-                     st.stride};
+                     st.stride, 0, b->ticket};
   }
   // An instanced draw becomes one ordinary draw of every instance's copy:
   // per-vertex streams' vertices repeated per instance, per-instance
