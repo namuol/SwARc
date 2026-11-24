@@ -43,6 +43,7 @@ void Device::StretchRectFlipped(ColorTarget src, const Rect& sr, ColorTarget dst
 uint64_t Device::WritesQueued() { return 0; }
 uint64_t Device::LandWrites(bool) { return 0; }
 bool Device::SupportsOcclusion() { return false; }
+bool Device::SupportsInstancing() { return false; }
 uint32_t Device::BeginOcclusion() { return 0; }
 void Device::EndOcclusion(uint32_t) {}
 bool Device::OcclusionResult(uint32_t, uint64_t* count, bool) {
