@@ -1862,8 +1862,15 @@ void r_color0(inout vec4 c) {
     const int w = c.right - c.left, h = c.bottom - c.top;
     if (w <= 0 || h <= 0) return;
     if (Pending(t.tex)) Flush();
-    QueueUpload(t.tex, level, c.left, c.top, w, h, src, pitch, RowCount(t.fmt, uint32_t(h)),
-                RowPitch(t.fmt, uint32_t(w)), false, IsCompressed(t.fmt), volume ? 0 : layer);
+    if (IsRaw(t.fmt) || IsCompressed(t.fmt)) {
+      QueueUpload(t.tex, level, c.left, c.top, w, h, src, pitch, RowCount(t.fmt, uint32_t(h)),
+                  RowPitch(t.fmt, uint32_t(w)), false, IsCompressed(t.fmt), volume ? 0 : layer);
+    } else {  // the Direct3D colour formats: A8R8G8B8 on the GPU (GpuFormat), as UpdateTexture
+      std::vector<uint32_t> px(size_t(w) * h);
+      ConvertToArgb(static_cast<const uint8_t*>(src), pitch, t.fmt, w, h, px.data());
+      QueueUpload(t.tex, level, c.left, c.top, w, h, px.data(), uint32_t(w) * 4, uint32_t(h),
+                  uint32_t(w) * 4, false, false, volume ? 0 : layer);
+    }
     if (volume) uploads_.back().z = uint32_t(layer);
   }
 
