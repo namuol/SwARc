@@ -210,15 +210,30 @@ inline bool InRange(Bits<D> v) {
 // One lane on the host: false (nothing written) outside the conditions.
 // `inexact` null: PE is already set, so the error term is not needed.
 template <bool D>
-inline bool FastLane(Op op, Bits<D> a, Bits<D> b, Bits<D>* out, bool* inexact) {
+inline bool FastLane(Op op, Bits<D> a, Bits<D> b, Bits<D>* out, bool* inexact,
+                     uint32_t ftz_daz = 0) {
   using U = Bits<D>;
   using F = typename Host<D>::F;
   if constexpr (RECOMP_SSE_FLAGS_UNOBSERVED) {
+    // ftz_daz: MXCSR's FTZ (0x8000) and DAZ (0x40). The host flushes
+    // nothing, so a denormal operand under DAZ (the guest reads it as a
+    // zero) and, under FTZ, a denormal result or one of exactly the
+    // smallest normal (which the guest flushes when it was tiny before
+    // rounding) go to the exact model; other results are the same.
+    constexpr U kExp = D ? 0x7FF0000000000000ull : 0x7F800000u;
+    constexpr U kMant = D ? 0x000FFFFFFFFFFFFFull : 0x007FFFFFu;
+    constexpr U kMinNormal = D ? 0x0010000000000000ull : 0x00800000u;
+    auto denormal = [&](U v) { return !(v & kExp) && (v & kMant); };
+    if ((ftz_daz & 0x40) && (denormal(a) || denormal(b))) return false;
     const F x = std::bit_cast<F>(a), y = std::bit_cast<F>(b);
     // x - y is x + (-y) in IEEE 754, signed zeros included.
     const F r = op == kAdd ? x + y : op == kSub ? x - y : op == kMul ? x * y : x / y;
     if (r != r && !Mutated(111)) return false;  // NaN: the exact model's bits
-    *out = std::bit_cast<U>(r);
+    const U rb = std::bit_cast<U>(r);
+    if ((ftz_daz & 0x8000) && !Mutated(113) &&
+        (denormal(rb) || (rb & ~(U(1) << (sizeof(U) * 8 - 1))) == kMinNormal))
+      return false;
+    *out = rb;
     (void)inexact;  // flags unobserved: PE is not maintained
     return true;
   }
@@ -267,16 +282,17 @@ inline bool FastArith(Ctx& c, Op op, int lanes, Xmm& d, const Xmm& s) {
   using U = Bits<D>;
   // FTZ and DAZ may be set (0x8040 left out): (2) keeps denormal operands
   // out, so DAZ never applies, and (3) keeps tiny results out, so FTZ
-  // never flushes and the flags are as without them. Not with the flags
-  // unobserved: that path does not check (2) and (3).
-  constexpr uint32_t kMask = RECOMP_SSE_FLAGS_UNOBSERVED ? 0xFFC0 : 0x7F80;
-  if ((c.mxcsr & kMask) != kMxcsrDefault) return false;
+  // never flushes and the flags are as without them. With the flags
+  // unobserved, FastLane checks the operands and result for them itself.
+  if ((c.mxcsr & 0x7F80) != kMxcsrDefault) return false;
+  const uint32_t ftz_daz = c.mxcsr & 0x8040;
   U r[16 / sizeof(U)];
   bool inexact = false;
   const bool pe_set = Mutated(106) || (c.mxcsr & 0x20) != 0;  // 106: always skipped
   for (int i = 0; i < lanes; i++) {
     bool ix = false;
-    if (!FastLane<D>(op, Lane<U>(d, i), Lane<U>(s, i), &r[i], pe_set ? nullptr : &ix)) return false;
+    if (!FastLane<D>(op, Lane<U>(d, i), Lane<U>(s, i), &r[i], pe_set ? nullptr : &ix, ftz_daz))
+      return false;
     inexact |= ix;
   }
   for (int i = 0; i < lanes; i++) SetLane<U>(d, i, r[i]);
