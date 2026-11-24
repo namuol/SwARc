@@ -679,6 +679,14 @@ bool Cas128(uint8_t* p, uint64_t* lo, uint64_t* hi, uint64_t new_lo, uint64_t ne
 // RECOMP_LIFT_X64 before including this header. Their segment bases are
 // read from c at each use, not kept: a fiber resumed on another thread
 // (libSceFiber) must see that thread's TLS, as its fs reads do.
+// MXCSR as of the last load of it (entry, LIFT_RELOAD, LDMXCSR, FXRSTOR):
+// the SSE fast paths read their control bits from it instead of Ctx, which
+// every guest memory store could have changed as far as the compiler
+// knows. Only the control bits are relied on, which only those change.
+#define LIFT_MXMODE_ENTER                                                \
+  uint32_t MXMODE = c.mxcsr;                                             \
+  (void)MXMODE;
+
 #ifndef RECOMP_LIFT_X64
 #define LIFT_ENTER                                                       \
   uint8_t* const B = ::recomp::g_guest_base;                                \
@@ -687,7 +695,8 @@ bool Cas128(uint8_t* p, uint64_t* lo, uint64_t* hi, uint64_t new_lo, uint64_t ne
   ::recomp::Flags F;                                                        \
   ::recomp::UnpackEFlags(F, c.eflags);                                   \
   const uint32_t FS = uint32_t(c.fs_base);                               \
-  (void)FS;
+  (void)FS;                                                              \
+  LIFT_MXMODE_ENTER
 #else
 #define LIFT_ENTER                                                       \
   uint8_t* const B = ::recomp::g_guest_base;                                \
@@ -698,7 +707,8 @@ bool Cas128(uint8_t* p, uint64_t* lo, uint64_t* hi, uint64_t new_lo, uint64_t ne
   ::recomp::Flags F;                                                        \
   ::recomp::UnpackEFlags(F, c.eflags);                                   \
   const uint64_t &FS = c.fs_base, &GS = c.gs_base;                       \
-  (void)FS, (void)GS;
+  (void)FS, (void)GS; \
+  LIFT_MXMODE_ENTER
 #endif
 
 // Tail calls between lifted functions (all void(Ctx&)) are guaranteed
@@ -720,7 +730,8 @@ bool Cas128(uint8_t* p, uint64_t* lo, uint64_t* hi, uint64_t new_lo, uint64_t ne
 #define LIFT_RELOAD                                                      \
   eax = c.eax; ecx = c.ecx; edx = c.edx; ebx = c.ebx;                    \
   esp = c.esp; ebp = c.ebp; esi = c.esi; edi = c.edi;                    \
-  ::recomp::UnpackEFlags(F, c.eflags);
+  ::recomp::UnpackEFlags(F, c.eflags);                                   \
+  MXMODE = c.mxcsr;
 // Before a call, return or tail call in a program where no arithmetic
 // flag crosses one (the lifter's --light-call-flags, checked over every
 // function): only the system flags (DF, AC, ID, NT) go into Ctx.
@@ -741,5 +752,6 @@ bool Cas128(uint8_t* p, uint64_t* lo, uint64_t* hi, uint64_t new_lo, uint64_t ne
   rsp = c.rsp; rbp = c.rbp; rsi = c.rsi; rdi = c.rdi;                    \
   r8 = c.r8; r9 = c.r9; r10 = c.r10; r11 = c.r11;                        \
   r12 = c.r12; r13 = c.r13; r14 = c.r14; r15 = c.r15;                    \
-  ::recomp::UnpackEFlags(F, c.eflags);
+  ::recomp::UnpackEFlags(F, c.eflags);                                   \
+  MXMODE = c.mxcsr;
 #endif

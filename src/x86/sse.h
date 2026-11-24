@@ -277,15 +277,18 @@ inline bool FastLane(Op op, Bits<D> a, Bits<D> b, Bits<D>* out, bool* inexact,
 
 // The whole instruction on the host, or false (nothing changed) if any
 // lane is outside the conditions.
+// mode: MXCSR's control bits as the lifted code last loaded them (MXMODE);
+// the flags-unobserved path reads them there, the other one reads MXCSR.
 template <bool D>
-inline bool FastArith(Ctx& c, Op op, int lanes, Xmm& d, const Xmm& s) {
+inline bool FastArith(Ctx& c, Op op, int lanes, Xmm& d, const Xmm& s, uint32_t mode) {
   using U = Bits<D>;
   // FTZ and DAZ may be set (0x8040 left out): (2) keeps denormal operands
   // out, so DAZ never applies, and (3) keeps tiny results out, so FTZ
   // never flushes and the flags are as without them. With the flags
   // unobserved, FastLane checks the operands and result for them itself.
-  if ((c.mxcsr & 0x7F80) != kMxcsrDefault) return false;
-  const uint32_t ftz_daz = c.mxcsr & 0x8040;
+  const uint32_t mx = RECOMP_SSE_FLAGS_UNOBSERVED ? mode : c.mxcsr;
+  if ((mx & 0x7F80) != kMxcsrDefault) return false;
+  const uint32_t ftz_daz = mx & 0x8040;
   U r[16 / sizeof(U)];
   bool inexact = false;
   const bool pe_set = Mutated(106) || (c.mxcsr & 0x20) != 0;  // 106: always skipped
@@ -483,8 +486,11 @@ inline bool FastCvtFloat(Ctx& c, bool to_dbl, int lanes, Xmm& d, const Xmm& s) {
 // forms pass lanes = 1 and keep the upper lanes of d. The fast path
 // (above) inline; ArithExact the exact model for everything else.
 RECOMP_SSE_SLOW void ArithExact(Ctx& c, Op op, bool dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va);
-inline void Arith(Ctx& c, Op op, bool dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va) {
-  if (dbl ? fast::FastArith<true>(c, op, lanes, d, s) : fast::FastArith<false>(c, op, lanes, d, s))
+// `mode`: MXCSR's control bits as last loaded (the lifted code's MXMODE).
+inline void Arith(Ctx& c, uint32_t mode, Op op, bool dbl, int lanes, Xmm& d, const Xmm& s,
+                  uint64_t va) {
+  if (dbl ? fast::FastArith<true>(c, op, lanes, d, s, mode)
+          : fast::FastArith<false>(c, op, lanes, d, s, mode))
     return;
   // Copies, here and in the wrappers below: lifted code keeps XMM
   // registers in locals, and an address passed out of line would make the
@@ -493,6 +499,9 @@ inline void Arith(Ctx& c, Op op, bool dbl, int lanes, Xmm& d, const Xmm& s, uint
   const Xmm u = s;
   ArithExact(c, op, dbl, lanes, t, u, va);
   d = t;
+}
+inline void Arith(Ctx& c, Op op, bool dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va) {
+  Arith(c, c.mxcsr, op, dbl, lanes, d, s, va);
 }
 
 // CMPPS/PD/SS/SD: each lane of d becomes all ones if `d pred s` holds,

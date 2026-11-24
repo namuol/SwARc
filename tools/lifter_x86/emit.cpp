@@ -1850,7 +1850,7 @@ void InsnEmitter::EmitSse() {
     if (a.m == m) {
       if (!IsXmm(0)) return Unimpl();
       std::string s = src(1);
-      L(Fmt("::recomp::sse::Arith(c, ::recomp::sse::%s, %s, %d, %s, %s, %s);", a.op,
+      L(Fmt("::recomp::sse::Arith(c, MXMODE, ::recomp::sse::%s, %s, %d, %s, %s, %s);", a.op,
             b(a.dbl), a.lanes, XmmRef(0).c_str(), s.c_str(), va.c_str()));
       return;
     }
@@ -2526,6 +2526,7 @@ void InsnEmitter::EmitSse() {
     case ZYDIS_MNEMONIC_LDMXCSR:
       L(Fmt("::recomp::sse::Ldmxcsr(c, ::recomp::lift::Rd<uint32_t>(B, m0), %s);",
             va.c_str()));
+      L("MXMODE = c.mxcsr;");
       return;
     case ZYDIS_MNEMONIC_PREFETCHNTA: case ZYDIS_MNEMONIC_PREFETCHT0:
     case ZYDIS_MNEMONIC_PREFETCHT1: case ZYDIS_MNEMONIC_PREFETCHT2:
@@ -2583,8 +2584,8 @@ void InsnEmitter::EmitAvx() {
     if (a.m == m) {
       int bytes = a.lanes == 1 ? (a.dbl ? 8 : 4) : 16;
       return binary([&](const std::string& t, const std::string& s2) {
-        return Fmt("::recomp::sse::Arith(c, ::recomp::sse::%s, %s, %d, %s, %s, %s);", a.op,
-                   b(a.dbl), a.lanes, t.c_str(), s2.c_str(), va.c_str());
+        return Fmt("::recomp::sse::Arith(c, MXMODE, ::recomp::sse::%s, %s, %d, %s, %s, %s);",
+                   a.op, b(a.dbl), a.lanes, t.c_str(), s2.c_str(), va.c_str());
       }, bytes);
     }
 
@@ -3459,6 +3460,7 @@ void InsnEmitter::EmitWideMem() {
       return;
     case ZYDIS_MNEMONIC_FXRSTOR: case ZYDIS_MNEMONIC_FXRSTOR64:
       L(Fmt("::recomp::sse::Fxrstor(c, B + m0, %s%s);", va.c_str(), X64() ? "" : ", 8"));
+      L("MXMODE = c.mxcsr;");
       return;
     default:
       return Unimpl();
