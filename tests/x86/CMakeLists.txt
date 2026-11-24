@@ -58,8 +58,11 @@ target_compile_options(sse_fast_noflags_mutation_111 PRIVATE -O2 ${RECOMP_X87_FP
 target_link_libraries(sse_fast_noflags_mutation_111 PRIVATE softfloat recomp_base)
 add_test(NAME sse_fast_noflags_mutation_111 COMMAND sse_fast_noflags_mutation_111 400000)
 # The same built with each planted bug of those fast paths
-# (RECOMP_X86_MUTATION 101-110, x86/sse.h), which it must catch.
-foreach(_m RANGE 101 110)
+# (RECOMP_X86_MUTATION 101-110 and 112, x86/sse.h), which it must catch.
+foreach(_m RANGE 101 112)
+  if(_m EQUAL 111)  # the flags-unobserved variant's (above)
+    continue()
+  endif()
   add_executable(sse_fast_mutation_${_m} sse_fast_test.cpp "${RECOMP_ROOT}/src/x86/sse.cpp")
   target_include_directories(sse_fast_mutation_${_m} PRIVATE "${RECOMP_ROOT}/src")
   target_compile_features(sse_fast_mutation_${_m} PRIVATE cxx_std_20)
