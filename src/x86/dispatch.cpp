@@ -59,6 +59,23 @@ CodeRange RangeOf(uint64_t lo, uint64_t size) {
   return r;
 }
 
+// 32-bit guests: the code range of each 64 KiB granule, for Dispatch
+// (an indirect branch otherwise tries every DLL's range). Null: no code
+// there, or a granule two ranges share (kShared), which takes the scan.
+const CodeRange* const kShared = reinterpret_cast<const CodeRange*>(uintptr_t(1));
+std::vector<const CodeRange*> g_granule;
+
+void IndexGranules() {
+  g_granule.assign(size_t(1) << 16, nullptr);
+  auto add = [](const CodeRange& r) {
+    if (!r.size || r.lo + r.size > (uint64_t(1) << 32)) return;
+    for (uint64_t g = r.lo >> 16; g <= (r.lo + r.size - 1) >> 16; g++)
+      g_granule[g] = g_granule[g] ? kShared : &r;
+  };
+  add(g_exe);
+  for (const CodeRange& d : g_dlls) add(d);
+}
+
 // The code range containing va, or null.
 const CodeRange* CodeAt(uint64_t va) {
   if (va - g_exe.lo < g_exe.size) return &g_exe;
@@ -352,6 +369,7 @@ void InitDispatch() {
     else
       g_dlls.push_back(RangeOf(lo, size));
   }
+  if (!g_proc->x64) IndexGranules();
 }
 
 bool IsLifted(gaddr va) {
@@ -383,7 +401,14 @@ void Dispatch(Ctx& c, uint64_t target, uint64_t va) {
 }
 
 void Dispatch(Ctx& c, uint32_t target, uint32_t va) {
-  const CodeRange* r = &g_exe;
+  const CodeRange* r = g_granule[target >> 16];
+  if (r > kShared && target - r->lo < r->size) {
+    if (GuestFn fn = r->table[target - r->lo]) {
+      fn(c);
+      return;
+    }
+  }
+  r = &g_exe;
   if (target - r->lo >= r->size) {
     if (target - kThunkBase < kThunkRegionSize) {
       hle::CallThunk(c, target);
