@@ -23,6 +23,17 @@ std::string FnName(uint64_t va);
 class Emitter {
  public:
   Emitter(const Program& p, const Decoder& dec) : p_(p), dec_(dec) {}
+  // --light-call-flags (32-bit): which calls and returns may carry only the
+  // system flags (DF, AC, ID, NT) in Ctx::eflags, from FlagsAcrossCalls
+  // over the whole program.
+  struct LightFlags {
+    bool on = false;
+    std::set<uint64_t> entry_readers;  // calls into these carry the flags
+    std::set<uint64_t> full_returns;   // these return the flags
+    bool indirect_calls = false;       // indirect calls may be light
+    bool returns = false;              // returns may be light (but full_returns)
+  };
+  void set_light_flags(const LightFlags* l) { light_ = l; }
 
   // Appends the function definition to *out. Every function it references
   // (calls, tail calls) is added to *refs for forward declarations.
@@ -42,6 +53,7 @@ class Emitter {
                   std::set<uint64_t>* refs, EmitStats* stats) const;
   const Program& p_;
   const Decoder& dec_;
+  const LightFlags* light_ = nullptr;
 };
 
 }  // namespace lifter

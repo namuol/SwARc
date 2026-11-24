@@ -804,4 +804,69 @@ void BuildFunction(const Program& p, const Decoder& dec, uint64_t entry,
   }
 }
 
+FlagReads FlagsAcrossCalls(const Program& p, const Function& f) {
+  constexpr uint32_t kArith = ZYDIS_CPUFLAG_CF | ZYDIS_CPUFLAG_PF | ZYDIS_CPUFLAG_AF |
+                              ZYDIS_CPUFLAG_ZF | ZYDIS_CPUFLAG_SF | ZYDIS_CPUFLAG_OF;
+  // Per instruction: w, the flags written on every path to it since the
+  // entry or a call (intersection); k, those that on some path were not
+  // written since a call (union): an unwritten flag is the caller's
+  // unless it is in k.
+  struct State {
+    uint32_t w, k;
+  };
+  std::map<uint64_t, State> in_state;
+  std::vector<uint64_t> work;
+  auto reach = [&](uint64_t va, State s) {
+    if (!f.insns.count(va)) return;
+    auto [it, fresh] = in_state.try_emplace(va, s);
+    if (fresh) {
+      work.push_back(va);
+    } else if ((it->second.w & s.w) != it->second.w || (it->second.k | s.k) != it->second.k) {
+      it->second.w &= s.w;
+      it->second.k |= s.k;
+      work.push_back(va);
+    }
+  };
+  reach(f.entry, {0, 0});
+  for (uint64_t r : f.setjmp_returns) reach(r, {0, 0});
+  FlagReads out;
+  std::set<uint64_t> bad;
+  while (!work.empty()) {
+    const uint64_t va = work.back();
+    work.pop_back();
+    const Insn& in = f.insns.at(va);
+    State s = in_state[va];
+    if (!in.ok) continue;
+    if (in.d.cpu_flags) {
+      const auto& cf = *in.d.cpu_flags;
+      const uint32_t missing = cf.tested & kArith & ~s.w;
+      if (missing) {
+        bad.insert(va);
+        if (missing & s.k) out.after_call = true;
+        if (missing & ~s.k) out.at_entry = true;
+      }
+      const uint32_t written = (cf.modified | cf.set_0 | cf.set_1 | cf.undefined) & kArith;
+      s.w |= written;
+      s.k &= ~written;
+    }
+    if (in.d.mnemonic == ZYDIS_MNEMONIC_CALL) s = {0, kArith};  // the callee's flags
+    uint64_t t;
+    switch (Classify(p, f, in, &t)) {
+      case Flow::Fall: reach(in.next(), s); break;
+      case Flow::Branch: reach(in.next(), s); reach(t, s); break;
+      case Flow::Jump: reach(t, s); break;
+      case Flow::JumpTable: {
+        auto jt = p.jumptables.find(va);
+        if (jt != p.jumptables.end())
+          for (uint64_t c : jt->second) reach(c, s);
+        break;
+      }
+      default: break;  // returns, tail calls and stops: to another function
+    }
+  }
+  out.where.assign(bad.begin(), bad.end());
+  return out;
+}
+
 }  // namespace lifter
+

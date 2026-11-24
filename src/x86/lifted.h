@@ -721,6 +721,13 @@ bool Cas128(uint8_t* p, uint64_t* lo, uint64_t* hi, uint64_t new_lo, uint64_t ne
   eax = c.eax; ecx = c.ecx; edx = c.edx; ebx = c.ebx;                    \
   esp = c.esp; ebp = c.ebp; esi = c.esi; edi = c.edi;                    \
   ::recomp::UnpackEFlags(F, c.eflags);
+// Before a call, return or tail call in a program where no arithmetic
+// flag crosses one (the lifter's --light-call-flags, checked over every
+// function): only the system flags (DF, AC, ID, NT) go into Ctx.
+#define LIFT_SPILL_LIGHT                                                 \
+  c.eax = eax; c.ecx = ecx; c.edx = edx; c.ebx = ebx;                    \
+  c.esp = esp; c.ebp = ebp; c.esi = esi; c.edi = edi;                    \
+  c.eflags = ::recomp::PackSystemEFlags(F);
 #else
 #define LIFT_SPILL                                                       \
   c.rax = rax; c.rcx = rcx; c.rdx = rdx; c.rbx = rbx;                    \

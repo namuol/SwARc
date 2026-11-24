@@ -71,6 +71,11 @@ struct Ctx {
          (f.df ? 0x400u : 0) | (f.of ? 0x800u : 0) | (f.nt ? 0x4000u : 0) |
          (f.ac ? 0x40000u : 0) | (f.id ? 0x200000u : 0);
 }
+// Only DF, NT, AC and ID (and the fixed bits): the arithmetic flags as 0.
+[[gnu::always_inline]] inline uint32_t PackSystemEFlags(const Flags& f) {
+  return 0x202u | (f.df ? 0x400u : 0) | (f.nt ? 0x4000u : 0) | (f.ac ? 0x40000u : 0) |
+         (f.id ? 0x200000u : 0);
+}
 [[gnu::always_inline]] inline void UnpackEFlags(Flags& f, uint32_t v) {
   f.cf = v & 0x1;
   f.pf = v & 0x4;
