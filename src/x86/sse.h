@@ -215,24 +215,25 @@ inline bool FastLane(Op op, Bits<D> a, Bits<D> b, Bits<D>* out, bool* inexact,
   using U = Bits<D>;
   using F = typename Host<D>::F;
   if constexpr (RECOMP_SSE_FLAGS_UNOBSERVED) {
-    // ftz_daz: MXCSR's FTZ (0x8000) and DAZ (0x40). The host flushes
-    // nothing, so a denormal operand under DAZ (the guest reads it as a
-    // zero) and, under FTZ, a denormal result or one of exactly the
-    // smallest normal (which the guest flushes when it was tiny before
-    // rounding) go to the exact model; other results are the same.
+    // ftz_daz: MXCSR's FTZ (0x8000) and DAZ (0x40), which the host (it
+    // flushes nothing) applies here as the guest does (SDM vol. 1,
+    // 10.2.3.3-4, as the exact model, sse.cpp's Scope, applies them): under
+    // DAZ a denormal operand is the zero of its sign; under FTZ a result
+    // that is denormal once rounded (the host rounds as the guest, RC being
+    // nearest) is the zero of its sign.
     constexpr U kExp = D ? 0x7FF0000000000000ull : 0x7F800000u;
     constexpr U kMant = D ? 0x000FFFFFFFFFFFFFull : 0x007FFFFFu;
-    constexpr U kMinNormal = D ? 0x0010000000000000ull : 0x00800000u;
     auto denormal = [&](U v) { return !(v & kExp) && (v & kMant); };
-    if ((ftz_daz & 0x40) && (denormal(a) || denormal(b))) return false;
+    if ((ftz_daz & 0x40) && !Mutated(114)) {
+      if (denormal(a)) a &= ~(kExp | kMant);
+      if (denormal(b)) b &= ~(kExp | kMant);
+    }
     const F x = std::bit_cast<F>(a), y = std::bit_cast<F>(b);
     // x - y is x + (-y) in IEEE 754, signed zeros included.
     const F r = op == kAdd ? x + y : op == kSub ? x - y : op == kMul ? x * y : x / y;
     if (r != r && !Mutated(111)) return false;  // NaN: the exact model's bits
-    const U rb = std::bit_cast<U>(r);
-    if ((ftz_daz & 0x8000) && !Mutated(113) &&
-        (denormal(rb) || (rb & ~(U(1) << (sizeof(U) * 8 - 1))) == kMinNormal))
-      return false;
+    U rb = std::bit_cast<U>(r);
+    if ((ftz_daz & 0x8000) && !Mutated(113) && denormal(rb)) rb &= ~(kExp | kMant);
     *out = rb;
     (void)inexact;  // flags unobserved: PE is not maintained
     return true;
