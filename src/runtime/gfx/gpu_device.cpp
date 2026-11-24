@@ -1592,7 +1592,10 @@ void r_color0(inout vec4 c) {
     }
     Argb(&sc.blend_constant.r, state.rs[193]);
 
-    // Vertices: each stream's range copied to the arena once.
+    // Vertices: each stream's range copied to the arena once, or, when
+    // every stream the shader reads is a locked per-vertex one (a static
+    // vertex buffer's) drawn in an earlier frame too, read from pvbuf_
+    // (PlacePersistent), copied there once.
     bool indexed = d.indices != nullptr;
     int64_t first = int64_t(d.base_vertex) + (indexed ? d.min_index : 0);
     uint32_t nverts = indexed ? d.vertex_count : n;
@@ -1600,6 +1603,33 @@ void r_color0(inout vec4 c) {
     VsState st{};
     int32_t stream_base[16];
     bool copied[16] = {};
+    struct PvRun {
+      uintptr_t lo, hi;
+      uint32_t stride;
+      int32_t at;
+    };
+    PvRun runs[13];
+    uint32_t run_lock[13];
+    int nruns = 0, run_of[16];
+    bool listed[16] = {};
+    bool persistent = pv_mode_ != PvMode::Off && nverts > 0;
+    for (size_t i = 0; i < vs.inputs && persistent; i++) {
+      VertexInput in = i < d.input_count ? d.inputs[i] : VertexInput{};
+      if (in.type >= 17 || in.stream >= 16 || !d.streams[in.stream].data) continue;
+      const VertexStream& vsm = d.streams[in.stream];
+      if (listed[in.stream]) continue;
+      listed[in.stream] = true;
+      const int64_t start = first * vsm.stride, bytes = int64_t(nverts) * vsm.stride;
+      if (!vsm.lock || vsm.divisor || !vsm.stride || start < 0 || start + bytes > vsm.size || nruns == 13) {
+        persistent = false;
+        break;
+      }
+      runs[nruns] = {uintptr_t(vsm.data + start), uintptr_t(vsm.data + start) + vsm.stride, vsm.stride, 0};
+      run_lock[nruns] = vsm.lock;
+      run_of[in.stream] = nruns++;
+    }
+    if (persistent) persistent = nruns > 0 && PlacePersistent(runs, nruns, run_lock, nverts);
+    c.pv = persistent;
     for (size_t i = 0; i < vs.inputs; i++) {
       VertexInput in = i < d.input_count ? d.inputs[i] : VertexInput{};
       if (in.type >= 17 || in.stream >= 16 || !d.streams[in.stream].data) {
@@ -1607,6 +1637,11 @@ void r_color0(inout vec4 c) {
         continue;
       }
       const VertexStream& vsm = d.streams[in.stream];
+      if (!copied[in.stream] && persistent) {
+        stream_base[in.stream] =
+            runs[run_of[in.stream]].at - int32_t(indexed ? d.min_index : 0) * int32_t(vsm.stride);
+        copied[in.stream] = true;
+      }
       if (!copied[in.stream]) {
         // Per-instance streams: their elements for every instance, from
         // the first.

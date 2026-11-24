@@ -193,6 +193,10 @@ struct VertexStream {
   // element per `divisor` instances (instance i reads element i /
   // divisor) instead of one per vertex.
   uint32_t divisor = 0;
+  // As FfStream::lock: nonzero while the bytes stay the same (a vertex
+  // buffer's ticket), so a range drawn in more than one frame can stay on
+  // the GPU.
+  uint32_t lock = 0;
 };
 
 // A Direct3D 9 draw with shaders. Vertex v of a stream is at data +
