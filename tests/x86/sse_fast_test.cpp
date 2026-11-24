@@ -145,7 +145,7 @@ void ArithCase() {
       const U lo = D ? 107 : 49, hi = D ? 2045 : 253;
       return e >= lo && e <= hi;
     };
-    bool taken = (before & (RECOMP_SSE_FLAGS_UNOBSERVED ? 0xFFC0 : 0x7F80)) == sse::kMxcsrDefault;
+    bool taken = (before & 0x7F80) == sse::kMxcsrDefault;  // FTZ/DAZ allowed
     for (int i = 0; i < lanes && taken; i++)
       taken = RECOMP_SSE_FLAGS_UNOBSERVED ? !IsNaN<D>(sse::Lane<U>(de, i))
                                           : in(sse::Lane<U>(d, i)) && in(sse::Lane<U>(s, i)) &&
