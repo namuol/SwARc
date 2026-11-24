@@ -128,6 +128,11 @@ struct ThreadObject : Waitable {
   std::atomic<bool> started{false};  // CreateThread vs ResumeThread races
   bool finished = false;  // under g_wait_mu
   uint32_t exit_code = 0;  // once finished
+  // Suspensions of the thread by itself (SuspendThread on its own handle):
+  // it sleeps until ResumeThread brings the count back to zero.
+  std::mutex suspend_mu;
+  std::condition_variable suspend_cv;
+  uint32_t suspend_count = 0;  // under suspend_mu
 };
 
 // The process, as its handles see it: signalled once it has exited, which
@@ -839,17 +844,33 @@ HLE64("kernel32.dll", CreateThread, 6) {
   return HandleRet(h);
 }
 
+// Both return the previous suspend count.
 HLE("kernel32.dll", ResumeThread, 1) {
   GuestSyncPoint sync;
   auto to = std::dynamic_pointer_cast<ThreadObject>(GetHandle(Arg(c, 0)));
   if (!to) return 0xFFFFFFFF;
-  return RunThreadObject(to) ? 1 : 0;
+  if (RunThreadObject(to)) return 1;  // created suspended
+  std::lock_guard<std::mutex> l(to->suspend_mu);
+  const uint32_t prev = to->suspend_count;
+  if (prev && --to->suspend_count == 0) to->suspend_cv.notify_all();
+  return prev;
 }
 
+// A thread may suspend itself: it sleeps until another resumes it. (Some
+// worker loops do this when they run out of work: ignoring it made them
+// spin.) Suspending another running thread is not supported.
 HLE("kernel32.dll", SuspendThread, 1) {
+  GuestSyncPoint sync;
+  auto to = std::dynamic_pointer_cast<ThreadObject>(GetHandle(Arg(c, 0)));
+  if (to && to->thread == CurrentThread()) {
+    std::unique_lock<std::mutex> l(to->suspend_mu);
+    const uint32_t prev = to->suspend_count++;
+    to->suspend_cv.wait(l, [&] { return to->suspend_count == 0; });
+    return prev;
+  }
   static std::once_flag once;  // games may call it every frame
   std::call_once(once, [] {
-    WarnF("SuspendThread on a running thread is not supported; ignored (warned once)\n");
+    WarnF("SuspendThread on another running thread is not supported; ignored (warned once)\n");
   });
   return 0;
 }
