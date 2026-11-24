@@ -1260,7 +1260,9 @@ class GpuDevice final : public Device {
   // registers, 2 the prelude's state.
 
   struct VsState {
-    int32_t in[16][4];  // per input slot: byte offset of vertex 0, stride, D3DDECLTYPE (-1: none), 0
+    // Per input slot: byte offset of vertex 0, stride, D3DDECLTYPE (-1:
+    // none), and the instance divisor (0: per vertex).
+    int32_t in[16][4];
     float pixel[4];     // 1 / viewport width, 1 / viewport height
     float clip[8][4];   // user clip planes, in clip space (shaders)
     int32_t clip_mask[4];  // CLIPPLANEENABLE, -, -, -
@@ -1313,7 +1315,7 @@ int r_hi(uint w) { return int(w) >> 16; }
 vec4 r_fetch(int slot) {
   ivec4 d = r_in[slot];
   if (d.z < 0) return vec4(0.0, 0.0, 0.0, 1.0);
-  int b = d.x + gl_VertexIndex * d.y;
+  int b = d.x + (d.w == 0 ? gl_VertexIndex : gl_InstanceIndex / d.w) * d.y;
   uint w = r_word(b);
   switch (d.z) {
     case 0: return vec4(uintBitsToFloat(w), 0.0, 0.0, 1.0);
@@ -1594,6 +1596,7 @@ void r_color0(inout vec4 c) {
     bool indexed = d.indices != nullptr;
     int64_t first = int64_t(d.base_vertex) + (indexed ? d.min_index : 0);
     uint32_t nverts = indexed ? d.vertex_count : n;
+    const uint32_t instances = std::max(d.instances, 1u);
     VsState st{};
     int32_t stream_base[16];
     bool copied[16] = {};
@@ -1605,22 +1608,27 @@ void r_color0(inout vec4 c) {
       }
       const VertexStream& vsm = d.streams[in.stream];
       if (!copied[in.stream]) {
-        int64_t start = first * vsm.stride;
-        int64_t end = std::min<int64_t>(start + int64_t(nverts) * vsm.stride, vsm.size);
+        // Per-instance streams: their elements for every instance, from
+        // the first.
+        const uint32_t count = vsm.divisor ? (instances - 1) / vsm.divisor + 1 : nverts;
+        int64_t start = vsm.divisor ? 0 : first * vsm.stride;
+        int64_t end = std::min<int64_t>(start + int64_t(count) * vsm.stride, vsm.size);
         size_t pos = (verts_.size() + 3) & ~size_t(3);
         size_t bytes = start >= 0 && end > start ? size_t(end - start) : 0;
         // Room for a whole last vertex and the shader's unaligned reads:
         // what is not copied is zeroed (the arena grows without zeroing).
-        const size_t room = size_t(nverts) * vsm.stride + 8;
+        const size_t room = size_t(count) * vsm.stride + 8;
         verts_.resize(pos + room);
         if (bytes) std::memcpy(verts_.data() + pos, vsm.data + start, bytes);
         std::memset(verts_.data() + pos + bytes, 0, room - bytes);
-        stream_base[in.stream] = int32_t(pos) - int32_t(indexed ? d.min_index : 0) * int32_t(vsm.stride);
+        stream_base[in.stream] =
+            int32_t(pos) - (vsm.divisor ? 0 : int32_t(indexed ? d.min_index : 0) * int32_t(vsm.stride));
         copied[in.stream] = true;
       }
       st.in[i][0] = stream_base[in.stream] + int32_t(in.offset);
       st.in[i][1] = int32_t(vsm.stride);
       st.in[i][2] = int32_t(in.type);
+      st.in[i][3] = int32_t(vsm.divisor);
     }
     std::memcpy(st.clip, state.clip, sizeof st.clip);
     st.clip_mask[0] = int32_t(state.rs[152] & 0xFF);
@@ -1665,6 +1673,8 @@ void r_color0(inout vec4 c) {
       c.first = 0;
       c.count = n;
     }
+
+    c.instances = instances;
 
     // Uniforms.
     auto ints = [](const int32_t (*i)[4], const uint32_t* b) {
@@ -2272,6 +2282,7 @@ void r_color0(inout vec4 c) {
   // ---- occlusion queries (see occl_buf_). Metal only: SDL_GPU gives
   // graphics shaders read-only storage buffers; Metal lets them write
   // (Vulkan would need fragmentStoresAndAtomics, which SDL may not enable).
+  bool SupportsInstancing() override { return true; }
   bool SupportsOcclusion() override {
 #if defined(__APPLE__)
     return true;
@@ -2487,6 +2498,7 @@ void r_color0(inout vec4 c) {
     bool indexed = false;
     uint32_t first = 0, count = 0;
     int32_t base = 0;
+    uint32_t instances = 1;  // a DrawShader's
     SDL_GPUBuffer* indirect = nullptr;  // a GPU buffer's draw (ProgramDraw)
     SDL_GPUBuffer* indices = nullptr;   // a GPU buffer's indices (ProgramDraw)
     uint32_t buffer_at = 0;             // that buffer's place in it
@@ -3194,9 +3206,9 @@ void r_color0(inout vec4 c) {
         set_rects(c);
         if (c.indexed) {
           bind_indices(ibuf_);
-          SDL_DrawGPUIndexedPrimitives(rp, c.count, 1, c.first, c.base, 0);
+          SDL_DrawGPUIndexedPrimitives(rp, c.count, c.instances, c.first, c.base, 0);
         } else {
-          SDL_DrawGPUPrimitives(rp, c.count, 1, c.first, 0);
+          SDL_DrawGPUPrimitives(rp, c.count, c.instances, c.first, 0);
         }
       }
       SDL_EndGPURenderPass(rp);

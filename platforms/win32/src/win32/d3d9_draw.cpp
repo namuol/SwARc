@@ -617,7 +617,12 @@ void Draw(Device& d, gfx::ShaderDraw& sd, const char* what) {
   // not know about instancing.
   std::vector<std::vector<uint8_t>> expanded;
   std::vector<uint32_t> expanded_indices, strip_indices;
-  if (instances > 1 || std::any_of(per_instance, per_instance + 16, [](uint32_t n) { return n; })) {
+  const bool instanced =
+      instances > 1 || std::any_of(per_instance, per_instance + 16, [](uint32_t n) { return n; });
+  if (instanced && d.gfx->SupportsInstancing()) {  // the GPU draws the instances
+    sd.instances = instances;
+    for (int s = 0; s < 16; s++) sd.streams[s].divisor = per_instance[s];
+  } else if (instanced) {
     // A non-indexed strip or fan becomes an indexed triangle list (strips
     // keep D3D's alternating winding), so each copy stays separate.
     if (sd.prim == 3 || sd.prim == 5 || sd.prim == 6) {

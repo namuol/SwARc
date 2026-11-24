@@ -189,6 +189,10 @@ struct VertexStream {
   const uint8_t* data = nullptr;  // vertex 0 (the buffer at its stream offset)
   uint32_t size = 0;              // bytes readable from data
   uint32_t stride = 0;
+  // Instanced draws (ShaderDraw::instances): nonzero, the stream holds one
+  // element per `divisor` instances (instance i reads element i /
+  // divisor) instead of one per vertex.
+  uint32_t divisor = 0;
 };
 
 // A Direct3D 9 draw with shaders. Vertex v of a stream is at data +
@@ -220,6 +224,9 @@ struct ShaderDraw {
   const uint32_t (*sampler_states)[14] = nullptr;
   // Render states, viewport and scissor (the rest is the shaders').
   const FfState* state = nullptr;
+  // Instances drawn (SupportsInstancing): each draws the vertices again,
+  // reading per-instance streams (VertexStream::divisor) at its element.
+  uint32_t instances = 1;
 };
 
 // ---- programs: console GPUs' shaders, which their front ends translate
@@ -525,6 +532,9 @@ class Device {
   // backend without them returns 0 from BeginOcclusion; the caller then
   // reports the query type as unavailable. One query is open at a time.
   virtual bool SupportsOcclusion();
+  // ShaderDraw::instances and VertexStream::divisor: without, the caller
+  // expands an instanced draw into one draw of every instance's copy.
+  virtual bool SupportsInstancing();
   virtual uint32_t BeginOcclusion();  // an id, never 0
   virtual void EndOcclusion(uint32_t id);
   // The count once the GPU has run the query's draws: true; with wait it
