@@ -1670,7 +1670,18 @@ void r_color0(inout vec4 c) {
     st.pixel[0] = 1.0f / float(std::max(state.viewport.width, 1u));
     st.pixel[1] = 1.0f / float(std::max(state.viewport.height, 1u));
 
-    if (indexed || d.prim == 6) {
+    int64_t pv_indices = -1;  // the indices' place in pvbuf_ (PlaceIndices)
+    if (indexed && d.prim != 6 && d.index_lock && pv_mode_ != PvMode::Off) {
+      const uint32_t lo = d.min_index, hi = lo + std::max(nverts, 1u) - 1;
+      pv_indices = PlaceIndices(d.indices, d.index_size, n, d.index_lock, lo, hi);
+    }
+    if (pv_indices >= 0) {
+      c.indexed = true;
+      c.pv_indices = true;
+      c.first = uint32_t(pv_indices / 4);
+      c.count = n;
+      c.base = 0;
+    } else if (indexed || d.prim == 6) {
       c.indexed = true;
       c.first = uint32_t(indices_.size());
       uint32_t lo = indexed ? d.min_index : 0, hi = lo + std::max(nverts, 1u) - 1;
@@ -2541,6 +2552,7 @@ void r_color0(inout vec4 c) {
     int shader = -1;   // shader_cmds_ index for a DrawShader
     int program = -1;  // program_cmds_ index for a DrawProgram
     bool pv = false;   // a fixed-function draw whose vertices are all in pvbuf_
+    bool pv_indices = false;  // a shader draw whose indices are in pvbuf_ (PlaceIndices)
   };
   // What a DrawShader adds to its Cmd: samplers (vertex 0-3, pixel 0-15)
   // and the uniform blocks in ubytes_ (vertex then pixel: float
@@ -3021,7 +3033,8 @@ void r_color0(inout vec4 c) {
       if (pvbytes) {
         if (!pvbuf_) {
           uint32_t cap = 0;
-          EnsureBuffer(pvbuf_, cap, kPvCap, SDL_GPU_BUFFERUSAGE_GRAPHICS_STORAGE_READ);
+          EnsureBuffer(pvbuf_, cap, kPvCap,
+                       SDL_GPU_BUFFERUSAGE_GRAPHICS_STORAGE_READ | SDL_GPU_BUFFERUSAGE_INDEX);
         }
         const size_t base = upload_at_ + ubytes + vbytes + ibytes + pbytes;
         for (const PvUpload& u : pv_uploads_) {
@@ -3240,7 +3253,7 @@ void r_color0(inout vec4 c) {
         }
         set_rects(c);
         if (c.indexed) {
-          bind_indices(ibuf_);
+          bind_indices(c.pv_indices ? pvbuf_ : ibuf_);
           SDL_DrawGPUIndexedPrimitives(rp, c.count, c.instances, c.first, c.base, 0);
         } else {
           SDL_DrawGPUPrimitives(rp, c.count, c.instances, c.first, 0);
@@ -4303,14 +4316,62 @@ void r_color0(inout vec4 c) {
     return true;
   }
 
+  // Persistent indices, as PlacePersistent's vertices: a locked index
+  // range drawn in an earlier frame too is converted once (32-bit, clamped
+  // to the draw's vertex range, as the arena path does) into pvbuf_. Its
+  // place there (a byte offset), or -1 when it cannot have one.
+  int64_t PlaceIndices(const void* src, uint32_t isz, uint32_t n, uint32_t lock, uint32_t lo,
+                       uint32_t hi) {
+    const PiKey k{lock, n, isz, lo, hi, uintptr_t(src)};
+    auto convert = [&](uint32_t* out) {
+      if (isz == 4)
+        for (uint32_t i = 0; i < n; i++)
+          out[i] = std::clamp(static_cast<const uint32_t*>(src)[i], lo, hi);
+      else
+        for (uint32_t i = 0; i < n; i++)
+          out[i] = std::clamp(uint32_t(static_cast<const uint16_t*>(src)[i]), lo, hi);
+    };
+    auto it = pi_at_.find(k);
+    if (it != pi_at_.end()) {
+      if (pv_mode_ == PvMode::Check &&
+          std::memcmp(pi_shadow_[k].data(), src, size_t(n) * isz))
+        FatalF("gfx: an index buffer changed without Lock/Unlock (FF_VCACHE=check): %u indices at %p",
+               n, src);
+      return it->second;
+    }
+    auto [seen, fresh] = pi_seen_.try_emplace(k, pv_frame_);
+    const uint32_t need = (n * 4 + 15) & ~15u;
+    if (fresh || seen->second == pv_frame_ || need > kPvCap / 8) return -1;
+    if (pv_head_ + need > kPvCap) {
+      pv_full_ = true;  // emptied at the next Present
+      return -1;
+    }
+    const uint32_t from = uint32_t(pv_staging_.size());
+    pv_staging_.resize(from + need);
+    std::vector<uint32_t> tmp(n);
+    convert(tmp.data());
+    std::memcpy(pv_staging_.data() + from, tmp.data(), size_t(n) * 4);
+    pv_uploads_.push_back({pv_head_, from, need});
+    if (pv_mode_ == PvMode::Check)
+      pi_shadow_[k].assign(static_cast<const uint8_t*>(src),
+                           static_cast<const uint8_t*>(src) + size_t(n) * isz);
+    pi_at_.emplace(k, pv_head_);
+    const uint32_t at = pv_head_;
+    pv_head_ += need;
+    return at;
+  }
+
   // At Present: a new frame for PlacePersistent; when pvbuf_ filled up,
   // it starts over once the GPU is done with it.
   void PersistentFrame() {
     pv_frame_++;
     if (pv_seen_.size() > (1u << 20)) pv_seen_.clear();
+    if (pi_seen_.size() > (1u << 20)) pi_seen_.clear();
     if (!pv_full_) return;
     Drain();
     pv_at_.clear();
+    pi_at_.clear();
+    pi_shadow_.clear();
     pv_shadow_.clear();
     pv_head_ = 0;
     pv_full_ = false;
@@ -5300,6 +5361,21 @@ void r_color0(inout vec4 c) {
   std::unordered_map<PvKey, uint32_t, PvHash> pv_at_;     // place in pvbuf_
   std::unordered_map<PvKey, uint64_t, PvHash> pv_seen_;   // frame first drawn
   std::unordered_map<PvKey, std::vector<uint8_t>, PvHash> pv_shadow_;  // FF_VCACHE=check
+  // Persistent indices (PlaceIndices).
+  struct PiKey {
+    uint32_t lock, count, size, lo, hi;
+    uintptr_t src;
+    bool operator==(const PiKey&) const = default;
+  };
+  struct PiHash {
+    size_t operator()(const PiKey& k) const {
+      return size_t(uint64_t(k.src) * 0x9E3779B97F4A7C15ull ^ (uint64_t(k.lock) << 32 | k.count) ^
+                    (uint64_t(k.lo) << 20) ^ (uint64_t(k.hi) << 40) ^ k.size);
+    }
+  };
+  std::unordered_map<PiKey, uint32_t, PiHash> pi_at_;    // place in pvbuf_
+  std::unordered_map<PiKey, uint64_t, PiHash> pi_seen_;  // frame first drawn
+  std::unordered_map<PiKey, std::vector<uint8_t>, PiHash> pi_shadow_;  // FF_VCACHE=check
   std::vector<uint8_t> pv_staging_;
   std::vector<PvUpload> pv_uploads_;
   // Locked streams placed since the last flush (PlaceStreams), the last

@@ -647,6 +647,7 @@ void Draw(Device& d, gfx::ShaderDraw& sd, const char* what) {
       if (!src) sd.min_index = 0;
       sd.indices = strip_indices.data();
       sd.index_size = 4;
+      sd.index_lock = 0;
       sd.prim = sd.prim == 3 ? 2 : 4;
     }
     // List types only: each instance's copy is a whole number of primitives
@@ -700,6 +701,7 @@ void Draw(Device& d, gfx::ShaderDraw& sd, const char* what) {
     if (sd.indices) {
       sd.indices = expanded_indices.data();
       sd.index_size = 4;
+      sd.index_lock = 0;
     }
     sd.base_vertex = 0;
     sd.min_index = 0;
@@ -771,6 +773,7 @@ HLE_NAMED("d3d9.dll", "IDirect3DDevice9::DrawIndexedPrimitive", D3DDev9_DrawInde
   uint64_t start = uint64_t(Arg(c, 5)) * sd.index_size;
   if (start + uint64_t(n) * sd.index_size > ib->length) return D3DERR_INVALIDCALL;
   sd.indices = static_cast<const uint8_t*>(GPtr(ib->mem)) + start;
+  sd.index_lock = ib->ticket;
   sd.base_vertex = int32_t(Arg(c, 2));
   sd.min_index = Arg(c, 3);
   sd.vertex_count = Arg(c, 4);
