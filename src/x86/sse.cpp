@@ -422,18 +422,15 @@ void Dp(Ctx& c, bool dbl, Xmm& d, const Xmm& s, uint8_t imm, uint64_t va) {
     DpT<false>(c, d, s, imm, va);
 }
 
-// The float nearest to 1/x (SoftFloat's division is correctly rounded),
-// results below the normal range flushed to zero as the SDM requires.
+// The float nearest to 1/x (IEEE division is correctly rounded: the host's,
+// in its default environment, as every guest thread checks), results below
+// the normal range flushed to zero as the SDM requires.
 uint32_t RcpLane(uint32_t x) {
   const uint32_t exp = (x >> 23) & 0xFF, frac = x & 0x7FFFFF, sign = x & 0x80000000u;
   if (exp == 0xFF && frac) return x | 0x00400000u;  // NaN: quieted
   if (exp == 0) return sign | 0x7F800000u;           // ±0, denormal: ±inf
   if (exp == 0xFF) return sign;                      // ±inf: ±0
-  const uint_fast8_t mode = softfloat_roundingMode, flags = softfloat_exceptionFlags;
-  softfloat_roundingMode = softfloat_round_near_even;
-  uint32_t r = f32_div(float32_t{0x3F800000u}, float32_t{x}).v;
-  softfloat_roundingMode = mode;
-  softfloat_exceptionFlags = flags;
+  uint32_t r = std::bit_cast<uint32_t>(1.0f / std::bit_cast<float>(x));
   if (!(r & 0x7F800000u)) r &= 0x80000000u;  // tiny: ±0
   return r;
 }
@@ -478,8 +475,9 @@ RECOMP_SSE_SLOW void SqrtExact(Ctx& c, bool dbl, int lanes, Xmm& d, const Xmm& s
 }
 
 // For a positive normal x, the float nearest to y = 1/sqrt(x). A first
-// guess from binary64 (sqrt, then a division: two roundings, then a
-// third to binary32) is checked exactly and moved by an ulp if needed:
+// guess from host binary64 (sqrt, then a division: two roundings, then a
+// third to binary32; host arithmetic, not SoftFloat, whose state is
+// thread-local) is checked exactly and moved by an ulp if needed:
 // r is correct iff y lies between the midpoints to its neighbours, i.e.
 // lo^2 * x <= 1 <= hi^2 * x, evaluated in 128-bit integers. y is never a
 // midpoint (it would be a dyadic rational with a 25-bit significand whose
@@ -490,12 +488,8 @@ uint32_t RsqrtLane(uint32_t x) {
   if (exp == 0) return (x & 0x80000000u) | 0x7F800000u;  // ±0, denormal: ±inf
   if (x & 0x80000000u) return 0xFFC00000u;               // negative: default NaN
   if (exp == 0xFF) return 0;                             // +inf: +0
-  const uint_fast8_t mode = softfloat_roundingMode, flags = softfloat_exceptionFlags;
-  softfloat_roundingMode = softfloat_round_near_even;
-  float64_t one{0x3FF0000000000000ull};
-  uint32_t r = f64_to_f32(f64_div(one, f64_sqrt(f32_to_f64(float32_t{x})))).v;
-  softfloat_roundingMode = mode;
-  softfloat_exceptionFlags = flags;
+  uint32_t r = std::bit_cast<uint32_t>(
+      float(1.0 / std::sqrt(double(std::bit_cast<float>(x)))));
   const unsigned __int128 mx = frac | 0x800000u;
   const int ex = int(exp) - 150;  // x = mx * 2^ex
   for (;;) {
