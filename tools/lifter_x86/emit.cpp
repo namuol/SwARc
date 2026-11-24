@@ -12,6 +12,16 @@ namespace {
 // frames, setjmp callers): a guaranteed tail call cannot leave a try
 // block.
 thread_local bool t_in_try = false;
+// Emitter::set_light_flags (32-bit only), and whether the function being
+// emitted returns light.
+thread_local const lifter::Emitter::LightFlags* t_light = nullptr;
+thread_local bool t_light_ret = false;
+// The spill before a direct call or tail call to t (0: an indirect call).
+const char* CallSpill(uint64_t t) {
+  const bool light = t_light && (t ? !t_light->entry_readers.count(t) : t_light->indirect_calls);
+  return light ? "LIFT_SPILL_LIGHT" : "LIFT_SPILL";
+}
+const char* RetSpill() { return t_light_ret ? "LIFT_SPILL_LIGHT" : "LIFT_SPILL"; }
 // Tail calls between lifted functions must not grow the host stack (a
 // loop that crosses function entries would otherwise recurse per
 // iteration).
@@ -599,7 +609,7 @@ class InsnEmitter {
   // ---- control flow -------------------------------------------------------
   std::string TailCall(uint64_t t) {
     refs_.insert(t);
-    return Fmt("{ LIFT_SPILL; %sreturn %s(c); }", TailAttr(), FnName(t).c_str());
+    return Fmt("{ %s; %sreturn %s(c); }", CallSpill(t), TailAttr(), FnName(t).c_str());
   }
   std::string GotoOrTail(uint64_t t) {
     if (IsOtherEntry(p_, f_, t)) return TailCall(t);
@@ -3525,12 +3535,12 @@ void InsnEmitter::Emit() {
           return;
         }
         refs_.insert(t);
-        L(Fmt("LIFT_SPILL; %s(c); LIFT_RELOAD;", FnName(t).c_str()));
+        L(Fmt("%s; %s(c); LIFT_RELOAD;", CallSpill(t), FnName(t).c_str()));
       } else {
         if (!PrepareMem()) return Unimpl();
         L("const uint32_t t = " + Read(0) + ";");
         Push32(Hex(next));
-        L(Fmt("LIFT_SPILL; ::recomp::Dispatch(c, t, %s); LIFT_RELOAD;",
+        L(Fmt("%s; ::recomp::Dispatch(c, t, %s); LIFT_RELOAD;", CallSpill(0),
               Hex(in_.va).c_str()));
       }
       uint64_t tt;
@@ -3565,7 +3575,7 @@ void InsnEmitter::Emit() {
     }
     case ZYDIS_MNEMONIC_RET: {
       uint32_t extra = Nvis() ? static_cast<uint32_t>(Op(0).imm.value.u) : 0;
-      L(Fmt("esp += %uu; LIFT_SPILL; return;", 4 + extra));
+      L(Fmt("esp += %uu; %s; return;", 4 + extra, RetSpill()));
       return;
     }
     case ZYDIS_MNEMONIC_JECXZ:
@@ -3942,6 +3952,8 @@ void Emitter::EmitFunction(const Function& f, std::string* out,
       resumable = true;
   }
   t_in_try = resumable;
+  t_light = light_ && light_->on && !p_.x64 ? light_ : nullptr;
+  t_light_ret = t_light && t_light->returns && !t_light->full_returns.count(f.entry);
   if (eh != p_.eh_frames.end()) o += "  uint64_t EF = 0;\n";
   const bool sj = p_.x64 && !f.setjmp_returns.empty();
   if (sj) o += "  uint64_t SJ = 0;\n";
@@ -4023,7 +4035,7 @@ void Emitter::EmitFunction(const Function& f, std::string* out,
       auto ni = std::next(it);
       if (IsOtherEntry(p_, f, nx)) {
         refs->insert(nx);
-        o += Fmt("  { LIFT_SPILL; %sreturn %s(c); }\n", TailAttr(),
+        o += Fmt("  { %s; %sreturn %s(c); }\n", CallSpill(nx), TailAttr(),
                  FnName(nx).c_str());
       } else if (ni == f.insns.end() || ni->first != nx) {
         o += f.insns.count(nx)
@@ -4092,6 +4104,7 @@ void CacheXmm(std::string* out, size_t at) {
       s.replace(p, from.size(), to);
   };
   replace_all(r, "LIFT_SPILL;", "LIFT_SPILL;" + spill);
+  replace_all(r, "LIFT_SPILL_LIGHT;", "LIFT_SPILL_LIGHT;" + spill);
   replace_all(r, "LIFT_RELOAD;", "LIFT_RELOAD;" + reload);
   const size_t e = r.find("  LIFT_ENTER\n");
   if (e == std::string::npos) return;

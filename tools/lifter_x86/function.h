@@ -84,4 +84,16 @@ bool IsOtherEntry(const Program& p, const Function& f, uint64_t t);
 // Absolute target of a relative branch/call operand.
 uint64_t RelTarget(const Insn& in);
 
+// Where f reads an arithmetic flag (CF PF AF ZF SF OF) that may come from
+// outside its own code: from its caller (not written since the entry or a
+// setjmp return point) or from a callee (not written since a call
+// returned). For --light-call-flags: calls into an entry reader, and
+// returns to an after-call reader, carry the flags; the rest need not.
+struct FlagReads {
+  bool at_entry = false;    // reads its caller's flags
+  bool after_call = false;  // reads a callee's flags
+  std::vector<uint64_t> where;
+};
+FlagReads FlagsAcrossCalls(const Program& p, const Function& f);
+
 }  // namespace lifter

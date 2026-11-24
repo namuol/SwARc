@@ -109,7 +109,7 @@ int main(int argc, char** argv) {
   uint64_t per_file = 12000;
   uint64_t dump = 0;
   std::string x87_test, int_test, sse_test, forms, code;
-  bool sweep_gaps = false, dump_discovery = false;
+  bool sweep_gaps = false, dump_discovery = false, light_call_flags = false;
   bool forms_x64 = false;
   std::set<uint64_t> only;
   for (int i = 1; i < argc; i++) {
@@ -124,6 +124,7 @@ int main(int argc, char** argv) {
     else if (a == "--insns-per-file") per_file = std::stoull(val());
     else if (a == "--dump") dump = std::stoull(val(), nullptr, 16);
     else if (a == "--sweep-gaps") sweep_gaps = true;
+    else if (a == "--light-call-flags") light_call_flags = true;
     else if (a == "--dump-discovery") dump_discovery = true;
     else if (a == "--x87-test") x87_test = val();
     else if (a == "--int-test") int_test = val();
@@ -498,9 +499,125 @@ int main(int argc, char** argv) {
   std::printf("jump tables: %zu from Ghidra (%zu extended), %zu recovered\n",
               p.jumptables.size() - recovered_tables, extended_tables, recovered_tables);
 
+  // --light-call-flags (32-bit): calls and returns carry the arithmetic
+  // flags only where a function reads them from across one
+  // (FlagsAcrossCalls): calls into a function that reads its caller's
+  // flags, and returns of the functions whose callers read their flags
+  // (with what they tail-call). Indirect calls are light unless such a
+  // reader could be their target: one that is exported or whose address
+  // code or data holds. A weak entry (known only from such a pointer)
+  // that reads its caller's flags is taken not to be a function: calls
+  // following the ABI pass no flags. Returns are light unless a reader of
+  // a callee's flags calls indirectly.
+  lifter::Emitter::LightFlags light;
+  if (light_call_flags && !p.x64) {
+    light.on = true;
+    light.indirect_calls = light.returns = true;
+    std::map<uint64_t, std::vector<uint64_t>> tails;  // direct tail calls
+    std::set<uint64_t> after_callers_calls;  // direct callees of after-call readers
+    std::set<uint64_t> code_ptrs;  // immediates and displacements in code
+    size_t fns = 0, reads = 0;
+    std::string examples;
+    for (uint64_t e : p.entries) {
+      lifter::Function f;
+      lifter::BuildFunction(p, dec, e, &f);
+      fns++;
+      tails[e].assign(f.tail_calls.begin(), f.tail_calls.end());
+      bool indirect_call = false, tail_dispatch = false;
+      for (const auto& [va, in] : f.insns) {
+        uint64_t t;
+        if (in.ok && in.d.mnemonic == ZYDIS_MNEMONIC_CALL &&
+            in.ops[0].type != ZYDIS_OPERAND_TYPE_IMMEDIATE)
+          indirect_call = true;
+        for (int i = 0; in.ok && i < in.d.operand_count_visible; i++) {
+          const auto& o = in.ops[i];
+          if (o.type == ZYDIS_OPERAND_TYPE_IMMEDIATE && !o.imm.is_relative)
+            code_ptrs.insert(static_cast<uint32_t>(o.imm.value.u));
+          if (o.type == ZYDIS_OPERAND_TYPE_MEMORY && o.mem.disp.has_displacement)
+            code_ptrs.insert(static_cast<uint32_t>(o.mem.disp.value));
+        }
+        if (in.ok && lifter::Classify(p, f, in, &t) == lifter::Flow::TailDispatch)
+          tail_dispatch = true;
+      }
+      const lifter::FlagReads r = lifter::FlagsAcrossCalls(p, f);
+      for (uint64_t va : r.where) {
+        char at[64];
+        std::snprintf(at, sizeof at, " at %08llX (%s%s%s)", static_cast<unsigned long long>(va),
+                      r.at_entry ? "entry" : "", r.at_entry && r.after_call ? "+" : "",
+                      r.after_call ? "call" : "");
+        if (reads++ < 40) examples += lifter::FnName(e) + at + (p.weak.count(e) ? " weak" : "") + "; ";
+      }
+      if (r.at_entry) light.entry_readers.insert(e);
+      if (r.after_call) {
+        if (indirect_call) light.returns = false;
+        after_callers_calls.insert(f.direct_calls.begin(), f.direct_calls.end());
+      }
+      (void)tail_dispatch;
+    }
+    // Entry readers whose address is taken.
+    std::set<uint64_t> taken;
+    // An export is reachable from another module that imports it, imports
+    // from its DLL by ordinal, or holds its name (GetProcAddress).
+    auto export_taken = [&](uint64_t e) {
+      auto x = p.exported.find(e);
+      if (x == p.exported.end()) return false;
+      const size_t mi = x->second.first;
+      std::string dll = p.modules[mi].name;
+      for (char& ch : dll) ch = char(std::tolower(uint8_t(ch)));
+      if (p.ordinal_imports.count(dll)) return true;
+      for (const auto& [im, name] : p.imported)
+        if (im != mi && name == dll + "!" + x->second.second) return true;
+      const std::string& s = x->second.second;
+      for (size_t k = 0; k < p.modules.size(); k++) {
+        if (k == mi) continue;
+        for (const auto& [lo, hi] : p.modules[k].data)
+          for (uint64_t a = lo; a + s.size() < hi; a++)
+            if (!std::memcmp(p.Bytes(a), s.c_str(), s.size() + 1)) return true;
+      }
+      return false;
+    };
+    for (uint64_t e : light.entry_readers)
+      if (!p.weak.count(e) && (export_taken(e) || code_ptrs.count(e))) taken.insert(e);
+    for (const auto& m : p.modules)
+      for (const auto& [lo, hi] : m.data)
+        for (uint64_t a = lo; a + 4 <= hi; a++) {
+          const uint32_t v = p.mem.read<uint32_t>(a);
+          if (light.entry_readers.count(v) && !p.weak.count(v)) taken.insert(v);
+        }
+    for (uint64_t e : taken) {
+      light.indirect_calls = false;
+      std::printf("light call flags: %s reads its caller's flags and its address is taken\n",
+                  lifter::FnName(e).c_str());
+    }
+    // Returns that carry the flags: the after-call readers' callees and what
+    // they tail-call; a tail dispatch among them could reach anything.
+    std::vector<uint64_t> work(after_callers_calls.begin(), after_callers_calls.end());
+    while (!work.empty()) {
+      const uint64_t e = work.back();
+      work.pop_back();
+      if (!light.full_returns.insert(e).second) continue;
+      for (uint64_t t : tails[e]) work.push_back(t);
+    }
+    for (uint64_t e : light.full_returns) {
+      lifter::Function f;
+      lifter::BuildFunction(p, dec, e, &f);
+      for (const auto& [va, in] : f.insns) {
+        uint64_t t;
+        if (in.ok && lifter::Classify(p, f, in, &t) == lifter::Flow::TailDispatch)
+          light.returns = false;
+      }
+    }
+    std::printf("light call flags: %zu functions; %zu read a caller's flags, %zu return theirs; "
+                "indirect calls %s, returns %s; %zu reads: %s\n",
+                fns, light.entry_readers.size(), light.full_returns.size(),
+                light.indirect_calls ? "light" : "full", light.returns ? "light" : "full", reads,
+                examples.c_str());
+  }
+
   // Pass 2: final CFGs and emission.
   std::filesystem::create_directories(outdir);
   lifter::Emitter em(p, dec);
+  em.set_light_flags(&light);
   lifter::EmitStats stats;
   std::map<std::string, std::string> files;
   std::string body, report_warnings, report_dispatch;

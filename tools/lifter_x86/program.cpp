@@ -130,9 +130,22 @@ bool Program::Load(const std::string& path, const std::string& symdir,
         uint64_t va = Hex(c[0]) + delta;
         if (!in_text(va)) return;
         entries.insert(va);
+        exported[va] = {modules.size() - 1, c[2]};
         if (!c[3].empty()) names[va] = c[3];
       }, err))
     return false;
+
+  // Imports: which exports other modules can reach through an import (by
+  // name, or any of a DLL's by ordinal).
+  ReadTsv(symdir + "/imports.tsv", [&](const auto& c) {
+        if (c.size() < 3 || c[0] == "iat_va") return;
+        std::string dll = lower(c[1]);
+        if (dll.size() > 4 && dll.compare(dll.size() - 4, 4, ".dll") == 0) dll.resize(dll.size() - 4);
+        if (!c[2].empty() && c[2][0] == '#')
+          ordinal_imports.insert(dll);
+        else
+          imported.insert({modules.size() - 1, dll + "!" + c[2]});
+      }, err);
 
   if (!ReadTsv(symdir + "/jumptables.tsv", [&](const auto& c) {
         if (c.size() < 2 || c[1].empty()) return;

@@ -67,6 +67,12 @@ struct Program {
   // at all, and splitting a loop at one turned every iteration into a
   // nested host call (a "freeze" that was really deepening recursion).
   std::set<uint64_t> weak;
+  // Exported functions (also in entries): their module (index) and name.
+  std::map<uint64_t, std::pair<size_t, std::string>> exported;
+  // Imports by name: the importing module and "dll!name" (dll lowercase,
+  // without .dll); and the DLLs something imports by ordinal.
+  std::set<std::pair<size_t, std::string>> imported;
+  std::set<std::string> ordinal_imports;
 
   // True if control reaching t from another function leaves that function
   // (a tail call) rather than continuing inline.
