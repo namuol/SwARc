@@ -432,8 +432,12 @@ uint64_t AnyF64() {
          (Rand() & 1 ? 1ull << 52 : 0);
 }
 
+// DoubleForms: the case is at PC=64 (CheckD then expects exact results only).
+bool g_pc64 = false;
+
 // A double result: true for success with value/flags/C1, compared with the
-// reference RV; failure only when the reference cannot be held.
+// reference RV; failure only when the reference cannot be held (or, at
+// PC=64, is inexact).
 template <class F>
 long CheckD(const char* what, Path path, run::RV ref, F&& fn, double a, double b) {
   const double kSentinel = 12345.0;
@@ -442,7 +446,8 @@ long CheckD(const char* what, Path path, run::RV ref, F&& fn, double a, double b
   bool up = true;
   bool ok = fn(&out, &fl, &up);
   Count(path, ok);
-  bool want = InRangeV(run::Val(ref));
+  // At PC=64 only exact results are held.
+  bool want = InRangeV(run::Val(ref)) && !(g_pc64 && (run::Flags(ref) & 0x20));
   bool good = ok == want &&
               (ok ? SameV(run::FromD(out), run::Val(ref)) &&
                         fl == (0x40 | run::Flags(ref)) && up == run::Up(ref)
@@ -461,16 +466,19 @@ long DoubleForms() {
                                    "ArithD subr", "ArithD div", "ArithD divr"};
   long fails = 0;
   recomp::x87::g_softfloat_only = true;
+  // PC=53, or PC=64 (where only exact results are held).
+  const uint32_t cw = Rand() % 2 ? kCw : 0x037F;
+  g_pc64 = cw == 0x037F;
   double a = RandIn(int(Rand() % 61) - 30), b = RandOther(a);
   int k = int(Rand() % 6);
-  run::RV ref = run::Arith(kCw, kOps[k], run::FromD(a), run::FromD(b));
+  run::RV ref = run::Arith(cw, kOps[k], run::FromD(a), run::FromD(b));
   fails += CheckD(kOpNames[k], kArithD, ref, [&](double* o, uint32_t* f, bool* u) {
-    return run::ArithD(kOps[k], a, b, o, f, u);
+    return run::ArithD(kOps[k], a, b, o, f, u, cw);
   }, a, b);
   // sqrt: in range, and negative operands (NaN, IE: never held).
-  ref = run::Sqrt(kCw, run::FromD(a));
+  ref = run::Sqrt(cw, run::FromD(a));
   fails += CheckD("SqrtD", kSqrtD, ref, [&](double* o, uint32_t* f, bool* u) {
-    return run::SqrtD(a, o, f, u);
+    return run::SqrtD(a, o, f, u, cw);
   }, a, 0);
   // m32/m64 operands: held exactly when the load is flag-free and in range.
   uint32_t m32 = AnyF32();
@@ -503,9 +511,9 @@ long DoubleForms() {
     k = 1;
   }
   if (run::OperandF64(m64, &x0) && run::OperandF64(n64, &x1)) {
-    run::RV r = run::ArithF64(kCw, kOps[k], run::Val(run::LoadF64(m64)), n64);
+    run::RV r = run::ArithF64(cw, kOps[k], run::Val(run::LoadF64(m64)), n64);
     fails += CheckD(kOpNames[k], kArithD, r, [&](double* o, uint32_t* f, bool* u) {
-      return run::ArithD(kOps[k], x0, x1, o, f, u);
+      return run::ArithD(kOps[k], x0, x1, o, f, u, cw);
     }, x0, x1);
   }
   // FCOM m64 takes any zero or normal value.
@@ -639,7 +647,7 @@ int main(int argc, char** argv) {
   for (long n = 0; n < cases && dbl_fails < 20; n++) dbl_fails += DoubleForms();
   std::printf("%ld cases of the host-double forms, %ld mismatches\n", cases, dbl_fails);
   for (uint16_t cw : {0x027F, 0x067F, 0x0A7F, 0x0E7F, 0x007F, 0x037F, 0x127F})
-    if (run::DoubleMode(cw) != (cw == 0x027F || cw == 0x127F)) {
+    if (run::DoubleMode(cw) != (cw == 0x027F || cw == 0x127F || cw == 0x037F)) {
       std::printf("FAIL DoubleMode %04X\n", cw);
       ++dbl_fails;
     }

@@ -21,7 +21,7 @@ set_tests_properties(x87_fast PROPERTIES TIMEOUT 300)
 # The same built with each planted bug of the fast paths
 # (RECOMP_X86_MUTATION, x86/x87.h), which it must catch (it exits 0 only
 # then); each builds its own x87.cpp.
-foreach(_m RANGE 1 17)
+foreach(_m 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 20)
   add_executable(x87_fast_mutation_${_m} x87_fast_test.cpp "${RECOMP_ROOT}/src/x86/x87.cpp")
   target_include_directories(x87_fast_mutation_${_m} PRIVATE "${RECOMP_ROOT}/src")
   target_compile_features(x87_fast_mutation_${_m} PRIVATE cxx_std_20)
