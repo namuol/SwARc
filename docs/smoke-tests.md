@@ -6,6 +6,34 @@ or check what it shows. They run often, so they should take as long as the
 game does and not a second more, and pass on a busy machine. Timings before
 and after converting every recomp: docs/smoke-timings.md.
 
+## What a game's smoke set must have
+
+- **Gameplay, with its essential inputs, each one checked.** At least one
+  case gets into play (a level, a mission, a match, a lot) and uses the
+  inputs a player cannot do without: movement and the camera, the mouse
+  buttons (fire, select, order), the keys the game is played with. Each
+  input's *effect* is checked by a later wait, check or compared shot (the
+  ammo count drops after a shot; a unit's panel opens when it is clicked;
+  the view leaves its pixels after a step). An input that is only sent
+  proves nothing: a lost click passes.
+- **As short as the game allows.** Skip what does not need covering: a
+  game's own dev switch or hook that starts a level (Soldiers'
+  SOLDIERS_BENCH, Source's +map, Crysis' +map with -devmode), a seeded
+  saved game past an unskippable cutscene (Max Payne 2), a map that starts
+  with the weapon in hand (Portal's testchmb_a_02).
+- **No redundant cases.** A case whose steps another case already performs
+  goes, flaky or not; don't add one that repeats another's coverage.
+- **Documented coverage.** smoke/COVERAGE.md beside cases.json says what
+  each case reaches, which inputs it uses, what checks their effect, and
+  what is not covered; keep it current with every change to a case.
+- **At least 90% reliable.** After adding or changing a case, run it up to
+  10 times (headless, one case at a time): it passes with at most 1
+  failure, and fails at the 2nd (the 10th run is not needed when the first
+  9 passed). Keep each failure's log and shot, with the load average. Then
+  commit and push it. Run cases that will run side by side (-j, a repo's
+  "parallel") that way too, under load: that is where frame-rate-dependent
+  steps break.
+
 ## Wait for screens, don't sleep through them
 
 Fixed times have to cover the slowest run ever seen, so every step carries
@@ -107,6 +135,11 @@ game's SUN.INI with its intro counted as seen; with no SUN.INI at all the
 game picks another screen size. `"data"` at the top level of cases.json is
 every case's.
 
+`"fresh_data"` also keeps a user's own settings out of the run: Crysis'
+per-user install/autoexec.cfg often holds a `map ...` line that would load
+another level. A saved game in `"data"` (Max Payne 2's quicksave) starts
+a case past what cannot be skipped.
+
 ## Clicks and timing
 
 - A click is a press and, 80 ms later, a release; games act on the release.
@@ -116,6 +149,15 @@ every case's.
   then leave ~0.5 s.
 - Check a script's clicks do what the comment says: DX-Ball 2's board
   screen PLAY click had never worked; the board started from later clicks.
+
+- A wait on the same line time as a held key or click (`key W 1`,
+  `click left 1.0`) starts only after the release; an `exit` timed before
+  that release ends the run without the wait ever running, and the case
+  passes. Put the wait at the release time and the exit after it, and
+  check the run log for the wait's line ("wait (line N) matched").
+- A click right after a level or a weapon appears may be lost (Portal's
+  first shot, a rifle still being drawn in Crysis or HL2): leave ~1 s, more
+  under load, and wait for the shot's effect.
 
 ## Shots and references
 
@@ -127,6 +169,14 @@ continues after it for crash coverage). Watch for menus with moving 3D
 scenes too (Soldiers'): take the reference at the same moment after the
 wait as the runs do. Changing when a shot is taken may need
 new local references (`--update`, then look at them).
+
+How far a held key moves the player depends on the frame rate (fewer
+simulated seconds under load), so a shot after walking differs from run to
+run. Put the steps whose result is fixed (a raw mouse delta turns the
+same at any frame rate) before the compared shot, and check a walk with
+`!=` on pixels it must leave rather than with a shot (Portal's chamber).
+HUD text that is drawn translucently washes out over a bright background:
+look at a dark part of the level before waiting on it (Crysis' ammo).
 
 ## Many at once
 
