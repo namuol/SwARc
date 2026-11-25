@@ -50,8 +50,6 @@ bool SpirvToMsl(const std::vector<uint32_t>& spirv, std::string* msl, std::strin
     o.set_msl_version(2, 1);
     o.enable_decoration_binding = true;
     o.enable_clip_distance_user_varying = false;
-    // invariant outputs (gl_Position) computed without fast-math reassociation
-    o.invariant_float_math = true;
     c.set_msl_options(o);
     *msl = c.compile();
   } catch (const std::exception& e) {
