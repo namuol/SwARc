@@ -106,6 +106,17 @@ enum Op : uint8_t { kAdd, kSub, kMul, kDiv };
 #ifndef RECOMP_SSE_FLAGS_UNOBSERVED
 #define RECOMP_SSE_FLAGS_UNOBSERVED 0
 #endif
+// RECOMP_SSE_FTZ_DAZ_FAST=1 (with RECOMP_SSE_FLAGS_UNOBSERVED=1): that fast
+// path also runs under FTZ and DAZ, applying them itself (FastLane). For
+// games that run with them on. Without it those modes take the exact
+// model, and none of that code is compiled in. Testing FTZ and DAZ at run
+// time costs every ADD/SUB/MUL/DIV: per lane, the compiler computes both
+// flushes and selects (about 8% in a game running with them off); as two
+// inline paths, the one a game never takes still costs it (FastArith);
+// moving the flushing path out of line, or a [[likely]] layout, cost more.
+#ifndef RECOMP_SSE_FTZ_DAZ_FAST
+#define RECOMP_SSE_FTZ_DAZ_FAST 0
+#endif
 
 namespace fast {
 
@@ -120,7 +131,8 @@ constexpr bool Mutated(int n) { return RECOMP_X86_MUTATION == n; }
 //   (1) MXCSR is the default but for its flags: every exception masked,
 //       round to nearest even, FTZ and DAZ off ((mxcsr & 0xFFC0) == 0x1F80).
 //       FastArith also takes FTZ and DAZ on ((mxcsr & 0x7F80) == 0x1F80):
-//       (2) and (3) keep denormals out of its operands and results.
+//       (2) and (3) keep denormals out of its operands and results (the
+//       flags-unobserved variant only with RECOMP_SSE_FTZ_DAZ_FAST).
 //       The host runs in its default environment too (round to nearest
 //       even, no flush to zero, no traps: platform::HostFpProblem, checked
 //       on every guest thread), and this file is built with
@@ -278,20 +290,11 @@ inline bool FastLane(Op op, Bits<D> a, Bits<D> b, Bits<D>* out, bool* inexact,
   return true;
 }
 
-// The whole instruction on the host, or false (nothing changed) if any
-// lane is outside the conditions.
-// mode: MXCSR's control bits as the lifted code last loaded them (MXMODE);
-// the flags-unobserved path reads them there, the other one reads MXCSR.
+// Every lane of the instruction on the host, or false (nothing changed) if
+// any lane is outside the conditions. ftz_daz as FastLane's.
 template <bool D>
-inline bool FastArith(Ctx& c, Op op, int lanes, Xmm& d, const Xmm& s, uint32_t mode) {
+inline bool FastLanes(Ctx& c, Op op, int lanes, Xmm& d, const Xmm& s, uint32_t ftz_daz) {
   using U = Bits<D>;
-  // FTZ and DAZ may be set (0x8040 left out): (2) keeps denormal operands
-  // out, so DAZ never applies, and (3) keeps tiny results out, so FTZ
-  // never flushes and the flags are as without them. With the flags
-  // unobserved, FastLane checks the operands and result for them itself.
-  const uint32_t mx = RECOMP_SSE_FLAGS_UNOBSERVED ? mode : c.mxcsr;
-  if ((mx & 0x7F80) != kMxcsrDefault) return false;
-  const uint32_t ftz_daz = mx & 0x8040;
   U r[16 / sizeof(U)];
   bool inexact = false;
   const bool pe_set = Mutated(106) || (c.mxcsr & 0x20) != 0;  // 106: always skipped
@@ -304,6 +307,38 @@ inline bool FastArith(Ctx& c, Op op, int lanes, Xmm& d, const Xmm& s, uint32_t m
   for (int i = 0; i < lanes; i++) SetLane<U>(d, i, r[i]);
   if (inexact) c.mxcsr |= 0x20;  // PE
   return true;
+}
+
+// The whole instruction on the host, or false (nothing changed) if any
+// lane is outside the conditions.
+// mode: MXCSR's control bits as the lifted code last loaded them (MXMODE);
+// the flags-unobserved path reads them there, the other one reads MXCSR.
+template <bool D>
+inline bool FastArith(Ctx& c, Op op, int lanes, Xmm& d, const Xmm& s, uint32_t mode) {
+  if constexpr (RECOMP_SSE_FLAGS_UNOBSERVED) {
+    // One of two paths per build, never both: inline at every call site,
+    // the one a game never takes still costs it (two paths, the second
+    // never taken, cost about 2% in a game running with FTZ and DAZ off,
+    // and 6% in one running with them on).
+    if constexpr (RECOMP_SSE_FTZ_DAZ_FAST) {
+      // FTZ and DAZ may be on: FastLane applies them to operands and
+      // result (branch-free: denormals are common under them).
+      // 115: they are ignored (no flushing).
+      if ((mode & 0x7F80) != kMxcsrDefault) return false;
+      return FastLanes<D>(c, op, lanes, d, s, Mutated(115) ? 0 : mode & 0x8040);
+    } else {
+      // FTZ and DAZ off only (the exact model has them): no flushing at
+      // all, ftz_daz a constant 0.
+      if ((mode & 0xFFC0) != kMxcsrDefault) return false;
+      return FastLanes<D>(c, op, lanes, d, s, 0);
+    }
+  }
+  // FTZ and DAZ may be set (0x8040 left out): (2) keeps denormal operands
+  // out, so DAZ never applies, and (3) keeps tiny results out, so FTZ
+  // never flushes and the flags are as without them.
+  (void)mode;
+  if ((c.mxcsr & 0x7F80) != kMxcsrDefault) return false;
+  return FastLanes<D>(c, op, lanes, d, s, 0);
 }
 
 // COMISS/COMISD: neither operand a NaN nor a denormal, so the comparison

@@ -57,23 +57,29 @@ target_compile_definitions(sse_fast_noflags_mutation_111 PRIVATE RECOMP_SSE_FLAG
 target_compile_options(sse_fast_noflags_mutation_111 PRIVATE -O2 ${RECOMP_X87_FP_FLAGS})
 target_link_libraries(sse_fast_noflags_mutation_111 PRIVATE softfloat recomp_base)
 add_test(NAME sse_fast_noflags_mutation_111 COMMAND sse_fast_noflags_mutation_111 400000)
-# 113: FTZ's denormal results not flushed; 114: DAZ's denormal operands kept.
-add_executable(sse_fast_noflags_mutation_113 sse_fast_test.cpp "${RECOMP_ROOT}/src/x86/sse.cpp")
-target_include_directories(sse_fast_noflags_mutation_113 PRIVATE "${RECOMP_ROOT}/src")
-target_compile_features(sse_fast_noflags_mutation_113 PRIVATE cxx_std_20)
-target_compile_definitions(sse_fast_noflags_mutation_113 PRIVATE RECOMP_SSE_FLAGS_UNOBSERVED=1
-                           RECOMP_X86_MUTATION=113)
-target_compile_options(sse_fast_noflags_mutation_113 PRIVATE -O2 ${RECOMP_X87_FP_FLAGS})
-target_link_libraries(sse_fast_noflags_mutation_113 PRIVATE softfloat recomp_base)
-add_test(NAME sse_fast_noflags_mutation_113 COMMAND sse_fast_noflags_mutation_113 400000)
-add_executable(sse_fast_noflags_mutation_114 sse_fast_test.cpp "${RECOMP_ROOT}/src/x86/sse.cpp")
-target_include_directories(sse_fast_noflags_mutation_114 PRIVATE "${RECOMP_ROOT}/src")
-target_compile_features(sse_fast_noflags_mutation_114 PRIVATE cxx_std_20)
-target_compile_definitions(sse_fast_noflags_mutation_114 PRIVATE RECOMP_SSE_FLAGS_UNOBSERVED=1
-                           RECOMP_X86_MUTATION=114)
-target_compile_options(sse_fast_noflags_mutation_114 PRIVATE -O2 ${RECOMP_X87_FP_FLAGS})
-target_link_libraries(sse_fast_noflags_mutation_114 PRIVATE softfloat recomp_base)
-add_test(NAME sse_fast_noflags_mutation_114 COMMAND sse_fast_noflags_mutation_114 400000)
+# With RECOMP_SSE_FTZ_DAZ_FAST too (FTZ and DAZ on the host), and its
+# planted bugs: 113: FTZ's denormal results not flushed; 114: DAZ's
+# denormal operands kept; 115: FTZ and DAZ ignored (nothing flushed).
+foreach(_m 0 113 114 115)
+  if(_m EQUAL 0)
+    set(_t sse_fast_noflags_ftzdaz_test)
+  else()
+    set(_t sse_fast_noflags_mutation_${_m})
+  endif()
+  add_executable(${_t} sse_fast_test.cpp "${RECOMP_ROOT}/src/x86/sse.cpp")
+  target_include_directories(${_t} PRIVATE "${RECOMP_ROOT}/src")
+  target_compile_features(${_t} PRIVATE cxx_std_20)
+  target_compile_definitions(${_t} PRIVATE RECOMP_SSE_FLAGS_UNOBSERVED=1
+                             RECOMP_SSE_FTZ_DAZ_FAST=1 RECOMP_X86_MUTATION=${_m})
+  target_compile_options(${_t} PRIVATE -O2 ${RECOMP_X87_FP_FLAGS})
+  target_link_libraries(${_t} PRIVATE softfloat recomp_base)
+  if(_m EQUAL 0)
+    add_test(NAME sse_fast_noflags_ftzdaz COMMAND ${_t})
+    set_tests_properties(sse_fast_noflags_ftzdaz PROPERTIES TIMEOUT 300)
+  else()
+    add_test(NAME ${_t} COMMAND ${_t} 400000)
+  endif()
+endforeach()
 # The same built with each planted bug of those fast paths
 # (RECOMP_X86_MUTATION 101-110 and 112, x86/sse.h), which it must catch.
 foreach(_m RANGE 101 112)

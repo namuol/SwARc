@@ -19,7 +19,8 @@
 //
 // Built with RECOMP_SSE_FLAGS_UNOBSERVED=1 (sse_fast_noflags_test) it
 // checks that variant of ADD/SUB/MUL/DIV: the same result bits, MXCSR's
-// flags not compared.
+// flags not compared; with RECOMP_SSE_FTZ_DAZ_FAST=1 as well
+// (sse_fast_noflags_ftzdaz_test), its FTZ and DAZ handling.
 //
 // Usage: sse_fast_test [cases] [seed]   (a random seed by default, printed)
 
@@ -145,7 +146,11 @@ void ArithCase() {
       const U lo = D ? 107 : 49, hi = D ? 2045 : 253;
       return e >= lo && e <= hi;
     };
-    bool taken = (before & 0x7F80) == sse::kMxcsrDefault;  // FTZ/DAZ allowed
+    // FTZ/DAZ allowed, but by the flags-unobserved variant only with
+    // RECOMP_SSE_FTZ_DAZ_FAST.
+    const uint32_t mask =
+        RECOMP_SSE_FLAGS_UNOBSERVED && !RECOMP_SSE_FTZ_DAZ_FAST ? 0xFFC0 : 0x7F80;
+    bool taken = (before & mask) == sse::kMxcsrDefault;
     for (int i = 0; i < lanes && taken; i++)
       taken = RECOMP_SSE_FLAGS_UNOBSERVED ? !IsNaN<D>(sse::Lane<U>(de, i))
                                           : in(sse::Lane<U>(d, i)) && in(sse::Lane<U>(s, i)) &&
