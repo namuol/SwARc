@@ -9,11 +9,11 @@ and after converting every recomp: docs/smoke-timings.md.
 ## What a game's smoke set must have
 
 - **Gameplay, with its essential inputs, each one checked.** At least one
-  case gets into play (a level, a mission, a match, a lot) and uses the
+  case gets into play (e.g. a level, a mission, a match, a lot) and uses the
   inputs a player cannot do without: movement and the camera, the mouse
-  buttons (fire, select, order), the keys the game is played with. Each
-  input's *effect* is checked by a later wait, check or compared shot (the
-  ammo count drops after a shot; a unit's panel opens when it is clicked;
+  buttons (e.g. fire, select, order), the keys the game is played with. Each
+  input's *effect* is checked by a later wait, check or compared shot (e.g.
+  the ammo count drops after a shot; a unit's panel opens when it is clicked;
   the view leaves its pixels after a step). An input that is only sent
   proves nothing: a lost click passes.
 - **As short as the game allows.** Skip what does not need covering: a
