@@ -151,10 +151,14 @@ a case past what cannot be skipped.
   screen PLAY click had never worked; the board started from later clicks.
 
 - A wait on the same line time as a held key or click (`key W 1`,
-  `click left 1.0`) starts only after the release; an `exit` timed before
-  that release ends the run without the wait ever running, and the case
-  passes. Put the wait at the release time and the exit after it, and
-  check the run log for the wait's line ("wait (line N) matched").
+  `click left 1.0`) starts only after the release. An `exit` timed before
+  a wait's start would end the run without the wait ever running, so the
+  script is rejected as a bad line ("exit at ... comes before the wait on
+  line N") and the case fails. Put the wait at the release time and the
+  exit after it.
+- `key` takes SDL's key names; write a name's spaces as `_` (`Left_Shift`,
+  `Left_Ctrl`). A held Shift types shifted characters: `key Left_Shift 0.3`
+  with the next key 0.1 s later.
 - A click right after a level or a weapon appears may be lost (Portal's
   first shot, a rifle still being drawn in Crysis or HL2): leave ~1 s, more
   under load, and wait for the shot's effect.

@@ -1410,7 +1410,21 @@ void InjectTestInput() {
     // a wait starts no earlier, or it would hold back the release of the
     // click before it (games act on the release).
     double last_release = 0;
-    auto motion = [](double t, float dx, float dy) {
+    // Each wait's start (line, time) and each exit's (line, time): an exit
+    // before a wait's start ends the run without that wait (checked below).
+    std::vector<std::pair<int, double>> wait_starts, exits;
+    // A key name as SDL spells it, or with '_' for its spaces (one token:
+    // "Left_Shift" for "Left Shift").
+    auto scancode = [](const char* name) {
+      SDL_Scancode sc = SDL_GetScancodeFromName(name);
+      if (sc == SDL_SCANCODE_UNKNOWN && std::strchr(name, '_')) {
+        std::string s = name;
+        std::replace(s.begin(), s.end(), '_', ' ');
+        sc = SDL_GetScancodeFromName(s.c_str());
+      }
+      return sc;
+    };
+    auto motion =[](double t, float dx, float dy) {
       SDL_Event e{};
       e.type = SDL_EVENT_MOUSE_MOTION;
       e.motion.which = kTestRelative;
@@ -1497,7 +1511,7 @@ void InjectTestInput() {
         e.wheel.direction = SDL_MOUSEWHEEL_NORMAL;
         q.push_back({t, e});
       } else if (c == "key" && n >= 3) {
-        SDL_Scancode sc = SDL_GetScancodeFromName(a);
+        SDL_Scancode sc = scancode(a);
         if (sc == SDL_SCANCODE_UNKNOWN) {
           WarnF("TEST_INPUT: unknown key %s\n", a);
           continue;
@@ -1533,7 +1547,7 @@ void InjectTestInput() {
           if (tok[i] == "tol" && i + 1 < tok.size()) {
             w.tolerance = std::atoi(tok[++i].c_str());
           } else if (tok[i] == "press" && i + 2 < tok.size()) {
-            w.press = SDL_GetScancodeFromName(tok[i + 1].c_str());
+            w.press = scancode(tok[i + 1].c_str());
             w.every = std::atof(tok[i + 2].c_str());
             ok = w.press != SDL_SCANCODE_UNKNOWN && w.every > 0;
             i += 2;
@@ -1557,11 +1571,14 @@ void InjectTestInput() {
         e.type = kWaitEvent;
         e.user.code = int32_t(g_waits.size());
         g_waits.push_back(std::move(w));
-        q.push_back({std::max(t, last_release + 0.001), e});
+        const double start = std::max(t, last_release + 0.001);
+        wait_starts.push_back({lineno, start});
+        q.push_back({start, e});
       } else if (c == "exit") {
         SDL_Event e{};
         e.type = kExitEvent;
         q.push_back({t, e});
+        exits.push_back({lineno, t});
       } else if (c == "leave") {  // the pointer leaves the window (WM_MOUSELEAVE)
         SDL_Event e{};
         e.type = SDL_EVENT_WINDOW_MOUSE_LEAVE;
@@ -1571,6 +1588,18 @@ void InjectTestInput() {
       }
     }
     std::fclose(f);
+    // The run stops at its first exit, so a wait that starts later never
+    // runs and checks nothing, yet the case would pass: report it as a bad
+    // line (smoke.py fails the case).
+    if (!exits.empty()) {
+      auto first = *std::min_element(exits.begin(), exits.end(),
+                                     [](auto& x, auto& y) { return x.second < y.second; });
+      for (auto& [wl, ws] : wait_starts)
+        if (ws > first.second)
+          WarnF("TEST_INPUT: bad line: exit at %.2f s (line %d) comes before the wait on line %d, "
+                "which starts at %.2f s (after the release before it)\n",
+                first.second, first.first, wl, ws);
+    }
     std::stable_sort(q.begin(), q.end(),
                      [](const TestEvent& x, const TestEvent& y) { return x.t < y.t; });
     WarnF("TEST_INPUT: %zu events from %s\n", q.size(), path);
