@@ -543,6 +543,7 @@ class GpuDevice final : public Device {
       for (auto& [pk, p] : v.pipelines) SDL_ReleaseGPUGraphicsPipeline(dev_, p);
       if (SDL_GPUShader* sh = v.shader.load()) SDL_ReleaseGPUShader(dev_, sh);
     }
+    FinishPipelineJobs();
     for (auto& [k, p] : shader_pipelines_) SDL_ReleaseGPUGraphicsPipeline(dev_, p);
     for (auto& [k, p] : program_pipelines_) SDL_ReleaseGPUGraphicsPipeline(dev_, p);
     for (auto& [id, pr] : programs_) ReleaseProgram(pr);
@@ -1506,10 +1507,11 @@ void r_color0(inout vec4 c) {
     Shader v = sh;
     v.glsl.clear();
     v.variants.clear();
-    v.pending = {};
-    const Uint64 t0 = SDL_GetTicksNS();
-    v.sh = CompileShader(sh.stage, sh.samplers, sh.glsl, occl, shadow);
-    AddStall(Stall::ShaderCompile, SDL_GetTicksNS() - t0);
+    v.sh = nullptr;
+    v.job.reset();
+    // On the pool like the shader itself: the draw that asked for it waits
+    // only when its pass is flushed, with the frame's other new shaders.
+    v.pending = CompileAsync(v, sh.glsl, occl, shadow);
     ShaderId id = next_id_++;
     sh.variants[key] = id;
     shaders_[id] = std::move(v);
@@ -1522,6 +1524,7 @@ void r_color0(inout vec4 c) {
     if (it == shaders_.end()) return;
     // Recorded draws and cached pipelines may use it.
     Flush();
+    FinishPipelineJobs();
     for (auto p = shader_pipelines_.begin(); p != shader_pipelines_.end();) {
       if (p->first.vs == id || p->first.ps == id) {
         SDL_ReleaseGPUGraphicsPipeline(dev_, p->second);
@@ -1796,7 +1799,10 @@ void r_color0(inout vec4 c) {
       sc.smp[r] = Sampler(sk);
     }
     sc.key.ps = Variant(d.ps, sc.occl, shadow);
-    ShaderPipeline(sc.key);
+    // Not waited for here: the pass waits when it is flushed, so a game that
+    // creates each shader just before its first draw has all of a pass's new
+    // shaders and pipelines made side by side, not one after another.
+    RequestPipeline(sc.key);
     c.shader = int(shader_cmds_.size());
     shader_cmds_.push_back(sc);
     cmds_.push_back(c);
@@ -2568,6 +2574,12 @@ void r_color0(inout vec4 c) {
     std::atomic<bool> claimed{false};
     std::packaged_task<SDL_GPUShader*()> task;
   };
+  // A translated-shader pipeline being created on the pool (RequestPipeline).
+  struct PipelineJob {
+    std::atomic<bool> claimed{false};
+    std::packaged_task<SDL_GPUGraphicsPipeline*()> task;
+    std::shared_future<SDL_GPUGraphicsPipeline*> done;
+  };
   struct Shader {
     SDL_GPUShader* sh = nullptr;
     hlsl::Stage stage = hlsl::Stage::Vertex;
@@ -2614,14 +2626,24 @@ void r_color0(inout vec4 c) {
 
   // CompileShader on the compile pool (whoever claims the job runs it):
   // the result once done.
-  std::shared_future<SDL_GPUShader*> CompileAsync(Shader& sh, const std::string& body) {
+  std::shared_future<SDL_GPUShader*> CompileAsync(Shader& sh, const std::string& body,
+                                                  bool occl = false, uint32_t shadow = 0) {
     const hlsl::Stage stage = sh.stage;
     const uint32_t samplers = sh.samplers;
     auto job = std::make_shared<CompileJob>();
-    job->task = std::packaged_task<SDL_GPUShader*()>(
-        [this, stage, samplers, body] { return CompileShader(stage, samplers, body, false, 0); });
+    job->task = std::packaged_task<SDL_GPUShader*()>([this, stage, samplers, body, occl, shadow] {
+      return CompileShader(stage, samplers, body, occl, shadow);
+    });
     std::shared_future<SDL_GPUShader*> f = job->task.get_future().share();
     sh.job = job;
+    PoolPush([job] {
+      if (!job->claimed.exchange(true)) job->task();
+    });
+    return f;
+  }
+
+  // Runs `f` on the compile pool, started on first use.
+  void PoolPush(std::function<void()> f) {
     {
       std::lock_guard<std::mutex> l(compile_mu_);
       if (compile_threads_.empty()) {
@@ -2629,15 +2651,14 @@ void r_color0(inout vec4 c) {
         const unsigned n = std::clamp(hw > 2 ? hw - 2 : 1u, 1u, 8u);
         for (unsigned i = 0; i < n; i++) compile_threads_.emplace_back([this] { CompileWorker(); });
       }
-      compile_jobs_.push_back(job);
+      compile_jobs_.push_back(std::move(f));
     }
     compile_cv_.notify_one();
-    return f;
   }
 
   void CompileWorker() {
     for (;;) {
-      std::shared_ptr<CompileJob> job;
+      std::function<void()> job;
       {
         std::unique_lock<std::mutex> l(compile_mu_);
         compile_cv_.wait(l, [&] { return compile_quit_ || !compile_jobs_.empty(); });
@@ -2645,7 +2666,7 @@ void r_color0(inout vec4 c) {
         job = std::move(compile_jobs_.front());
         compile_jobs_.pop_front();
       }
-      if (!job->claimed.exchange(true)) job->task();
+      job();
     }
   }
   struct BlitTex {
@@ -3856,7 +3877,11 @@ void r_color0(inout vec4 c) {
     if (FsVariant* v = variant_last_) {
       if (SDL_GPUShader* sh = v->shader.load(std::memory_order_acquire)) {
         auto it = v->pipelines.find(k);
-        if (it == v->pipelines.end()) it = v->pipelines.emplace(k, CreatePipeline(k, vs_, sh, nullptr)).first;
+        if (it == v->pipelines.end()) {
+          const Uint64 t0 = SDL_GetTicksNS();
+          it = v->pipelines.emplace(k, CreatePipeline(k, vs_, sh, nullptr)).first;
+          AddStall(Stall::Pipeline, SDL_GetTicksNS() - t0);
+        }
         return it->second;
       }
     }
@@ -4011,8 +4036,11 @@ void r_color0(inout vec4 c) {
     if (last_pipeline_ && alpha_test == last_alpha_test_ && k == last_key_) return last_pipeline_;
     auto& cache = alpha_test ? pipelines_alpha_test_ : pipelines_;
     auto it = cache.find(k);
-    if (it == cache.end())
+    if (it == cache.end()) {
+      const Uint64 t0 = SDL_GetTicksNS();
       it = cache.emplace(k, CreatePipeline(k, vs_, alpha_test ? fs_alpha_test_ : fs_, nullptr)).first;
+      AddStall(Stall::Pipeline, SDL_GetTicksNS() - t0);
+    }
     last_key_ = k;
     last_alpha_test_ = alpha_test;
     return last_pipeline_ = it->second;
@@ -4064,10 +4092,8 @@ void r_color0(inout vec4 c) {
     pi.target_info.num_color_targets = k.targets;
     pi.target_info.has_depth_stencil_target = k.depth_format != SDL_GPU_TEXTUREFORMAT_INVALID;
     pi.target_info.depth_stencil_format = SDL_GPUTextureFormat(k.depth_format);
-    const Uint64 t0 = SDL_GetTicksNS();
     SDL_GPUGraphicsPipeline* p = SDL_CreateGPUGraphicsPipeline(dev_, &pi);
     if (!p) FatalF("gfx: SDL_CreateGPUGraphicsPipeline: %s", SDL_GetError());
-    AddStall(Stall::Pipeline, SDL_GetTicksNS() - t0);
     return p;
   }
 
@@ -4711,14 +4737,61 @@ void r_color0(inout vec4 c) {
     sc.ulen[slot] = len;
   }
 
+  // Starts creating the pipeline for `k` on the compile pool, unless it
+  // exists or is already on its way. A pipeline's first creation costs the
+  // backend tens of milliseconds; started when the draw is recorded, the
+  // pipelines of a pass are made side by side (and alongside the game's own
+  // work) instead of one after another when the pass is flushed.
+  void RequestPipeline(const ShaderKey& k) {
+    if (shader_pipelines_.count(k) || pipeline_jobs_.count(k)) return;
+    // The two shaders as the job will need them: done, or their compile.
+    struct Src {
+      SDL_GPUShader* sh;
+      std::shared_future<SDL_GPUShader*> pending;
+      std::shared_ptr<CompileJob> job;
+    };
+    auto src = [&](ShaderId id) {
+      Shader& s = shaders_.at(id);
+      return Src{s.sh, s.pending, s.job};
+    };
+    auto resolve = [](Src& s) {
+      if (s.sh) return s.sh;
+      if (s.job && !s.job->claimed.exchange(true)) s.job->task();
+      return s.pending.get();
+    };
+    auto job = std::make_shared<PipelineJob>();
+    job->task = std::packaged_task<SDL_GPUGraphicsPipeline*()>(
+        [this, k, vs = src(k.vs), ps = src(k.ps), resolve]() mutable {
+          const uint8_t alpha[3] = {k.src_a, k.dst_a, k.op_a};
+          return CreatePipeline(k.k, resolve(vs), resolve(ps), alpha);
+        });
+    job->done = job->task.get_future().share();
+    pipeline_jobs_[k] = job;
+    PoolPush([job] {
+      if (!job->claimed.exchange(true)) job->task();
+    });
+  }
+
+  // The pipeline for `k`, waiting for (or making) it if it is not done.
   SDL_GPUGraphicsPipeline* ShaderPipeline(const ShaderKey& k) {
     auto it = shader_pipelines_.find(k);
     if (it != shader_pipelines_.end()) return it->second;
-    const uint8_t alpha[3] = {k.src_a, k.dst_a, k.op_a};
-    SDL_GPUGraphicsPipeline* p =
-        CreatePipeline(k.k, Gpu(shaders_.at(k.vs)), Gpu(shaders_.at(k.ps)), alpha);
+    RequestPipeline(k);
+    auto jit = pipeline_jobs_.find(k);
+    std::shared_ptr<PipelineJob> job = jit->second;
+    pipeline_jobs_.erase(jit);
+    const Uint64 t0 = SDL_GetTicksNS();
+    if (!job->claimed.exchange(true)) job->task();
+    SDL_GPUGraphicsPipeline* p = job->done.get();
+    AddStall(Stall::Pipeline, SDL_GetTicksNS() - t0);
     shader_pipelines_[k] = p;
     return p;
+  }
+
+  // Waits for every pipeline still being made and caches it: before a
+  // shader it may use is released.
+  void FinishPipelineJobs() {
+    while (!pipeline_jobs_.empty()) ShaderPipeline(pipeline_jobs_.begin()->first);
   }
 
   // D3DSAMPLERSTATETYPE values (index 1-13; null: D3D9's defaults).
@@ -5318,7 +5391,7 @@ void r_color0(inout vec4 c) {
   // The translated shaders' compile pool (CompileAsync).
   std::mutex compile_mu_;
   std::condition_variable compile_cv_;
-  std::deque<std::shared_ptr<CompileJob>> compile_jobs_;
+  std::deque<std::function<void()>> compile_jobs_;
   std::vector<std::thread> compile_threads_;
   bool compile_quit_ = false;
   enum class VariantMode { Async, Sync, Off } variant_mode_ = VariantMode::Async;
@@ -5503,6 +5576,8 @@ void r_color0(inout vec4 c) {
   };
   StageBinding stage_bindings_[8];
   std::unordered_map<ShaderKey, SDL_GPUGraphicsPipeline*, BytesHash<ShaderKey>> shader_pipelines_;
+  // Pipelines being created on the pool (RequestPipeline), not yet waited for.
+  std::unordered_map<ShaderKey, std::shared_ptr<PipelineJob>, BytesHash<ShaderKey>> pipeline_jobs_;
   std::map<ShaderId, Shader> shaders_;
   std::vector<ShaderCmd> shader_cmds_;
   std::vector<uint8_t> ubytes_;  // shader draws' uniform blocks
