@@ -37,6 +37,18 @@ bool ShotPending();
 // Frames presented so far (back or front buffer).
 int FramesPresented();
 
+// Render-thread work that can stall a frame the first time something is
+// drawn. A device adds the time it spends in each (AddStall); <ID>_HITCH's
+// report of a slow frame breaks its time down by them.
+enum class Stall {
+  ShaderWait,     // waiting for a shader compiled on the pool
+  ShaderCompile,  // compiling a shader (or a variant) on the render thread
+  Pipeline,       // creating a pipeline (the backend's final compile)
+  ShaderCreate,   // a front end translating a shader the game creates
+  kCount
+};
+void AddStall(Stall s, uint64_t ns);
+
 // The gamma ramp a device applies to what it shows (Device::SetGammaRamp):
 // the test aids' shots and probes apply it too, so they hold what is shown.
 // 256 red, green and blue 16-bit entries; null: none.

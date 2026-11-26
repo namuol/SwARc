@@ -1512,7 +1512,9 @@ void r_color0(inout vec4 c) {
     v.glsl.clear();
     v.variants.clear();
     v.pending = {};
+    const Uint64 t0 = SDL_GetTicksNS();
     v.sh = CompileShader(sh.stage, sh.samplers, sh.glsl, occl, shadow);
+    AddStall(Stall::ShaderCompile, SDL_GetTicksNS() - t0);
     ShaderId id = next_id_++;
     sh.variants[key] = id;
     shaders_[id] = std::move(v);
@@ -2589,9 +2591,12 @@ void r_color0(inout vec4 c) {
   // queue): a draw waits for its own shaders only.
   static SDL_GPUShader* Gpu(Shader& s) {
     if (!s.sh && s.pending.valid()) {
-      if (s.job && !s.job->claimed.exchange(true)) s.job->task();
+      const Uint64 t0 = SDL_GetTicksNS();
+      bool here = s.job && !s.job->claimed.exchange(true);
+      if (here) s.job->task();
       s.sh = s.pending.get();
       s.job.reset();
+      AddStall(here ? Stall::ShaderCompile : Stall::ShaderWait, SDL_GetTicksNS() - t0);
     }
     return s.sh;
   }
@@ -4040,8 +4045,10 @@ void r_color0(inout vec4 c) {
     pi.target_info.num_color_targets = k.targets;
     pi.target_info.has_depth_stencil_target = k.depth_format != SDL_GPU_TEXTUREFORMAT_INVALID;
     pi.target_info.depth_stencil_format = SDL_GPUTextureFormat(k.depth_format);
+    const Uint64 t0 = SDL_GetTicksNS();
     SDL_GPUGraphicsPipeline* p = SDL_CreateGPUGraphicsPipeline(dev_, &pi);
     if (!p) FatalF("gfx: SDL_CreateGPUGraphicsPipeline: %s", SDL_GetError());
+    AddStall(Stall::Pipeline, SDL_GetTicksNS() - t0);
     return p;
   }
 
@@ -5199,8 +5206,10 @@ void r_color0(inout vec4 c) {
     pi.target_info.num_color_targets = Uint32(targets);
     pi.target_info.has_depth_stencil_target = depth != nullptr;
     pi.target_info.depth_stencil_format = depth ? depth->gpu_format : SDL_GPU_TEXTUREFORMAT_INVALID;
+    const Uint64 t0 = SDL_GetTicksNS();
     SDL_GPUGraphicsPipeline* p = SDL_CreateGPUGraphicsPipeline(dev_, &pi);
     if (!p) FatalF("gfx: SDL_CreateGPUGraphicsPipeline (program): %s", SDL_GetError());
+    AddStall(Stall::Pipeline, SDL_GetTicksNS() - t0);
     program_pipelines_[k] = p;
     return p;
   }

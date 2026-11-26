@@ -3,6 +3,7 @@
 #include "runtime/gfx/present.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -123,9 +124,19 @@ void MaybeShoot(int w, int h, const ReadFn& read_rect) {
   }
 }
 
+// This frame's stalls (AddStall), by kind. Atomic: a game may create
+// shaders on another thread than the one that presents.
+std::atomic<uint64_t> g_stall_ns[int(Stall::kCount)];
+std::atomic<int> g_stall_n[int(Stall::kCount)];
+
 }  // namespace
 
 int FramesPresented() { return frame; }
+
+void AddStall(Stall s, uint64_t ns) {
+  g_stall_ns[int(s)].fetch_add(ns, std::memory_order_relaxed);
+  g_stall_n[int(s)].fetch_add(1, std::memory_order_relaxed);
+}
 
 void NoteShownGamma(const uint16_t* ramp) {
   bool on = false;
@@ -189,11 +200,18 @@ void PresentWithDevAids(Device& dev, int w, int h) {
     Uint64 now = SDL_GetTicksNS();
     if (!start) start = now;
     double dt = last ? (now - last) / 1e6 : 0;
-    if (dt > hitch_ms)
-      WarnF("hitch: frame %d took %.1f ms (t=%.2f s)\n", frame, dt,
-            (now - start) / 1e9);
+    if (dt > hitch_ms) {
+      auto ms = [](Stall s) { return g_stall_ns[int(s)].load() / 1e6; };
+      auto n = [](Stall s) { return g_stall_n[int(s)].load(); };
+      WarnF("hitch: frame %d took %.1f ms (t=%.2f s): shader waits %.1f ms (%d), "
+            "shader compiles %.1f ms (%d), pipelines %.1f ms (%d), shader creation %.1f ms (%d)\n",
+            frame, dt, (now - start) / 1e9, ms(Stall::ShaderWait), n(Stall::ShaderWait),
+            ms(Stall::ShaderCompile), n(Stall::ShaderCompile), ms(Stall::Pipeline),
+            n(Stall::Pipeline), ms(Stall::ShaderCreate), n(Stall::ShaderCreate));
+    }
     last = now;
   }
+  for (int i = 0; i < int(Stall::kCount); i++) g_stall_ns[i] = 0, g_stall_n[i] = 0;  // the next frame's
   // <ID>_FPS_REPORT=s: every s seconds, the frame rate and the spread of
   // frame intervals.
   static const double report_s = [] {
