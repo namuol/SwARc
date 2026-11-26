@@ -3588,10 +3588,16 @@ void r_color0(inout vec4 c) {
         const auto* p = reinterpret_cast<const uint32_t*>(s);
         for (int x = 0; x < w; x++) d[x] = p[x] | 0xFF000000u;
       } else if (const uint32_t* lut = Lut16(f)) {
-        // 16-bit formats: a table of DecodePixel's results, so the same
-        // values at a fraction of the cost (full-screen 2D blits).
+        // 16- and 8-bit formats: a table of DecodePixel's results, so the
+        // same values at a fraction of the cost (full-screen 2D blits,
+        // textures a game fills while it plays).
         const auto* p = reinterpret_cast<const uint16_t*>(s);
         for (int x = 0; x < w; x++) d[x] = lut[p[x]];
+      } else if (const uint32_t* lut = Lut8(f)) {
+        for (int x = 0; x < w; x++) d[x] = lut[s[x]];
+      } else if (f == Format::R8G8B8) {
+        for (int x = 0; x < w; x++)
+          d[x] = 0xFF000000u | uint32_t(s[3 * x + 2]) << 16 | uint32_t(s[3 * x + 1]) << 8 | s[3 * x];
       } else {
         for (int x = 0; x < w; x++) d[x] = DecodePixel(s + size_t(x) * bpp, f);
       }
@@ -3601,8 +3607,8 @@ void r_color0(inout vec4 c) {
   // DecodePixel of every value of a 16-bit format, built on first use;
   // null for other formats.
   static const uint32_t* Lut16(Format f) {
-    static const Format kFormats[] = {Format::R5G6B5, Format::X1R5G5B5, Format::A1R5G5B5,
-                                      Format::A4R4G4B4, Format::X4R4G4B4};
+    static const Format kFormats[] = {Format::R5G6B5,   Format::X1R5G5B5, Format::A1R5G5B5,
+                                      Format::A4R4G4B4, Format::X4R4G4B4, Format::A8L8};
     static std::once_flag once[std::size(kFormats)];
     static std::vector<uint32_t> tables[std::size(kFormats)];
     for (size_t i = 0; i < std::size(kFormats); i++) {
@@ -3615,6 +3621,24 @@ void r_color0(inout vec4 c) {
         }
       });
       return tables[i].data();
+    }
+    return nullptr;
+  }
+
+  // The same for the 8-bit formats DecodePixel knows.
+  static const uint32_t* Lut8(Format f) {
+    static const Format kFormats[] = {Format::A8, Format::L8, Format::R3G3B2};
+    static std::once_flag once[std::size(kFormats)];
+    static uint32_t tables[std::size(kFormats)][256];
+    for (size_t i = 0; i < std::size(kFormats); i++) {
+      if (kFormats[i] != f) continue;
+      std::call_once(once[i], [&] {
+        for (uint32_t v = 0; v < 256; v++) {
+          const uint8_t raw = uint8_t(v);
+          tables[i][v] = DecodePixel(&raw, f);
+        }
+      });
+      return tables[i];
     }
     return nullptr;
   }
