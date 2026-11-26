@@ -482,6 +482,11 @@ class Device {
   virtual ShaderId CreateShader(const hlsl::Program& p) = 0;
   virtual void DestroyShader(ShaderId s) = 0;
   virtual void DrawShader(const ShaderDraw& d) = 0;
+  // Shaders whose compiles are still queued or running (a backend may
+  // compile them in the background after CreateShader returns), and a wait
+  // until there are none. A backend that compiles at once has none.
+  virtual size_t PendingShaderCompiles() { return 0; }
+  virtual void WaitForShaderCompiles() {}
 
   // ---- programs (see ProgramDesc). Backends without them (d3d9) fail
   // fatally. A program that does not compile is fatal too, with its

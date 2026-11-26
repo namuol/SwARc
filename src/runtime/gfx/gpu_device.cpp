@@ -2636,10 +2636,26 @@ void r_color0(inout vec4 c) {
     });
     std::shared_future<SDL_GPUShader*> f = job->task.get_future().share();
     sh.job = job;
-    PoolPush([job] {
+    {
+      std::lock_guard<std::mutex> l(compile_mu_);
+      compile_pending_++;
+    }
+    PoolPush([this, job] {
       if (!job->claimed.exchange(true)) job->task();
+      std::lock_guard<std::mutex> l(compile_mu_);
+      if (--compile_pending_ == 0) compile_idle_cv_.notify_all();
     });
     return f;
+  }
+
+  size_t PendingShaderCompiles() override {
+    std::lock_guard<std::mutex> l(compile_mu_);
+    return compile_pending_;
+  }
+
+  void WaitForShaderCompiles() override {
+    std::unique_lock<std::mutex> l(compile_mu_);
+    compile_idle_cv_.wait(l, [&] { return compile_pending_ == 0; });
   }
 
   // Runs `f` on the compile pool, started on first use.
@@ -5391,6 +5407,10 @@ void r_color0(inout vec4 c) {
   // The translated shaders' compile pool (CompileAsync).
   std::mutex compile_mu_;
   std::condition_variable compile_cv_;
+  // Shader compiles pushed and not yet run off the pool's queue
+  // (PendingShaderCompiles); compile_idle_cv_ signals when none are left.
+  size_t compile_pending_ = 0;
+  std::condition_variable compile_idle_cv_;
   std::deque<std::function<void()>> compile_jobs_;
   std::vector<std::thread> compile_threads_;
   bool compile_quit_ = false;
