@@ -9,6 +9,8 @@ namespace recomp {
 // Sets the id switches are read under; the platform calls it once, when
 // the process starts and before anything reads a switch.
 void SetEnvId(const std::string& id);
+// The id given to SetEnvId (empty before).
+const std::string& EnvId();
 // Switch `name`: getenv("<ID>_<name>"), e.g. Env("TRACE") reads
 // GAME_TRACE for id "game". Null if unset or before SetEnvId.
 const char* Env(const char* name);

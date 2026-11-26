@@ -145,6 +145,13 @@ target_link_libraries(hlsl_bytecode_test PRIVATE recomp_hlsl)
 add_test(NAME hlsl_bytecode COMMAND hlsl_bytecode_test ${RECOMP_GLSLANG}
          ${CMAKE_CURRENT_SOURCE_DIR}/hlsl/prelude.glsl ${CMAKE_CURRENT_BINARY_DIR})
 
+# shader_cache_test: the per-user disk cache of compiled shader code.
+if(RECOMP_HOST)
+  add_executable(shader_cache_test shader_cache_test.cpp)
+  target_link_libraries(shader_cache_test PRIVATE recomp_gfx recomp_log)
+  add_test(NAME shader_cache COMMAND shader_cache_test)
+endif()
+
 # gfx_program_test: gfx::Device's programs (the console GPUs' path) on
 # SDL_GPU; needs a Vulkan device (lavapipe will do), skipped without one.
 # On macOS it runs on Metal by hand: SDL_GPU_DRIVER=metal gfx_program_test.

@@ -9,13 +9,17 @@
 namespace recomp {
 namespace {
 std::string g_prefix;  // "<ID>_"
+std::string g_id;
 }  // namespace
 
 void SetEnvId(const std::string& id) {
+  g_id = id;
   g_prefix.clear();
   for (char ch : id) g_prefix += char(std::toupper(uint8_t(ch)));
   g_prefix += '_';
 }
+
+const std::string& EnvId() { return g_id; }
 
 const char* Env(const char* name) {
   if (g_prefix.empty()) return nullptr;

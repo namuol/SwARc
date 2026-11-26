@@ -1471,23 +1471,18 @@ void r_color0(inout vec4 c) {
     // with different shaders and relies on equal depths).
     std::string glsl = "#version 450\n" + std::string(vertex ? "invariant gl_Position;\n" : "") +
                        Prelude(stage, samplers, occl, shadow) + body;
-    std::vector<uint32_t> spirv;
-    std::string log;
-    if (!GlslToSpirv(glsl, vertex ? ShaderStage::Vertex : ShaderStage::Fragment, &spirv, &log)) {
+    std::string code, log;
+    if (!GlslToBackendCode(glsl, vertex ? ShaderStage::Vertex : ShaderStage::Fragment, &code, &log)) {
       std::fprintf(stderr, "%s\n", glsl.c_str());
       FatalF("gfx: compiling a translated shader (source above): %s", log.c_str());
     }
     SDL_GPUShaderCreateInfo si{};
+    si.code = reinterpret_cast<const Uint8*>(code.data());
+    si.code_size = code.size();
 #if defined(__APPLE__)
-    std::string msl;
-    if (!SpirvToMsl(spirv, &msl, &log)) FatalF("gfx: SPIR-V to MSL: %s", log.c_str());
-    si.code = reinterpret_cast<const Uint8*>(msl.c_str());
-    si.code_size = msl.size();
     si.entrypoint = "main0";
     si.format = SDL_GPU_SHADERFORMAT_MSL;
 #else
-    si.code = reinterpret_cast<const Uint8*>(spirv.data());
-    si.code_size = spirv.size() * 4;
     si.entrypoint = "main";
     si.format = SDL_GPU_SHADERFORMAT_SPIRV;
 #endif
