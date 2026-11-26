@@ -12,10 +12,13 @@
 
 #include <array>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
 #include <vector>
+
+#include <SDL3/SDL_timer.h>
 
 #include "runtime/display.h"
 #include "runtime/gfx/present.h"
@@ -846,6 +849,20 @@ HLE_NAMED("d3d9.dll", "IDirect3DDevice9::Present", D3DDev9_Present, 5) {
   {
     gfx::ColorTarget back[4] = {};
     d->gfx->SetRenderTargets(back, 0);
+  }
+  // <ID>_SHADER_BACKLOG_WAIT=n overrides GameConfig::shader_backlog_wait
+  // (0: never wait), read once.
+  static const uint32_t backlog_wait = [] {
+    if (const char* e = Env("SHADER_BACKLOG_WAIT")) return uint32_t(std::strtoul(e, nullptr, 10));
+    return Game().shader_backlog_wait;
+  }();
+  if (const uint32_t n = backlog_wait; n) {
+    if (const size_t pending = d->gfx->PendingShaderCompiles(); pending >= n) {
+      const Uint64 t0 = SDL_GetTicksNS();
+      d->gfx->WaitForShaderCompiles();
+      WarnF("d3d9: Present waited %.1f s for %zu pending shader compiles\n",
+            (SDL_GetTicksNS() - t0) / 1e9, pending);
+    }
   }
   PresentFrame(*d->gfx, int(d->pp.BackBufferWidth), int(d->pp.BackBufferHeight));
   BindTargets(*d);

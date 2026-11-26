@@ -74,6 +74,16 @@ struct GameConfig : recomp::GameConfig {
   enum class GdiScale { Nearest, Integer, SharpBilinear };
   GdiScale gdi_scale = GdiScale::Nearest;
 
+  // For games that create a level's shaders up front while it loads: when
+  // a frame is presented with at least this many shader compiles still
+  // pending (gfx::Device::PendingShaderCompiles), the present waits for
+  // them. The loading screen then stays up while they compile, instead of
+  // the level stalling on them one scene at a time; with the backend's
+  // caches warm (later runs) the wait is short. 0: never wait. Games that
+  // create many shaders they do not draw with soon are better off without.
+  // <ID>_SHADER_BACKLOG_WAIT=n overrides it (0 turns it off).
+  uint32_t shader_backlog_wait = 0;
+
   // Video memory DirectDraw reports, in MB. Games pick detail settings
   // from it; a game's best profile may need more than the default.
   uint32_t video_memory_mb = 64;
