@@ -13,6 +13,9 @@
 #include <cstdio>
 #include <cstring>
 
+#include <SDL3/SDL_timer.h>
+
+#include "runtime/gfx/present.h"
 #include "runtime/log.h"
 #include "win32/d3d9_impl.h"
 #include "win32/hle.h"
@@ -697,6 +700,7 @@ void DumpBytecode(const Shader& s) {
 uint32_t CreateShader(Ctx& c, bool pixel) {
   // (pFunction, ppShader)
   if (!Arg(c, 1)) return D3DERR_INVALIDCALL;
+  const Uint64 t0 = SDL_GetTicksNS();
   auto s = std::make_shared<Shader>();
   s->device = Arg(c, 0);
   s->pixel = pixel;
@@ -716,6 +720,7 @@ uint32_t CreateShader(Ctx& c, bool pixel) {
     FatalF("d3d9: Create%sShader with a %s shader", pixel ? "Pixel" : "Vertex",
            pixel ? "vertex" : "pixel");
   s->id = Dev(c)->gfx->CreateShader(*s->program);
+  gfx::AddStall(gfx::Stall::ShaderCreate, SDL_GetTicksNS() - t0);
   const uint32_t obj = com::Publish(s, ShaderVtable(pixel));
   Wr32(Arg(c, 2), obj);
   // The name SHADER_DUMP gives its tokens, to find a bound shader's source.
